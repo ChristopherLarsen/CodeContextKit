@@ -4,12 +4,13 @@ import PackageDescription
 let package = Package(
     name: "CodeContextKit",
     platforms: [
-        .macOS("16.0")
+        .macOS("15.0")
     ],
     products: [
         .executable(name: "cckit", targets: ["CodeContextKitCLI"]),
         .library(name: "CodeContextKitCore", targets: ["CodeContextKitCore"]),
         .library(name: "CodeContextKitSwiftIndex", targets: ["CodeContextKitSwiftIndex"]),
+        .library(name: "CodeContextKitKotlinIndex", targets: ["CodeContextKitKotlinIndex"]),
         .library(name: "CodeContextKitStorage", targets: ["CodeContextKitStorage"]),
         .library(name: "CodeContextKitRetrieval", targets: ["CodeContextKitRetrieval"]),
         .library(name: "CodeContextKitContext", targets: ["CodeContextKitContext"])
@@ -21,6 +22,8 @@ let package = Package(
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", from: "2.0.0"),
         .package(url: "https://github.com/unum-cloud/usearch.git", from: "2.16.0"),
+        .package(url: "https://github.com/tree-sitter/tree-sitter.git", from: "0.22.6"),
+        .package(url: "https://github.com/tree-sitter-grammars/tree-sitter-kotlin.git", from: "1.1.0"),
         .package(url: "https://github.com/christopherkarani/Wax.git", branch: "main"),
         .package(url: "https://github.com/christopherkarani/ContextCore.git", branch: "main")
     ],
@@ -62,6 +65,14 @@ let package = Package(
             ]
         ),
         .target(
+            name: "CodeContextKitKotlinIndex",
+            dependencies: [
+                "CodeContextKitCore",
+                .product(name: "TreeSitter", package: "tree-sitter"),
+                .product(name: "TreeSitterKotlin", package: "tree-sitter-kotlin")
+            ]
+        ),
+        .target(
             name: "CodeContextKitStorage",
             dependencies: [
                 "CodeContextKitCore",
@@ -83,6 +94,7 @@ let package = Package(
             dependencies: [
                 "CodeContextKitCore",
                 "CodeContextKitSwiftIndex",
+                "CodeContextKitKotlinIndex",
                 "CodeContextKitStorage",
                 "CodeContextKitRetrieval",
                 .product(name: "ContextCore", package: "ContextCore")
@@ -91,6 +103,10 @@ let package = Package(
         .testTarget(
             name: "CodeContextKitSwiftIndexTests",
             dependencies: ["CodeContextKitSwiftIndex"]
+        ),
+        .testTarget(
+            name: "CodeContextKitKotlinIndexTests",
+            dependencies: ["CodeContextKitKotlinIndex"]
         ),
         .testTarget(
             name: "CodeContextKitContextTests",

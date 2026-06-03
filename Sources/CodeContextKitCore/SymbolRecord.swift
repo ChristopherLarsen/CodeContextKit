@@ -17,6 +17,14 @@ public struct SymbolRecord: Codable, Hashable, Sendable {
         case file
         case style
         case `case`
+        case object
+        case companion
+        case dataClass
+        case sealedClass
+        case valueClass
+        case `typealias` = "typealias"
+        case constructor
+        case enumEntry
     }
 
     public struct Reference: Codable, Hashable, Sendable {

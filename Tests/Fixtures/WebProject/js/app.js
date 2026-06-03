@@ -6,7 +6,7 @@ const formatCurrency = (value) => {
     return `$${value.toFixed(2)}`;
 };
 
-class ContextShoppingCat {
+class ShoppingCart {
     constructor() {
         this.items = [];
     }

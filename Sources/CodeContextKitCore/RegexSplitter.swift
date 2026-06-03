@@ -30,12 +30,6 @@ public struct RegexSplitter: CodeSplitter, Sendable {
                 .interface: #"\binterface\s+([a-zA-Z0-9_]+)"#,
                 .method: #"\b(?:public|protected|private|static|\s) +[\w\<\>\[\]]+\s+([a-zA-Z0-9_]+)\s*\("#
             ]
-        case "kotlin", "kt":
-            self.patterns = [
-                .class: #"\bclass\s+([a-zA-Z0-9_]+)"#,
-                .interface: #"\binterface\s+([a-zA-Z0-9_]+)"#,
-                .function: #"\bfun\s+([a-zA-Z0-9_]+)"#
-            ]
         default:
             self.patterns = [:]
         }

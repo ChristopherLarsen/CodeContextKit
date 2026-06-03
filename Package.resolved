@@ -1,5 +1,5 @@
 {
-  "originHash" : "e8f9ab1308485042a839d5593cad2c9d0d2586e1e706522cb391afbfc83ab8a8",
+  "originHash" : "6e6f06978c372425ccebf731f8f3d734f705f1a6392bb7c89d0496f652013ba2",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -296,6 +296,24 @@
       "state" : {
         "revision" : "ca48d46c25f8fa948d37eaa480c73172182cf90f",
         "version" : "1.5.0"
+      }
+    },
+    {
+      "identity" : "tree-sitter",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/tree-sitter/tree-sitter.git",
+      "state" : {
+        "revision" : "7f534862c3ec939c3a6ee147f7600ef5c1bf900f",
+        "version" : "0.26.9"
+      }
+    },
+    {
+      "identity" : "tree-sitter-kotlin",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/tree-sitter-grammars/tree-sitter-kotlin.git",
+      "state" : {
+        "revision" : "77dd60ea0a9003ce062c9728a513ffe1aaff8c82",
+        "version" : "1.1.0"
       }
     },
     {

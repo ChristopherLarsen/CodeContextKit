@@ -1,6 +1,5 @@
 import Foundation
 import CodeContextKitCore
-import CodeContextKitSwiftIndex
 import CodeContextKitStorage
 import CodeContextKitRetrieval
 
@@ -43,6 +42,8 @@ public final class Indexer: Sendable {
         at path: String,
         include: [String] = [],
         exclude: [String] = [],
+        includeBuildScripts: Bool = false,
+        includeGenerated: Bool = false,
         delegate: IndexerProgressDelegate? = nil
     ) async throws {
         let absolutePath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
@@ -51,8 +52,17 @@ public final class Indexer: Sendable {
         let settings = ProjectSettings.load(projectRoot: absolutePath)
         let effectiveExclude = Array(Set(settings.excludedFolders + exclude))
         let effectiveIncludeFolders = settings.includedFolders
-        
-        let files = scanner.scan(at: absolutePath, include: include, exclude: effectiveExclude, includeFolders: effectiveIncludeFolders)
+        let languageRegistry = SourceLanguageRegistry.default
+
+        let files = scanner.scan(
+            at: absolutePath,
+            include: include,
+            exclude: effectiveExclude,
+            includeFolders: effectiveIncludeFolders,
+            includeBuildScripts: includeBuildScripts,
+            includeGenerated: includeGenerated,
+            policies: languageRegistry.scanPolicies
+        )
         let scannedRelativePaths = Set(files.map { fileURL in
             relativePath(for: fileURL, rootPath: absolutePath)
         })
@@ -93,25 +103,27 @@ public final class Indexer: Sendable {
                     }
                 }
                 
-                let ext = (relativePath as NSString).pathExtension.lowercased()
-                let router = SplitterRouter()
+                let language = languageRegistry.canonicalLanguage(for: relativePath)
+                let router = SplitterRouter(registry: languageRegistry)
                 let splitter = router.splitter(for: relativePath)
                 
-                let (extractedSymbols, references) = splitter.extractSymbols(content: content, filePath: relativePath)
-                let searchSymbol = SymbolRecord(
-                    kind: .file,
-                    name: relativePath,
-                    qualifiedName: relativePath,
-                    signature: "File: \(relativePath)",
-                    filePath: relativePath,
-                    startLine: 1,
-                    endLine: lines.count
-                )
-                let symbols = extractedSymbols.isEmpty ? [searchSymbol] : extractedSymbols
+                var (symbols, references) = splitter.extractSymbols(content: content, filePath: relativePath)
+                if symbols.isEmpty {
+                    symbols = [SymbolRecord(
+                        kind: .file,
+                        name: relativePath,
+                        qualifiedName: relativePath,
+                        signature: "File: \(relativePath)",
+                        filePath: relativePath,
+                        startLine: 1,
+                        endLine: lines.count,
+                        estimatedTokens: TokenEstimator.shared.estimate(content)
+                    )]
+                }
                 
                 let fileId = try db.saveFile(
                     path: relativePath,
-                    language: ext,
+                    language: language,
                     sha256: currentHash,
                     sizeBytes: content.utf8.count,
                     modifiedAt: try fileURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
@@ -121,14 +133,9 @@ public final class Indexer: Sendable {
                 
                 try db.saveSymbols(symbols, references: references, fileId: fileId)
                 
-                // For Wax, we either save individual symbols (Swift) or the whole file (other)
-                if let swiftSplitter = splitter as? SwiftSourceFile {
-                    for symbol in symbols {
-                        let body = swiftSplitter.body(for: symbol)
-                        try await wax.saveSymbol(symbol, body: body)
-                    }
-                } else {
-                    try await wax.saveSymbol(searchSymbol, body: content)
+                for symbol in symbols {
+                    let body = symbol.kind == .file ? content : LineRangeBodyExtractor.body(for: symbol, content: content)
+                    try await wax.saveSymbol(symbol, body: body)
                 }
                 
                 updatedCount += 1

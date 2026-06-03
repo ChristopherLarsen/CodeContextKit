@@ -2,7 +2,6 @@ import Foundation
 import CodeContextKitCore
 import CodeContextKitStorage
 import CodeContextKitRetrieval
-import CodeContextKitSwiftIndex
 
 /// Orchestrates the assembly of surgical context packets for AI consumption.
 ///
@@ -75,7 +74,8 @@ public final class ContextPacker {
             let fullURL = rootURL.appendingPathComponent(path)
             if let content = try? String(contentsOf: fullURL, encoding: .utf8) {
                 let fileName = (path as NSString).lastPathComponent
-                let section = "### \(fileName) (FULL)\n```swift\n\(content)\n```\n\n"
+                let fence = LanguageFence.fence(for: path)
+                let section = "### \(fileName) (FULL)\n```\(fence)\n\(content)\n```\n\n"
                 let sectionTokens = await wax.countTokens(section)
                 if currentTokens + sectionTokens < budget {
                     output += section
@@ -88,7 +88,7 @@ public final class ContextPacker {
         for (path, reason) in associatedFiles where !stagedFiles.contains(path) {
             if currentTokens > budget { break }
             let symbols = try db.getSymbols(path: path)
-            let skeleton = SwiftOutlineRenderer().render(filePath: path, symbols: symbols)
+            let skeleton = OutlineRendererRegistry().renderer(for: path).render(filePath: path, symbols: symbols)
             let fileName = (path as NSString).lastPathComponent
             let fileBase = (fileName as NSString).deletingPathExtension
             

@@ -1,11 +1,31 @@
 import Foundation
 
 public struct FileScanner {
+    private static let defaultSupportedExtensions: Set<String> = [
+        "swift", "h", "m", "mm", "c", "cpp", "hpp", "js", "ts", "json", "md", "yaml", "yml", "skill", "html", "css"
+    ]
+
     public init() {}
     
-    public func scan(at path: String, include: [String], exclude: [String], includeFolders: [String] = []) -> [URL] {
+    public func scan(
+        at path: String,
+        include: [String],
+        exclude: [String],
+        includeFolders: [String] = [],
+        includeBuildScripts: Bool = false,
+        includeGenerated: Bool = false,
+        policies: [any FileScanPolicy] = []
+    ) -> [URL] {
         let rootURL = URL(fileURLWithPath: path)
         var results: [URL] = []
+        var supportedExtensions = Self.defaultSupportedExtensions
+        var policyExcludeFragments: [String] = []
+
+        for policy in policies {
+            supportedExtensions.formUnion(policy.supportedExtensions)
+            policyExcludeFragments.append(contentsOf: policy.excludedPathFragments(rootPath: path, includeGenerated: includeGenerated))
+        }
+
         let rules = IgnoreRules(rootURL: rootURL, exclude: exclude, includeFolders: includeFolders)
         
         let enumerator = FileManager.default.enumerator(
@@ -20,11 +40,13 @@ public struct FileScanner {
                 let relativePath = relativePath(for: fileURL, rootURL: rootURL)
 
                 if resourceValues.isDirectory == true {
-                    if rules.shouldSkipDirectory(path: relativePath) {
+                    if rules.shouldSkipDirectory(path: relativePath)
+                        || policyExcludeFragments.contains(where: { relativePath.contains($0) }) {
                         enumerator?.skipDescendants()
                     }
                 } else if resourceValues.isRegularFile == true {
-                    if shouldInclude(path: relativePath, include: include, rules: rules) {
+                    if shouldInclude(path: relativePath, include: include, rules: rules, supportedExtensions: supportedExtensions, policyExcludeFragments: policyExcludeFragments),
+                       policies.allSatisfy({ $0.shouldInclude(fileURL: fileURL, relativePath: relativePath, includeBuildScripts: includeBuildScripts) }) {
                         results.append(fileURL)
                     }
                 }
@@ -36,12 +58,13 @@ public struct FileScanner {
         return results
     }
     
-    private func shouldInclude(path: String, include: [String], rules: IgnoreRules) -> Bool {
+    private func shouldInclude(path: String, include: [String], rules: IgnoreRules, supportedExtensions: Set<String>, policyExcludeFragments: [String]) -> Bool {
+        if policyExcludeFragments.contains(where: { path.contains($0) }) { return false }
         if rules.excludesFile(path: path) { return false }
-        if rules.isIncluded(path: path) { return hasSupportedExtension(path) }
-        
+        if rules.isIncluded(path: path) { return hasSupportedExtension(path, supportedExtensions: supportedExtensions) }
+
         if include.isEmpty {
-            return hasSupportedExtension(path)
+            return hasSupportedExtension(path, supportedExtensions: supportedExtensions)
         }
         
         for pattern in include {
@@ -51,10 +74,7 @@ public struct FileScanner {
         return false
     }
 
-    private func hasSupportedExtension(_ path: String) -> Bool {
-        let supportedExtensions = [
-            "swift", "h", "m", "mm", "c", "cpp", "hpp", "js", "ts", "json", "md", "yaml", "yml", "skill", "html", "css"
-        ]
+    private func hasSupportedExtension(_ path: String, supportedExtensions: Set<String>) -> Bool {
         let ext = (path as NSString).pathExtension.lowercased()
         return supportedExtensions.contains(ext)
     }

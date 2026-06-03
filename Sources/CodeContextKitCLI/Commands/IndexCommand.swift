@@ -33,6 +33,12 @@ struct IndexCommand: AsyncParsableCommand {
     @Flag(help: "Print index statistics.")
     var stats: Bool = false
 
+    @Flag(help: "Include Gradle .kts build scripts.")
+    var includeBuildScripts: Bool = false
+
+    @Flag(help: "Include generated Gradle/Kotlin source directories.")
+    var includeGenerated: Bool = false
+
     func run() async throws {
         let startTime = Date()
         let dbPath = ".cckit/index.sqlite"
@@ -61,7 +67,14 @@ struct IndexCommand: AsyncParsableCommand {
         }
         
         print("Indexing \(path)...")
-        try await indexer.index(at: path, include: include, exclude: exclude, delegate: CommandLineProgressDelegate())
+        try await indexer.index(
+            at: path,
+            include: include,
+            exclude: exclude,
+            includeBuildScripts: includeBuildScripts,
+            includeGenerated: includeGenerated,
+            delegate: CommandLineProgressDelegate()
+        )
         
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
         try await actionOrchestrator.recordCLIAction(command: "index \(path)\(clean ? " --clean" : "")", toolName: "Indexer", durationMs: duration)
