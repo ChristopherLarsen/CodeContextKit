@@ -22,12 +22,15 @@ struct MapCommand: AsyncParsableCommand {
     @Option(help: "The base branch for changed files.")
     var base: String = "main"
 
+    @Flag(name: .shortAndLong, help: "Show verbose output to diagnose performance.")
+    var verbose: Bool = false
+
     func run() async throws {
         let startTime = Date()
         let dbPath = ".cckit/index.sqlite"
         guard FileManager.default.fileExists(atPath: dbPath) else {
             print("Error: Index not found. Run 'cckit index' first.")
-            return
+            throw ExitCode.failure
         }
         
         let db = try Database(path: dbPath)
@@ -36,13 +39,15 @@ struct MapCommand: AsyncParsableCommand {
         
         let builder = RepoMapBuilder(db: db, counter: { text in await wax.countTokens(text) })
         let delegate = CommandLineRepoMapProgressDelegate()
-        let map = try await builder.buildMap(budget: budget, focusTerms: focus, delegate: delegate)
+        let map = try await builder.buildMap(budget: budget, focusTerms: focus, delegate: delegate, verbose: verbose)
         
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
         let tokens = await wax.countTokens(map)
-        try await actionOrchestrator.recordCLIAction(command: "map --budget \(budget)", toolName: "Map Builder", durationMs: duration, tokensUsed: tokens)
+        let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
+        try await actionOrchestrator.recordCLIAction(command: fullCommand, toolName: "Map Builder", durationMs: duration, tokensUsed: tokens)
         
         print("\n" + map)
+        try await wax.close()
     }
 }
 

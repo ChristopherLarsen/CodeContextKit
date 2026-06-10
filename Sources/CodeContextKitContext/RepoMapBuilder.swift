@@ -18,7 +18,9 @@ public final class RepoMapBuilder {
         self.counter = counter
     }
     
-    public func buildMap(budget: Int, focusTerms: String? = nil, delegate: RepoMapProgressDelegate? = nil) async throws -> String {
+    public func buildMap(budget: Int, focusTerms: String? = nil, delegate: RepoMapProgressDelegate? = nil, verbose: Bool = false) async throws -> String {
+        var stderrStream = StderrOutputStream()
+        let totalStartTime = Date()
         let taskDescription = focusTerms ?? "Provide an architectural overview of the repository focusing on core modules and their relationships."
         
         // Use a configuration that allows more chunks to fill the budget
@@ -29,8 +31,16 @@ public final class RepoMapBuilder {
         let agentContext = try AgentContext(configuration: config)
         try await agentContext.beginSession(systemPrompt: "You are an architectural mapping engine. Provide concise, high-signal symbol skeletons.")
         
+        let dbStart = Date()
         let allFiles = try db.getAllFiles()
+        let dbDuration = Date().timeIntervalSince(dbStart)
+        if verbose {
+            print("[VERBOSE] DB: Fetched \(allFiles.count) files in \(String(format: "%.3f", dbDuration))s", to: &stderrStream)
+        }
+        
         let totalFiles = allFiles.count
+        var rememberCount = 0
+        let rememberStart = Date()
         
         for (index, file) in allFiles.enumerated() {
             delegate?.repoMapDidProgress(completed: index, total: totalFiles, currentFile: file.path)
@@ -71,28 +81,59 @@ public final class RepoMapBuilder {
                     content = "/// \(doc.replacingOccurrences(of: "\n", with: "\n/// "))\n\(content)"
                 }
                 
+                let startRem = Date()
                 // If it matches focus, "boost" it by remembering it multiple times or adding a tag
                 if matchesFocus {
                     try await agentContext.remember("FOCUS: " + content)
                     try await agentContext.remember(content)
+                    rememberCount += 2
                 } else {
                     try await agentContext.remember(content)
+                    rememberCount += 1
+                }
+                let remDur = Date().timeIntervalSince(startRem)
+                if verbose && remDur > 0.05 {
+                    print("[VERBOSE] SLOW: remembering symbol '\(symbol.name)' in \(fileName) took \(String(format: "%.3f", remDur))s", to: &stderrStream)
                 }
             }
         }
+        let rememberDuration = Date().timeIntervalSince(rememberStart)
+        if verbose {
+            print("[VERBOSE] Context: Remembered \(rememberCount) symbol chunks in \(String(format: "%.3f", rememberDuration))s", to: &stderrStream)
+        }
         
         // Pass 2: ContextCore performs Attention Centrality ranking and Progressive Compression
+        let buildStart = Date()
         let window = try await agentContext.buildWindow(currentTask: taskDescription, maxTokens: budget)
+        let buildDuration = Date().timeIntervalSince(buildStart)
+        if verbose {
+            print("[VERBOSE] Centrality: Built window (ranking & compression) in \(String(format: "%.3f", buildDuration))s", to: &stderrStream)
+        }
+        
+        let joinStart = Date()
         let mapContent = window.chunks
             .filter { !$0.isSystemPrompt }
             .sorted(by: { $0.score > $1.score }) // Keep important ones at top or keep original order? 
             // Actually, keep original order if possible, but buildWindow reranks.
             .map(\.content)
             .joined(separator: "\n---\n")
+        let joinDuration = Date().timeIntervalSince(joinStart)
+        if verbose {
+            print("[VERBOSE] Format: Joined map content in \(String(format: "%.3f", joinDuration))s", to: &stderrStream)
+            let totalDuration = Date().timeIntervalSince(totalStartTime)
+            print("[VERBOSE] Total Map Time: \(String(format: "%.3f", totalDuration))s", to: &stderrStream)
+        }
         
         var header = "# Repository Map (Tokens: \(window.totalTokens)/\(budget))\n\n"
         header += "SYSTEM: CCKit/ContextCore integrated mapping engine. Centrality ranking applied.\n\n"
         
         return header + mapContent
+    }
+}
+
+private struct StderrOutputStream: TextOutputStream {
+    mutating func write(_ string: String) {
+        fputs(string, stderr)
+        fflush(stderr)
     }
 }

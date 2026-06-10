@@ -33,7 +33,7 @@ struct PackCommand: AsyncParsableCommand {
         guard FileManager.default.fileExists(atPath: dbPath),
               FileManager.default.fileExists(atPath: waxPath) else {
             print("Error: Index not found. Run 'cckit index' first.")
-            return
+            throw ExitCode.failure
         }
         
         let db = try Database(path: dbPath)
@@ -45,7 +45,8 @@ struct PackCommand: AsyncParsableCommand {
         
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
         let tokens = await wax.countTokens(packet)
-        try await actionOrchestrator.recordCLIAction(command: "pack --task \"\(task)\"", toolName: "Context Packer", durationMs: duration, tokensUsed: tokens)
+        let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
+        try await actionOrchestrator.recordCLIAction(command: fullCommand, toolName: "Context Packer", durationMs: duration, tokensUsed: tokens)
 
         if let outputPath = output {
             try packet.write(toFile: outputPath, atomically: true, encoding: .utf8)
@@ -53,5 +54,6 @@ struct PackCommand: AsyncParsableCommand {
         } else {
             print(packet)
         }
+        try await wax.close()
     }
 }

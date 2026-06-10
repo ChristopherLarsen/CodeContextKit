@@ -25,7 +25,7 @@ struct SearchCommand: AsyncParsableCommand {
     var json: Bool = false
 
     @Option(help: "Limit the number of results.")
-    var limit: Int = 10
+    var limit: Int = 100
 
     func run() async throws {
         let startTime = Date()
@@ -34,7 +34,7 @@ struct SearchCommand: AsyncParsableCommand {
         
         guard FileManager.default.fileExists(atPath: dbPath) else {
             print("Error: Index not found. Run 'cckit index' first.")
-            return
+            throw ExitCode.failure
         }
         
         let db = try Database(path: dbPath)
@@ -47,14 +47,16 @@ struct SearchCommand: AsyncParsableCommand {
             let data = try JSONSerialization.data(withJSONObject: results, options: .prettyPrinted)
             if let string = String(data: data, encoding: .utf8) { 
                 print(string) 
-                let duration = Int(Date().timeIntervalSince(startTime) * 1000)
-                try await actionOrchestrator.recordCLIAction(command: "search \"\(query)\" --json", toolName: "Unified Search", durationMs: duration)
             }
         } else {
             try await runInteractiveSearch(db: db, wax: wax)
-            let duration = Int(Date().timeIntervalSince(startTime) * 1000)
-            try await actionOrchestrator.recordCLIAction(command: "search \"\(query)\"", toolName: "Unified Search", durationMs: duration)
         }
+        
+        let duration = Int(Date().timeIntervalSince(startTime) * 1000)
+        let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
+        try await actionOrchestrator.recordCLIAction(command: fullCommand, toolName: "Unified Search", durationMs: duration)
+        
+        try await wax.close()
     }
 
     private func performUnifiedSearch(db: Database, wax: WaxStore) async throws -> [String: Any] {

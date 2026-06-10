@@ -77,7 +77,8 @@ struct IndexCommand: AsyncParsableCommand {
         )
         
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
-        try await actionOrchestrator.recordCLIAction(command: "index \(path)\(clean ? " --clean" : "")", toolName: "Indexer", durationMs: duration)
+        let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
+        try await actionOrchestrator.recordCLIAction(command: fullCommand, toolName: "Indexer", durationMs: duration)
         
         try await wax.close()
     }

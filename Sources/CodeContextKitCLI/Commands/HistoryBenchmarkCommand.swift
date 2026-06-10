@@ -35,7 +35,7 @@ struct HistoryBenchmarkCommand: AsyncParsableCommand {
         let status = try runShell("git status", at: repoURL.path)
         guard status.contains("On branch") || status.contains("HEAD detached") else {
             print("Error: Target path is not a git repository.")
-            return
+            throw ExitCode.failure
         }
         
         // Save current branch to restore later
@@ -105,6 +105,8 @@ struct HistoryBenchmarkCommand: AsyncParsableCommand {
             results.append(result)
             
             print("Naive Tokens: \(naiveTokens) | Map Tokens: \(mapTokens) | Preserved: \(isFocusPreserved)")
+            
+            try await wax.close()
             
             // Cleanup isolated DBs
             try? FileManager.default.removeItem(atPath: tempDBPath)
