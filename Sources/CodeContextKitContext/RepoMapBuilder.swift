@@ -32,70 +32,110 @@ public final class RepoMapBuilder {
         try await agentContext.beginSession(systemPrompt: "You are an architectural mapping engine. Provide concise, high-signal symbol skeletons.")
         
         let dbStart = Date()
-        let allFiles = try db.getAllFiles()
+        let hasFocus = (focusTerms != nil && !focusTerms!.isEmpty)
+        let symbols = try db.getSymbolsForRepoMap(hasFocus: hasFocus)
         let dbDuration = Date().timeIntervalSince(dbStart)
         if verbose {
-            print("[VERBOSE] DB: Fetched \(allFiles.count) files in \(String(format: "%.3f", dbDuration))s", to: &stderrStream)
+            print("[VERBOSE] DB: Fetched \(symbols.count) symbols in \(String(format: "%.3f", dbDuration))s", to: &stderrStream)
         }
         
-        let totalFiles = allFiles.count
-        var rememberCount = 0
         let rememberStart = Date()
         
-        for (index, file) in allFiles.enumerated() {
-            delegate?.repoMapDidProgress(completed: index, total: totalFiles, currentFile: file.path)
-            let symbols = try db.getSymbols(fileId: file.id!)
+        // 1. Deduplicate symbols by content to prevent identical concurrent inserts (which causes idAlreadyExists)
+        var uniqueItems: [(content: String, matchesFocus: Bool)] = []
+        var seenContents = Set<String>()
+        
+        for (index, symbol) in symbols.enumerated() {
+            if index % 100 == 0 {
+                delegate?.repoMapDidProgress(completed: index, total: symbols.count, currentFile: symbol.filePath)
+            }
             
-            let fileName = (file.path as NSString).lastPathComponent
+            let fileName = (symbol.filePath as NSString).lastPathComponent
             let fileBase = (fileName as NSString).deletingPathExtension
 
-            for symbol in symbols {
-                let importantKinds: Set<SymbolRecord.Kind> = [.class, .struct, .protocol, .actor, .enum, .interface, .case]
-                let isLikelyPublic = symbol.accessLevel == "public" || symbol.accessLevel == "open" || symbol.accessLevel == nil
-                
-                // If focusing, be more selective but ALWAYS include focused matches
-                let matchesFocus = focusTerms?.lowercased().split(separator: " ").contains { term in
-                    symbol.name.lowercased().contains(term) || (symbol.docComment?.lowercased().contains(term) ?? false)
-                } ?? false
+            let importantKinds: Set<SymbolRecord.Kind> = [.class, .struct, .protocol, .actor, .enum, .interface, .case]
+            let isLikelyPublic = symbol.accessLevel == "public" || symbol.accessLevel == "open" || symbol.accessLevel == nil
+            let isTestFile = fileBase.lowercased().contains("test")
+            
+            let matchesFocus = focusTerms?.lowercased().split(separator: " ").contains { term in
+                symbol.name.lowercased().contains(term) || (symbol.docComment?.lowercased().contains(term) ?? false)
+            } ?? false
 
-                if !matchesFocus {
-                    // Aggressively filter out non-important symbols if we have focus terms
-                    if focusTerms != nil {
-                        if !importantKinds.contains(symbol.kind) { continue }
-                    } else {
-                        if !importantKinds.contains(symbol.kind) && !isLikelyPublic && !symbol.name.hasPrefix("test") {
-                            continue
-                        }
+            if !matchesFocus {
+                // If it's a test file and doesn't match the focus, skip it completely.
+                // Test files usually aren't needed for high-level architectural overviews.
+                if isTestFile { continue }
+                
+                if focusTerms != nil {
+                    if !importantKinds.contains(symbol.kind) { continue }
+                } else {
+                    if !importantKinds.contains(symbol.kind) && !isLikelyPublic && !symbol.name.hasPrefix("test") {
+                        continue
                     }
                 }
+            }
 
-                // Format the symbol as a high-signal memory chunk
-                var content = ""
-                if symbol.name.lowercased() == fileBase.lowercased() {
-                    content = "\(symbol.signature) [L\(symbol.startLine)-L\(symbol.endLine)]"
-                } else {
-                    content = "\(fileName): \(symbol.signature) [L\(symbol.startLine)-L\(symbol.endLine)]"
-                }
-                
-                if let doc = symbol.docComment, !doc.isEmpty {
-                    content = "/// \(doc.replacingOccurrences(of: "\n", with: "\n/// "))\n\(content)"
-                }
-                
-                let startRem = Date()
-                // If it matches focus, "boost" it by remembering it multiple times or adding a tag
-                if matchesFocus {
-                    try await agentContext.remember("FOCUS: " + content)
-                    try await agentContext.remember(content)
-                    rememberCount += 2
-                } else {
-                    try await agentContext.remember(content)
-                    rememberCount += 1
-                }
-                let remDur = Date().timeIntervalSince(startRem)
-                if verbose && remDur > 0.05 {
-                    print("[VERBOSE] SLOW: remembering symbol '\(symbol.name)' in \(fileName) took \(String(format: "%.3f", remDur))s", to: &stderrStream)
+            var content = ""
+            if symbol.name.lowercased() == fileBase.lowercased() {
+                content = "\(symbol.signature) [L\(symbol.startLine)-L\(symbol.endLine)]"
+            } else {
+                content = "\(fileName): \(symbol.signature) [L\(symbol.startLine)-L\(symbol.endLine)]"
+            }
+            
+            if let doc = symbol.docComment, !doc.isEmpty {
+                content = "/// \(doc.replacingOccurrences(of: "\n", with: "\n/// "))\n\(content)"
+            }
+            
+            if !seenContents.contains(content) {
+                seenContents.insert(content)
+                uniqueItems.append((content: content, matchesFocus: matchesFocus))
+            } else if matchesFocus {
+                // If it was already seen but now it matches focus, upgrade its status
+                if let idx = uniqueItems.firstIndex(where: { $0.content == content }) {
+                    uniqueItems[idx].matchesFocus = true
                 }
             }
+        }
+        
+        // 2. Bound concurrency to prevent thread starvation and CoreML bottlenecking
+        let rememberCount = try await withThrowingTaskGroup(of: Int.self) { group in
+            var count = 0
+            let maxConcurrency = 20
+            var taskIndex = 0
+            
+            while taskIndex < min(maxConcurrency, uniqueItems.count) {
+                let item = uniqueItems[taskIndex]
+                group.addTask {
+                    if item.matchesFocus {
+                        try await agentContext.remember("FOCUS: " + item.content)
+                        try await agentContext.remember(item.content)
+                        return 2
+                    } else {
+                        try await agentContext.remember(item.content)
+                        return 1
+                    }
+                }
+                taskIndex += 1
+            }
+            
+            for try await taskCount in group {
+                count += taskCount
+                if taskIndex < uniqueItems.count {
+                    let item = uniqueItems[taskIndex]
+                    group.addTask {
+                        if item.matchesFocus {
+                            try await agentContext.remember("FOCUS: " + item.content)
+                            try await agentContext.remember(item.content)
+                            return 2
+                        } else {
+                            try await agentContext.remember(item.content)
+                            return 1
+                        }
+                    }
+                    taskIndex += 1
+                }
+            }
+            return count
         }
         let rememberDuration = Date().timeIntervalSince(rememberStart)
         if verbose {

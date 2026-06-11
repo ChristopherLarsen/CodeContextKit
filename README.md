@@ -154,6 +154,27 @@ Swift and Kotlin are indexed into the same local database. Kotlin symbols use pa
 | `cckit outline` | Get the structural "skeleton" of Swift and Kotlin files. |
 | `cckit symbol` | Retrieve the exact implementation of any named symbol. |
 
+### 📦 Pack Examples
+
+Generate a targeted Markdown context packet for your AI assistant:
+
+```bash
+# Basic task-based packing
+cckit pack --task "Implement OAuth2 login flow"
+
+# Budgeted packing (limit token output)
+cckit pack --task "Add retry logic to network requests" --budget 15000
+
+# Targeted packing with a specific focus file
+cckit pack --task "Refactor the user profile view" --focus Sources/Views/UserProfile.swift
+
+# Output the packet to a specific file
+cckit pack --task "Fix the crash in the CoreData migration" --output migration_context.md
+
+# Combined example
+cckit pack --task "Update the sync service to handle workout reminders" --focus Sources/Services/SyncService.swift --budget 15000 --output my_context.md
+```
+
 ---
 
 ## MCP vs CLI
