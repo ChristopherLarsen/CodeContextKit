@@ -40,7 +40,8 @@ jobs:
 
     - name: Generate Documentation (DocC)
       run: |
-        swift package generate-documentation \
+        swift package --allow-writing-to-directory ./docs-export \
+          generate-documentation \
           --target CodeContextKitContext \
           --disable-indexing \
           --transform-for-static-hosting \
