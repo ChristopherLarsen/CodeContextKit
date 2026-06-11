@@ -252,6 +252,25 @@ function handleMessage(message) {
             packSemanticTopics = message.data.topics;
             updatePackGraph();
             break;
+        case 'pack_task_results':
+            if (message.data && message.data.length > 0) {
+                message.data.forEach(item => {
+                    if (!contextCart.some(i => i.path === item.path && i.name === item.name)) {
+                        contextCart.push(item);
+                    }
+                });
+                renderCart();
+                renderPackView();
+            }
+            if (message.reasoning) {
+                const reasoningContainer = document.getElementById('pack-reasoning-summary');
+                const reasoningText = document.getElementById('reasoning-text');
+                if (reasoningContainer && reasoningText) {
+                    reasoningContainer.style.display = 'block';
+                    reasoningText.innerText = message.reasoning;
+                }
+            }
+            break;
         case 'chat_reply':
             const chatHistory = document.getElementById('chat-history');
             if (chatHistory) {
@@ -292,6 +311,21 @@ function clearCart() {
 }
 
 function expandContext() { if (contextCart.length === 0) return; send({ type: 'get_associated_context', items: contextCart }); }
+
+function buildPackFromTask() {
+    const taskInput = document.getElementById('pack-task-input');
+    if (!taskInput || !taskInput.value) return;
+    const task = taskInput.value;
+    
+    const reasoningContainer = document.getElementById('pack-reasoning-summary');
+    const reasoningText = document.getElementById('reasoning-text');
+    if (reasoningContainer && reasoningText) {
+        reasoningContainer.style.display = 'block';
+        reasoningText.innerText = '🤖 Performing semantic search for task...';
+    }
+    
+    send({ type: 'search_for_pack', query: `semantic:${task}` });
+}
 
 function renderCart() {
     const listEl = document.getElementById('cart-list');
@@ -766,7 +800,27 @@ function renderFileContent(file) {
 
 function copyToClipboard(text) { navigator.clipboard.writeText(text).then(() => { const toast = document.createElement('div'); toast.innerText = `Copied: ${text}`; toast.style = 'position: fixed; bottom: 20px; right: 20px; background: #333; color: white; padding: 10px 20px; border-radius: 8px; z-index: 100000; font-size: 0.8rem;'; document.body.appendChild(toast); setTimeout(() => toast.remove(), 2000); }); }
 function populateSkeleton(file) { initMonaco('skeleton-container', file.content, 'swift', true); }
-function toggleSkeleton() { settings.skeletonOpen = !settings.skeletonOpen; localStorage.setItem('cckit_skeleton_open', settings.skeletonOpen); showView(window.location.pathname.startsWith('/file') ? 'docs' : 'docs', false); }
+function toggleSkeleton() { 
+    settings.skeletonOpen = !settings.skeletonOpen; 
+    localStorage.setItem('cckit_skeleton_open', settings.skeletonOpen); 
+    
+    const container = document.getElementById('skeleton-container');
+    const arrow = document.getElementById('skeleton-arrow');
+    
+    if (container) {
+        container.style.display = settings.skeletonOpen ? 'block' : 'none';
+        if (settings.skeletonOpen && typeof skeletonEditor !== 'undefined' && skeletonEditor) {
+            setTimeout(() => {
+                const contentHeight = Math.min(1000, skeletonEditor.getContentHeight());
+                container.style.height = `${contentHeight}px`;
+                skeletonEditor.layout({ width: container.clientWidth, height: contentHeight });
+            }, 10);
+        }
+    }
+    if (arrow) {
+        arrow.style.transform = `rotate(${settings.skeletonOpen ? '90deg' : '0deg'})`;
+    }
+}
 function isFavorite(name, filePath) { return favorites.some(f => f.name === name && f.filePath === filePath); }
 function toggleFavorite(name, filePath, kind, viewMode = 'symbols') { if (isFavorite(name, filePath)) { send({ type: 'remove_favorite', name: name, filePath: filePath }); } else { send({ type: 'add_favorite', name: name, filePath: filePath, kind: kind, viewMode: viewMode }); } }
 function requestSummary(name, signature, file) { const container = document.getElementById('ai-summary-container'); if (container) container.style.display = 'block'; const textEl = document.getElementById('ai-summary-text'); if (textEl) textEl.innerText = '🤖 Asking Foundation Model...'; send({ type: 'generate_summary', name: name, signature: signature, file: file }); }

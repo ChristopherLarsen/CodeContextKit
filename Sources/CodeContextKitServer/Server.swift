@@ -286,6 +286,24 @@ public struct CodeContextServer: Sendable {
                                 let response = ["type": "expanded_context", "data": expandedItems, "reasoning": reasoning]
                                 let responseData = try JSONSerialization.data(withJSONObject: response); try await outbound.write(.text(String(data: responseData, encoding: .utf8)!))
                             }
+                        case "search_for_pack":
+                            if let query = json["query"] as? String {
+                                let semanticQuery = query.hasPrefix("semantic:") ? String(query.dropFirst(9)) : query
+                                let waxResults = (try? await wax.search(semanticQuery, limit: 15)) ?? []
+                                var items: [[String: String]] = []
+                                var reasons: [String] = []
+                                for res in waxResults {
+                                    if let sym = try db.getSymbols(qualifiedName: res.symbol).first {
+                                        items.append(["path": sym.filePath, "name": sym.name, "kind": "symbol"])
+                                        reasons.append("Included symbol '\(sym.name)' (score: \(String(format: "%.2f", res.score))).")
+                                    }
+                                }
+                                
+                                let reasoning = reasons.isEmpty ? "No semantic matches found for the task." : "Mapped task to the following symbols:\n" + reasons.joined(separator: "\n")
+                                let response = ["type": "pack_task_results", "data": items, "reasoning": reasoning]
+                                let responseData = try JSONSerialization.data(withJSONObject: response)
+                                try await outbound.write(.text(String(data: responseData, encoding: .utf8)!))
+                            }
 
                         case "get_pack_preview":
                             if let items = json["items"] as? [[String: String]] {
@@ -495,7 +513,7 @@ public struct CodeContextServer: Sendable {
                                 
                                 // 1. Semantic Matches
                                 let semanticQuery = query.hasPrefix("semantic:") ? String(query.dropFirst(9)) : query
-                                let waxResults = try await wax.search(semanticQuery, limit: 8)
+                                let waxResults = (try? await wax.search(semanticQuery, limit: 8)) ?? []
                                 var semanticMatches: [[String: Any]] = []
                                 for res in waxResults {
                                     if let sym = try db.getSymbols(qualifiedName: res.symbol).first {
