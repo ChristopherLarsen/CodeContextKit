@@ -107,6 +107,11 @@
                     </div>
                 </div>
 
+                <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+                    <input type="text" id="pack-task-input" placeholder="Describe a task to auto-pack relevant semantic context (e.g., 'Update the sync service')..." style="flex: 1; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color);">
+                    <button class="action-btn" onclick="buildPackFromTask()" style="background: var(--accent-color);">🔍 Map Task</button>
+                </div>
+
                 <div id="pack-visualization-section" style="display: flex; flex-direction: column; gap: 20px; margin-bottom: 30px;">
                     <div style="height: 350px; background: var(--secondary-background); border: 1px solid var(--border-color); border-radius: 12px; overflow: hidden; position: relative;">
                         <div id="pack-graph-container" style="width: 100%; height: 100%;"></div>

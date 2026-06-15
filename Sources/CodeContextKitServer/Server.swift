@@ -75,8 +75,9 @@ public struct CodeContextServer: Sendable {
     private static func isPortFree(_ port: Int) -> Bool { let serverBootstrap = ServerBootstrap(group: MultiThreadedEventLoopGroup.singleton); do { let channel = try serverBootstrap.bind(host: "0.0.0.0", port: port).wait(); try channel.close().wait(); return true } catch { return false } }
 
     public func run() async throws {
+        let webPath = try await resolveWebDirectory()
         let router = Router(context: ServerContext.self)
-        router.addMiddleware { FileMiddleware("web", searchForIndexHtml: true) }
+        router.addMiddleware { FileMiddleware(webPath, searchForIndexHtml: true) }
         let db = try Database(path: dbPath)
         let wax = try await WaxStore(path: ".cckit/repo.wax")
         let indexer = Indexer(db: db, wax: wax)
@@ -99,7 +100,7 @@ public struct CodeContextServer: Sendable {
                 throw HTTPError(.notFound)
             }
             
-            let indexContent = try String(contentsOfFile: "web/index.html", encoding: .utf8)
+            let indexContent = try String(contentsOfFile: URL(fileURLWithPath: webPath).appendingPathComponent("index.html").path, encoding: .utf8)
             return Response(status: .ok, headers: [.contentType: "text/html"], body: .init(byteBuffer: ByteBuffer(string: indexContent)))
         }
 
@@ -284,6 +285,24 @@ public struct CodeContextServer: Sendable {
                                 let reasoning = reasons.isEmpty ? "No additional associated files found." : Array(Set(reasons)).joined(separator: " ")
                                 let response = ["type": "expanded_context", "data": expandedItems, "reasoning": reasoning]
                                 let responseData = try JSONSerialization.data(withJSONObject: response); try await outbound.write(.text(String(data: responseData, encoding: .utf8)!))
+                            }
+                        case "search_for_pack":
+                            if let query = json["query"] as? String {
+                                let semanticQuery = query.hasPrefix("semantic:") ? String(query.dropFirst(9)) : query
+                                let waxResults = (try? await wax.search(semanticQuery, limit: 15)) ?? []
+                                var items: [[String: String]] = []
+                                var reasons: [String] = []
+                                for res in waxResults {
+                                    if let sym = try db.getSymbols(qualifiedName: res.symbol).first {
+                                        items.append(["path": sym.filePath, "name": sym.name, "kind": "symbol"])
+                                        reasons.append("Included symbol '\(sym.name)' (score: \(String(format: "%.2f", res.score))).")
+                                    }
+                                }
+                                
+                                let reasoning = reasons.isEmpty ? "No semantic matches found for the task." : "Mapped task to the following symbols:\n" + reasons.joined(separator: "\n")
+                                let response = ["type": "pack_task_results", "data": items, "reasoning": reasoning]
+                                let responseData = try JSONSerialization.data(withJSONObject: response)
+                                try await outbound.write(.text(String(data: responseData, encoding: .utf8)!))
                             }
 
                         case "get_pack_preview":
@@ -494,7 +513,7 @@ public struct CodeContextServer: Sendable {
                                 
                                 // 1. Semantic Matches
                                 let semanticQuery = query.hasPrefix("semantic:") ? String(query.dropFirst(9)) : query
-                                let waxResults = try await wax.search(semanticQuery, limit: 8)
+                                let waxResults = (try? await wax.search(semanticQuery, limit: 8)) ?? []
                                 var semanticMatches: [[String: Any]] = []
                                 for res in waxResults {
                                     if let sym = try db.getSymbols(qualifiedName: res.symbol).first {
@@ -607,6 +626,58 @@ public struct CodeContextServer: Sendable {
         #endif
     }
     private func fallbackSummary(name: String, signature: String, file: String, projectName: String) -> String { return "Provides core functionality for '\(name)' within the \(projectName) project. Handles logic related to \(signature.contains("func") ? "the implementation of this function" : "this type definition") in the context of \(file)." }
+
+    private func resolveWebDirectory() async throws -> String {
+        let fm = FileManager.default
+        let localWebPath = "web"
+        let projectWebDir = URL(fileURLWithPath: ".cckit/web")
+        
+        let localIndexURL = URL(fileURLWithPath: localWebPath).appendingPathComponent("index.html")
+        if fm.fileExists(atPath: localIndexURL.path) {
+            return localWebPath
+        }
+        
+        // Otherwise, check project's .cckit/web dir
+        let indexURL = projectWebDir.appendingPathComponent("index.html")
+        let cssURL = projectWebDir.appendingPathComponent("css/style.css")
+        let jsURL = projectWebDir.appendingPathComponent("js/app.js")
+        
+        if !fm.fileExists(atPath: indexURL.path) || !fm.fileExists(atPath: cssURL.path) || !fm.fileExists(atPath: jsURL.path) {
+            print("Web visualizer assets not found locally or in .cckit/web/")
+            print("Downloading latest visualizer files from GitHub...")
+            try await downloadWebFiles(to: projectWebDir)
+        }
+        
+        return projectWebDir.path
+    }
+    
+    private func downloadWebFiles(to directory: URL) async throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: directory.appendingPathComponent("css"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: directory.appendingPathComponent("js"), withIntermediateDirectories: true)
+        
+        let files = [
+            ("index.html", "https://raw.githubusercontent.com/NickTrienens2025/CodeContextKit/main/web/index.html"),
+            ("css/style.css", "https://raw.githubusercontent.com/NickTrienens2025/CodeContextKit/main/web/css/style.css"),
+            ("js/app.js", "https://raw.githubusercontent.com/NickTrienens2025/CodeContextKit/main/web/js/app.js")
+        ]
+        
+        for (relPath, urlStr) in files {
+            guard let url = URL(string: urlStr) else { continue }
+            print("Downloading \(relPath)...")
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                throw NSError(
+                    domain: "CodeContextKit",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to download \(relPath) from \(urlStr)"]
+                )
+            }
+            let destURL = directory.appendingPathComponent(relPath)
+            try data.write(to: destURL)
+        }
+        print("Download complete.")
+    }
 }
 
 struct ServerProgressDelegate: IndexerProgressDelegate {

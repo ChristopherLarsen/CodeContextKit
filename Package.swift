@@ -25,7 +25,8 @@ let package = Package(
         .package(url: "https://github.com/tree-sitter/tree-sitter.git", from: "0.22.6"),
         .package(url: "https://github.com/tree-sitter-grammars/tree-sitter-kotlin.git", from: "1.1.0"),
         .package(url: "https://github.com/christopherkarani/Wax.git", branch: "main"),
-        .package(url: "https://github.com/christopherkarani/ContextCore.git", branch: "main")
+        .package(url: "https://github.com/christopherkarani/ContextCore.git", branch: "main"),
+        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.3.0")
     ],
     targets: [
         .executableTarget(

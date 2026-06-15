@@ -19,7 +19,7 @@ struct SymbolCommand: AsyncParsableCommand {
         let dbPath = ".cckit/index.sqlite"
         guard FileManager.default.fileExists(atPath: dbPath) else {
             print("Error: Index not found. Run 'cckit index' first.")
-            return
+            throw ExitCode.failure
         }
         
         let db = try Database(path: dbPath)
