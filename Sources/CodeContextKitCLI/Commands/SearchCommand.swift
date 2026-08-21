@@ -18,8 +18,11 @@ struct SearchCommand: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "Treat the query as a regular expression.")
     var regex: Bool = false
 
-    @Flag(name: .shortAndLong, help: "Require ALL terms to match (AND logic). Default is ANY (OR logic).")
+    @Flag(name: .shortAndLong, help: "Require ALL terms to match (AND logic) for lexical/file/symbol/grep search. Not applicable to vector meaning search.")
     var strict: Bool = false
+
+    @Flag(help: "Force semantic (vector) meaning search even for identifier-like queries.")
+    var vector: Bool = false
 
     @Flag(help: "Output in JSON format.")
     var json: Bool = false
@@ -36,69 +39,88 @@ struct SearchCommand: AsyncParsableCommand {
             print("Error: Index not found. Run 'cckit index' first.")
             throw ExitCode.failure
         }
-        
+
+        let route: SearchRoute = vector
+            ? .vector(SearchRoute.strippedQuery(query))
+            : SearchRoute.resolveCLI(query)
         let db = try Database(path: dbPath)
         let wax = try await WaxStore(path: waxPath)
-        let actionOrchestrator = ActionOrchestrator(db: db, wax: wax)
+
+        if case .vector = route {
+            try await requireVectorReady(wax: wax)
+        }
+
+        let actionOrchestrator = ActionOrchestrator(wax: wax)
         
         if json {
-            // JSON output is useful for sub-agents
-            let results = try await performUnifiedSearch(db: db, wax: wax)
+            let results = try await performUnifiedSearch(db: db, wax: wax, route: route)
             let data = try JSONSerialization.data(withJSONObject: results, options: .prettyPrinted)
             if let string = String(data: data, encoding: .utf8) { 
                 print(string) 
             }
         } else {
-            try await runInteractiveSearch(db: db, wax: wax)
+            try await runInteractiveSearch(db: db, wax: wax, route: route)
         }
         
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
         let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
-        try await actionOrchestrator.recordCLIAction(command: fullCommand, toolName: "Unified Search", durationMs: duration)
+        try await actionOrchestrator.recordCLIAction(command: fullCommand, toolName: "search", durationMs: duration)
         
         try await wax.close()
     }
 
-    private func performUnifiedSearch(db: Database, wax: WaxStore) async throws -> [String: Any] {
-        var results: [String: Any] = [:]
-        
-        if query.hasPrefix("semantic:") {
-            let semanticQuery = String(query.dropFirst(9)).trimmingCharacters(in: .whitespaces)
-            let waxResults = try await wax.search(semanticQuery, limit: limit)
-            results["semanticMatches"] = waxResults.map { ["symbol": $0.symbol, "score": $0.score, "file": $0.file] }
-        } else {
-            // 1. File Matches
-            let files = try db.getFilesLike(pattern: query, strict: strict)
-            results["files"] = files.prefix(limit).map { ["path": $0.path, "language": $0.language] }
+    private func performUnifiedSearch(db: Database, wax: WaxStore, route: SearchRoute) async throws -> [String: Any] {
+        switch route {
+        case .vector(let semanticQuery):
+            var payload = try await vectorPayload(wax: wax, query: semanticQuery)
+            if strict {
+                payload["warning"] = "strict_ignored"
+                payload["message"] = "--strict applies to lexical file/symbol/grep match only; vector meaning search does not AND terms."
+            }
+            return payload
 
-            // 2. Symbol Matches
-            let symbols = try db.getSymbolsLike(name: query, strict: strict)
-            results["symbols"] = symbols.prefix(limit).map { ["name": $0.qualifiedName, "kind": "\($0.kind)", "file": $0.filePath] }
-            
-            // 3. Text Matches (Grep logic)
-            let textResults = try await performGrepSearch(db: db)
-            results["textMatches"] = textResults
+        case .lexical(let pattern, let includeGrep, let allowVectorFallback):
+            let useAnd = strict || allowVectorFallback
+            let files = try db.getFilesLike(pattern: pattern, strict: useAnd)
+            let symbols = try db.getSymbolsLike(name: pattern, strict: useAnd)
+            let textMatches: [[String: Any]] = includeGrep
+                ? try await performGrepSearch(db: db, pattern: pattern)
+                : []
+
+            let useful = !files.isEmpty || !symbols.isEmpty || !textMatches.isEmpty
+            if !useful && allowVectorFallback {
+                try await requireVectorReady(wax: wax)
+                var payload = try await vectorPayload(wax: wax, query: pattern)
+                payload["fallback"] = "vector"
+                payload["message"] = "No AND lexical matches for multi-word identifier query; fell back to vector search."
+                return payload
+            }
+
+            var results: [String: Any] = [:]
+            results["files"] = files.prefix(limit).map { ["path": $0.path, "language": $0.language] }
+            results["symbols"] = symbols.prefix(limit).map {
+                ["name": $0.qualifiedName, "kind": "\($0.kind)", "file": $0.filePath]
+            }
+            if includeGrep {
+                results["textMatches"] = textMatches
+            }
+            return results
         }
-        
-        return results
     }
 
-    private func runInteractiveSearch(db: Database, wax: WaxStore) async throws {
-        if query.hasPrefix("semantic:") {
-            print("🧠 Performing Semantic Search...")
-            let semanticQuery = String(query.dropFirst(9)).trimmingCharacters(in: .whitespaces)
-            let waxResults = try await wax.search(semanticQuery, limit: limit)
-            
-            for res in waxResults {
-                if let sym = try db.getSymbols(qualifiedName: res.symbol).first {
-                    print("\n--- \(sym.qualifiedName) (\(sym.kind)) ---")
-                    print("File: \(sym.filePath)")
-                    print("Match: \(res.preview)")
-                }
+    private func runInteractiveSearch(db: Database, wax: WaxStore, route: SearchRoute) async throws {
+        switch route {
+        case .vector(let semanticQuery):
+            if strict {
+                print("Warning: --strict is ignored for vector meaning search (applies to lexical match only).")
             }
-        } else {
-            // File Search
-            let files = try db.getFilesLike(pattern: query, strict: strict)
+            try await printVectorResults(db: db, wax: wax, query: semanticQuery)
+
+        case .lexical(let pattern, let includeGrep, let allowVectorFallback):
+            let useAnd = strict || allowVectorFallback
+            let files = try db.getFilesLike(pattern: pattern, strict: useAnd)
+            let symbols = try db.getSymbolsLike(name: pattern, strict: useAnd)
+
             if !files.isEmpty {
                 print("📄 Found \(min(files.count, limit)) file matches:")
                 for file in files.prefix(limit) {
@@ -106,8 +128,6 @@ struct SearchCommand: AsyncParsableCommand {
                 }
             }
 
-            // Symbol Search
-            let symbols = try db.getSymbolsLike(name: query, strict: strict)
             if !symbols.isEmpty {
                 print("\n🔶 Found \(min(symbols.count, limit)) symbol matches:")
                 for symbol in symbols.prefix(limit) {
@@ -115,29 +135,85 @@ struct SearchCommand: AsyncParsableCommand {
                 }
             }
 
-            // Grep Search
-            print("\n🔍 Found text matches:")
-            let textResults = try await performGrepSearch(db: db)
-            for match in textResults {
-                print("\n--- \(match["file"]!) ---")
-                if let snippet = match["snippet"] as? String {
-                    print(snippet)
+            var textEmpty = true
+            if includeGrep {
+                print("\n🔍 Found text matches:")
+                let textResults = try await performGrepSearch(db: db, pattern: pattern)
+                textEmpty = textResults.isEmpty
+                for match in textResults {
+                    print("\n--- \(match["file"]!) ---")
+                    if let snippet = match["snippet"] as? String {
+                        print(snippet)
+                    }
                 }
+            }
+
+            let useful = !files.isEmpty || !symbols.isEmpty || (includeGrep && !textEmpty)
+            if !useful && allowVectorFallback {
+                print("No AND lexical matches; falling back to semantic search...")
+                try await requireVectorReady(wax: wax)
+                try await printVectorResults(db: db, wax: wax, query: pattern)
+            } else if !useful {
+                print("No file or symbol matches for '\(pattern)'.")
             }
         }
     }
 
-    private func performGrepSearch(db: Database) async throws -> [[String: Any]] {
+    private func vectorPayload(wax: WaxStore, query: String) async throws -> [String: Any] {
+        let waxResults = try await wax.search(query, limit: limit)
+        return [
+            "semanticMatches": waxResults.map {
+                ["symbol": $0.symbol, "score": $0.score, "file": $0.file] as [String: Any]
+            }
+        ]
+    }
+
+    private func printVectorResults(db: Database, wax: WaxStore, query: String) async throws {
+        print("🧠 Performing Semantic Search...")
+        guard await wax.isAvailable() else {
+            print("Error: Semantic store unavailable. Run 'cckit index .' to rebuild.")
+            throw ExitCode.failure
+        }
+        let waxResults = try await wax.search(query, limit: limit)
+
+        if waxResults.isEmpty {
+            print("No semantic matches. If you recently upgraded cckit, run 'cckit index .' to rebuild the vector index.")
+            return
+        }
+        
+        for res in waxResults {
+            if let sym = try db.getSymbols(qualifiedName: res.symbol).first {
+                print("\n--- \(sym.qualifiedName) (\(sym.kind)) ---")
+                print("File: \(sym.filePath)")
+                print("Match: \(res.preview)")
+            } else {
+                print("\n--- \(res.symbol) ---")
+                print("File: \(res.file)")
+                print("Match: \(res.preview)")
+            }
+        }
+    }
+
+    private func requireVectorReady(wax: WaxStore) async throws {
+        do {
+            try WaxEmbedderIdentity.requireCurrent()
+            try await wax.requireEmbeddings()
+        } catch {
+            print("Error: \(error.localizedDescription)")
+            throw ExitCode.failure
+        }
+    }
+
+    private func performGrepSearch(db: Database, pattern: String) async throws -> [[String: Any]] {
         let files = try db.getAllFiles()
         var matches: [[String: Any]] = []
         
-        // Multi-term logic for non-regex search
-        let terms = regex ? [query] : query.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+        let terms = regex ? [pattern] : pattern.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
         if terms.isEmpty { return [] }
 
         let regexes = terms.compactMap { term -> NSRegularExpression? in
-            let pattern = regex ? term : NSRegularExpression.escapedPattern(for: term)
-            return try? NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+            let escaped = regex ? term : NSRegularExpression.escapedPattern(for: term)
+            return try? NSRegularExpression(pattern: escaped, options: .caseInsensitive)
         }
         
         for file in files {
@@ -147,7 +223,6 @@ struct SearchCommand: AsyncParsableCommand {
             for (index, line) in lines.enumerated() {
                 let range = NSRange(location: 0, length: line.utf16.count)
                 
-                // Multi-term logic
                 let matchCount = regexes.filter { re in
                     re.firstMatch(in: line, options: [], range: range) != nil
                 }.count
@@ -155,7 +230,6 @@ struct SearchCommand: AsyncParsableCommand {
                 let isMatch = strict ? (matchCount == regexes.count) : (matchCount > 0)
 
                 if isMatch {
-                    // Snippet with 1 line context
                     let start = max(0, index - 1)
                     let end = min(lines.count - 1, index + 1)
                     var snippet = ""
@@ -170,7 +244,7 @@ struct SearchCommand: AsyncParsableCommand {
                         "content": line.trimmingCharacters(in: .whitespaces),
                         "snippet": snippet
                     ])
-                    break // One match per file for the summary view
+                    break
                 }
             }
             if matches.count >= limit { break }

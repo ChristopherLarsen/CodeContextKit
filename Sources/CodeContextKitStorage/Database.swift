@@ -150,6 +150,19 @@ public final class Database: @unchecked Sendable {
                 t.column("response", .text)
             }
         }
+
+        migrator.registerMigration("v6_wax_frames") { db in
+            try db.create(table: "waxFrameRecord") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("fileId", .integer)
+                    .notNull()
+                    .references("fileRecord", column: "id", onDelete: .cascade)
+                t.column("frameId", .integer)
+                t.column("mandate", .text).notNull()
+            }
+            try db.create(index: "idx_wax_frames_fileId", on: "waxFrameRecord", columns: ["fileId"])
+            try db.create(index: "idx_wax_frames_mandate", on: "waxFrameRecord", columns: ["mandate"])
+        }
         
         return migrator
     }
@@ -175,6 +188,80 @@ public final class Database: @unchecked Sendable {
     public func deleteFile(path: String) throws {
         _ = try writer.write { db in
             try FileRecord.filter(Column("path") == path).deleteAll(db)
+        }
+    }
+
+    /// Wax frame IDs previously ingested for this path (empty when never tracked).
+    public func waxFrameIDs(path: String) throws -> [UInt64] {
+        try writer.read { db in
+            guard let file = try FileRecord.filter(Column("path") == path).fetchOne(db),
+                  let fileId = file.id else {
+                return []
+            }
+            return try WaxFrameRecord
+                .filter(Column("fileId") == fileId)
+                .fetchAll(db)
+                .compactMap { row in
+                    guard let raw = row.frameId, raw >= 0 else { return nil }
+                    return UInt64(raw)
+                }
+        }
+    }
+
+    /// Mandates previously ingested for this path (delete-by-mandate fallback).
+    public func waxMandates(path: String) throws -> [String] {
+        try writer.read { db in
+            guard let file = try FileRecord.filter(Column("path") == path).fetchOne(db),
+                  let fileId = file.id else {
+                return []
+            }
+            let rows = try WaxFrameRecord
+                .filter(Column("fileId") == fileId)
+                .fetchAll(db)
+            var seen = Set<String>()
+            var out: [String] = []
+            for row in rows where seen.insert(row.mandate).inserted && !row.mandate.isEmpty {
+                out.append(row.mandate)
+            }
+            return out
+        }
+    }
+
+    public func waxFrameCount() throws -> Int {
+        try writer.read { db in
+            try WaxFrameRecord.fetchCount(db)
+        }
+    }
+
+    /// Every recorded Wax frame ID across the index (for `--compact`).
+    public func allWaxFrameIDs() throws -> [UInt64] {
+        try writer.read { db in
+            try WaxFrameRecord
+                .fetchAll(db)
+                .compactMap { row in
+                    guard let raw = row.frameId, raw >= 0 else { return nil }
+                    return UInt64(raw)
+                }
+        }
+    }
+
+    public func saveWaxFrames(fileId: Int64, mandate: String, frameIDs: [UInt64]) throws {
+        guard !mandate.isEmpty || !frameIDs.isEmpty else { return }
+        try writer.write { db in
+            if frameIDs.isEmpty {
+                var record = WaxFrameRecord(id: nil, fileId: fileId, frameId: nil, mandate: mandate)
+                try record.save(db)
+                return
+            }
+            for frameID in frameIDs {
+                var record = WaxFrameRecord(
+                    id: nil,
+                    fileId: fileId,
+                    frameId: Int64(frameID),
+                    mandate: mandate
+                )
+                try record.save(db)
+            }
         }
     }
     
@@ -224,6 +311,17 @@ public final class Database: @unchecked Sendable {
         }
     }
 
+    /// SQLite LIKE metacharacters. `\` is the escape so `%` / `_` in a name are literals.
+    private static let likeEscape = "\\"
+
+    private static func likeContains(_ column: Column, _ term: String) -> SQLExpression {
+        let escaped = term
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        return column.like("%\(escaped)%", escape: likeEscape)
+    }
+
     public func getFilesLike(pattern: String, strict: Bool = false) throws -> [FileRecord] {
         let terms = pattern.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
         if terms.isEmpty { return [] }
@@ -232,10 +330,10 @@ public final class Database: @unchecked Sendable {
             var request = FileRecord.all()
             if strict {
                 for term in terms {
-                    request = request.filter(Column("path").like("%\(term)%"))
+                    request = request.filter(Self.likeContains(Column("path"), term))
                 }
             } else {
-                let filters = terms.map { Column("path").like("%\($0)%") }
+                let filters = terms.map { Self.likeContains(Column("path"), $0) }
                 request = request.filter(filters.joined(operator: .or))
             }
             return try request.fetchAll(db)
@@ -288,10 +386,16 @@ public final class Database: @unchecked Sendable {
             var request = SymbolRecordInternal.all()
             if strict {
                 for term in terms {
-                    request = request.filter(Column("name").like("%\(term)%") || Column("qualifiedName").like("%\(term)%"))
+                    request = request.filter(
+                        Self.likeContains(Column("name"), term)
+                            || Self.likeContains(Column("qualifiedName"), term)
+                    )
                 }
             } else {
-                let filters = terms.map { Column("name").like("%\($0)%") || Column("qualifiedName").like("%\($0)%") }
+                let filters = terms.map {
+                    Self.likeContains(Column("name"), $0)
+                        || Self.likeContains(Column("qualifiedName"), $0)
+                }
                 request = request.filter(filters.joined(operator: .or))
             }
 
@@ -344,12 +448,66 @@ public final class Database: @unchecked Sendable {
         }
     }
 
+    /// Bulk-fetch symbols for repo-map generation (avoids N+1 per-file queries).
+    public func getSymbolsForRepoMap() throws -> [SymbolRecord] {
+        return try writer.read { db in
+            let files = try FileRecord.fetchAll(db)
+            var filePaths: [Int64: String] = [:]
+            filePaths.reserveCapacity(files.count)
+            for file in files {
+                if let id = file.id {
+                    filePaths[id] = file.path
+                }
+            }
+
+            let records = try SymbolRecordInternal
+                .order(Column("fileId").asc, Column("startLine").asc)
+                .fetchAll(db)
+
+            return records.map { record in
+                SymbolRecord(
+                    kind: SymbolRecord.Kind(rawValue: record.kind) ?? .function,
+                    name: record.name,
+                    qualifiedName: record.qualifiedName,
+                    signature: record.signature ?? "",
+                    filePath: filePaths[record.fileId] ?? "",
+                    startLine: record.startLine,
+                    endLine: record.endLine,
+                    enclosingType: record.enclosingType,
+                    accessLevel: record.accessLevel,
+                    docComment: record.docComment,
+                    estimatedTokens: record.estimatedTokens ?? 0
+                )
+            }
+        }
+    }
+
     public func getReferences(forSymbolName name: String) throws -> [SymbolRecord.Reference] {
         try writer.read { db in
             let records = try SymbolReferenceInternal
                 .filter(Column("name") == name)
                 .fetchAll(db)
             return try records.map {
+                let file = try FileRecord.filter(Column("id") == $0.fileId).fetchOne(db)
+                return SymbolRecord.Reference(name: $0.name, startLine: $0.startLine, endLine: $0.endLine, context: $0.context, file: file?.path ?? "")
+            }
+        }
+    }
+
+    /// References whose stored name contains `name` (closest/shortest first).
+    ///
+    /// Fallback for exact-name misses so near-name lookups do not retire to
+    /// Grep. Results are approximate: callers must label them as such.
+    public func getReferencesLike(name: String, limit: Int = 200) throws -> [SymbolRecord.Reference] {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        return try writer.read { db in
+            let records = try SymbolReferenceInternal
+                .filter(Self.likeContains(Column("name"), trimmed))
+                .limit(limit * 4)
+                .fetchAll(db)
+            let ranked = records.sorted { ($0.name.count, $0.name) < ($1.name.count, $1.name) }
+            return try ranked.prefix(limit).map {
                 let file = try FileRecord.filter(Column("id") == $0.fileId).fetchOne(db)
                 return SymbolRecord.Reference(name: $0.name, startLine: $0.startLine, endLine: $0.endLine, context: $0.context, file: file?.path ?? "")
             }
@@ -566,6 +724,17 @@ public struct SymbolRecordInternal: Codable, FetchableRecord, MutablePersistable
     public var docComment: String?
     public var estimatedTokens: Int?
     
+    public mutating func didInsert(_ inserted: InsertionSuccess) {
+        id = inserted.rowID
+    }
+}
+
+public struct WaxFrameRecord: Codable, FetchableRecord, MutablePersistableRecord {
+    public var id: Int64?
+    public var fileId: Int64
+    public var frameId: Int64?
+    public var mandate: String
+
     public mutating func didInsert(_ inserted: InsertionSuccess) {
         id = inserted.rowID
     }

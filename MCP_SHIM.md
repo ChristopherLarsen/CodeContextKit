@@ -82,28 +82,61 @@ Equivalent local config:
 
 Use absolute paths. Claude Code may launch the MCP server from a different working directory.
 
+## Agent Discovery (critical)
+
+Agents route from **server instructions** and **tool descriptions**. Copy must stay lean (those strings sit in the agent prompt) while still winning against Grep/Read/Glob.
+
+Tone:
+
+- Prefer these tools for relevance/token savings; never forbid built-ins.
+- `gather_code_context` is the starting retrieval for a symptom, a change, more than one file, or a failure log — even when names are visible (those names go in `task`). Treat the packet as starting context. Prefer gather over Grep/Read for source on the first retrieval. `symbol` for one known body; `find_symbol` after gather, or when you only need a qualified name, not a packet.
+- Content tools (`gather_code_context`, `symbol`, `outline`) read disk; locators (`find_symbol`, `find_references`) use the last index. A dirty worktree does not retire these tools. MCP auto-refreshes HEAD drift and dirty indexable files.
+- After a gather or locator hit, do not Grep that name. If you lack the next name, outline the file. Huge ranges: narrow Read, not symbol of the whole type.
+- On a locator miss, MCP indexes once and retries internally — do not ask the agent to call `index`. A miss that still fails attaches outlines of dirty files when it can; otherwise outline those files. Grep/Read remain appropriate for non-indexable files (markdown, project files, logs) and string literals. For source symbols, Grep only if outline lacks the name, then return to `symbol()`; do not Grep a committed symbol because some other file is dirty. `find_references` wants a symbol name, not a string.
+- `find_symbol` prints line ranges only for huge hits. Named-identifier gather misses (real CamelCase / qualified names absent from the packet) return a short miss (no filler packet). Title-case English is not an identifier. Gather misses invite retrying gather with prose; locator misses invite outline/symbol. Successful locator responses do not append a `Next:` footer — server instructions already steer. `symbol()` returns bodies only (call sites stay on `find_references`).
+- Do not brand CodeContextKit/cckit to the user; work under the hood.
+- Avoid force words (`REQUIRED`, `DO NOT`, `PRIMARY`, `must`), except the dirty-tree anti-pattern above.
+- Expose pack as `gather_code_context`; CLI remains `cckit pack`.
+- Keep `index` last.
+- Pass `repo=` when unsure (document on every tool).
+- Ideal MCP v1 surface: `find_symbol`, `find_references`, `gather_code_context`, `symbol`, `outline`, `map`, `index`.
+  Omit `search`, `estimate`, `summarize`, `explain` from MCP (CLI still has them).
+- Responses omit freshness when the index is current; `stale: true` only when not.
+
+The shim must keep:
+
+1. `FastMCP("cckit", instructions=...)` — gather_code_context for task-shaped work (symptom, change, multi-file, failure log) even when names are visible; find_symbol after gather or for a qualified name only; symbol for one known body; freshness free; dirty tree does not retire these tools; auto-refresh on HEAD drift and dirty indexable hash mismatches; miss-time force-index + single retry (no agent `index` call); occupancy rule (after a gather or locator hit, do not Grep that name; outline when unnamed; huge ranges → narrow Read); miss attaches dirty-file outlines; Grep stays valid for strings/docs/logs.
+2. Lean `@server.tool(title=..., description=...)` — capability, cost anchors where useful, `no_index` / `stale` → `index`.
+3. Short `Field(description=...)` on parameters — agents often choose args from schema text.
+4. `gather_code_context` schema: `task`, `repo`, `budget`, `failure`, `mode` only.
+
+Pin the script dependency to `mcp>=1.0,<2` (mcp 2.x removed FastMCP).
+
 ## Tool Surface
 
-Keep the first version small:
+Ideal MCP v1 (keep small):
 
 | MCP tool | Wraps | Notes |
 |---|---|---|
-| `index` | `cckit index .` | Supports `clean`, `include`, `exclude`, `include_build_scripts`, and `include_generated`. |
-| `search` | `cckit search --json` | Parses JSON output. |
-| `symbol` | `cckit symbol --json` | Fetch exact qualified symbols. |
-| `outline` | `cckit outline` | Works for Swift and Kotlin through cckit's registry. |
-| `map` | `cckit map` | Token-budgeted repo map. |
-| `pack` | `cckit pack` | Main context-building tool. |
-| `estimate` | `cckit estimate` | Token estimate helper. |
-| `summarize` | `cckit summarize --memory` | Deterministic project memory output. |
-| `explain` | `cckit explain` | Current diagnostic command. |
+| `find_symbol` | `cckit find-symbol` | Name lookup after gather, or when you only need a qualified name, not a packet (line ranges only for huge hits). |
+| `find_references` | `cckit find-references` | Indexed call sites. Rejects non-symbol strings. Returns `truncated` + `totalCount`. |
+| `gather_code_context` | `cckit pack` | Budgeted source packet for a symptom, change, multi-file task, or failure log. Names in `task` help matching. Identifier miss → short miss, not a filler packet. |
+| `symbol` | `cckit symbol --json` | Exact qualified **body**. Batch names after `find_symbol`, or for a name a gather packet did not include. |
+| `outline` | `cckit outline` | Structural skeleton before full-file reads (metadata only). |
+| `map` | `cckit map` | Names-only repo map; prefer gather when you need source. Skip if the gather packet already included a repository map. |
+| `index` | `cckit index .` | Last. Usually unnecessary — MCP auto-refreshes on HEAD drift / dirty files, auto-compacts leaked Wax vectors, and retries once on locator miss (`CCKIT_REFRESH=auto`). |
 
-Omit for v1:
+Responses omit freshness when the index is current; `stale: true` appears only when it is not. MCP flattens CLI JSON fields to the top level (not nested under `data`). Set `CCKIT_REFRESH=never` to disable auto-reindex. `CCKIT_CALLER=mcp` is set on subprocesses so `pack-stats` can separate agent traffic from shell runs.
 
+Omit from MCP (still available via CLI):
+
+- `search`
+- `estimate`
+- `summarize`
+- `explain`
 - `serve`
 - `benchmark-serve`
 - `history-benchmark`
-- any future `clean`, `detect`, `config`, or language-diagnostic commands that do not exist in the current CLI.
 
 ## Repo Resolution
 
@@ -115,7 +148,9 @@ Resolution order:
 2. Optional `CCKIT_REPO` environment variable.
 3. MCP server launch cwd as a last resort.
 
-The recommended path is to always pass `repo`.
+The recommended path is to always pass `repo`. Do not set `CCKIT_REPO` globally
+in a Cursor MCP config shared across workspaces — every other project then
+searches the wrong tree unless each tool call passes `repo=`.
 
 ## Subprocess Wrapper
 
@@ -139,23 +174,43 @@ def index(
     return run_cckit(args, repo=repo, timeout=300)
 ```
 
-## Pack Tool Shape
+## Context tool shape (`gather_code_context` → `cckit pack`)
 
-`cckit pack` remains the primary context tool. The current focused Kotlin support does not include a Gradle failure-log parser, so the MCP shim should not document Kotlin-specific failure-log behavior as implemented.
+`cckit pack` remains the CLI. The MCP surface exposes it as `gather_code_context`
+so agents match on “need code context for this work.” The current focused Kotlin
+support does not include a Gradle failure-log parser, so the MCP shim should not
+document Kotlin-specific failure-log behavior as implemented.
 
 ```python
-def pack(
-    repo: str | None,
+@server.tool(name="gather_code_context", title="Gather code context", ...)
+def gather_code_context(
     task: str,
+    repo: str | None = None,
     budget: int = 12000,
+    failure: str | None = None,
+    mode: Annotated[
+        str,
+        Field(description="auto (default)=smallest of surgical|full|raw; surgical; full"),
+    ] = "auto",
 ) -> dict:
-    return run_cckit(
-        ["pack", "--task", task, "--budget", str(budget)],
-        repo=repo,
-        timeout=120,
-    )
+    args = ["pack", "--task", task, "--budget", str(budget)]
+    if failure:
+        args.extend(["--failure", failure])
+    if mode == "full":
+        args.append("--full")
+    elif mode == "surgical":
+        args.append("--surgical")
+    return run_cckit(args, repo=repo, timeout=180)
 ```
 
+MCP schema is `task`, `repo`, `budget`, `failure`, `mode` only (`format`/`full` not exposed).
+Default packing is **`auto`**: deliver the smallest of surgical, full, and raw.
+Raw is primary files plus the packet banner (not a literal `cat`); it is
+delivered-only — requested modes are `auto|surgical|full`. Surgical mode uses
+symbol body slices plus same-file related name lists (cap 5); files ≤100 lines
+dump as whole files without related-hint chrome. Pass `mode=full` (CLI `--full`)
+for forced whole-file primary dumps. Surfacing mode on the MCP schema (not only
+the tool docstring) matters: agents often choose args from schema descriptions.
 If `cckit pack --failure` exists and works generically, the shim can pass it through as a generic option. It should not claim Kotlin compiler log anchoring unless that feature is reintroduced.
 
 ## Error Handling
@@ -176,14 +231,14 @@ Completed:
 1. Created `mcp/cckit_mcp.py`.
 2. Added the PEP-723 header.
 3. Implemented `run_cckit`.
-4. Implemented `index`, `search`, `symbol`, `outline`, `pack`, `map`, `estimate`, `summarize`, and `explain`.
+4. Ideal MCP v1 tools: `find_symbol`, `find_references`, `gather_code_context` (wraps pack), `symbol`, `outline`, `map`, `index`.
 
 Remaining local setup:
 
 1. Build `cckit` with `swift build -c release`.
 2. Register the shim in Claude Code.
 3. Restart Claude Code.
-4. Verify a tool call such as `search(repo: "...", query: "UserRepository")`.
+4. Verify a tool call such as `gather_code_context(repo: "...", task: "Fix login retry")`.
 
 ## Current Status
 

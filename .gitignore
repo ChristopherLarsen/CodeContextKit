@@ -6,5 +6,7 @@ Packages/
 .swiftpm/
 *.sqlite
 *.wax
+__pycache__/
+*.py[cod]
 Sources/CTreeSitter/
 Sources/CTreeSitterKotlin/

@@ -1,5 +1,6 @@
 import ArgumentParser
 import CodeContextKitServer
+import CodeContextKitRetrieval
 import Foundation
 
 struct ServeCommand: AsyncParsableCommand {
@@ -12,6 +13,13 @@ struct ServeCommand: AsyncParsableCommand {
     var port: Int?
 
     func run() async throws {
+        do {
+            try WaxEmbedderIdentity.requireCurrent()
+        } catch {
+            print("Error: \(error.localizedDescription)")
+            throw ExitCode.failure
+        }
+
         let finalPort: Int
         if let port = self.port {
             finalPort = port

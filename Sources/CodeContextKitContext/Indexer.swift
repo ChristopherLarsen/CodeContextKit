@@ -45,7 +45,7 @@ public final class Indexer: Sendable {
         includeBuildScripts: Bool = false,
         includeGenerated: Bool = false,
         delegate: IndexerProgressDelegate? = nil
-    ) async throws {
+    ) async throws -> WaxCompactResult {
         let absolutePath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
         let scanner = FileScanner()
         let hasher = FileHasher()
@@ -67,6 +67,11 @@ public final class Indexer: Sendable {
             relativePath(for: fileURL, rootPath: absolutePath)
         })
         delegate?.indexerDidStart(totalFiles: files.count)
+
+        let needsWaxBackfill = try db.waxFrameCount() == 0 && !db.getAllFiles().isEmpty
+        if needsWaxBackfill {
+            try await wax.resetStore()
+        }
         
         var updatedCount = 0
         var skippedCount = 0
@@ -82,11 +87,11 @@ public final class Indexer: Sendable {
                 let currentHash = hasher.hash(content: content)
                 
                 if let existingFile = try db.getFile(path: relativePath) {
-                    if existingFile.sha256 == currentHash {
+                    if !needsWaxBackfill && existingFile.sha256 == currentHash {
                         skippedCount += 1
                         continue
                     }
-                    try db.deleteFile(path: relativePath)
+                    try await retractFromWaxAndSQLite(path: relativePath)
                 }
                 
                 let lines = content.components(separatedBy: .newlines)
@@ -135,7 +140,14 @@ public final class Indexer: Sendable {
                 
                 for symbol in symbols {
                     let body = symbol.kind == .file ? content : LineRangeBodyExtractor.body(for: symbol, content: content)
-                    try await wax.saveSymbol(symbol, body: body)
+                    let ingest = try await wax.saveSymbol(symbol, body: body)
+                    if ingest.didWrite {
+                        try db.saveWaxFrames(
+                            fileId: fileId,
+                            mandate: ingest.mandate,
+                            frameIDs: ingest.frameIDs
+                        )
+                    }
                 }
                 
                 updatedCount += 1
@@ -152,12 +164,41 @@ public final class Indexer: Sendable {
         for indexedFile in allIndexedFiles {
             let fullURL = URL(fileURLWithPath: absolutePath).appendingPathComponent(indexedFile.path)
             if !FileManager.default.fileExists(atPath: fullURL.path) || !scannedRelativePaths.contains(indexedFile.path) {
-                try db.deleteFile(path: indexedFile.path)
+                try await retractFromWaxAndSQLite(path: indexedFile.path)
                 print("Removed stale file from index: \(indexedFile.path)")
             }
         }
-        
+
+        let compacted = try await compactWax()
+        if compacted.deleted > 0 {
+            print("Compacted Wax: deleted \(compacted.deleted) leaked vectors (\(compacted.kept) kept)")
+        }
+
         delegate?.indexerDidFinish(updated: updatedCount, skipped: skippedCount, totalSymbols: totalSymbols)
+        return compacted
+    }
+
+    /// Drop Wax vectors that are not in the current SQLite keep-set. No re-embed.
+    public func compactWax() async throws -> WaxCompactResult {
+        let recorded = Set(try db.allWaxFrameIDs())
+        let live = Set(try db.getSymbolsForRepoMap().map {
+            WaxStore.symbolKey(filePath: $0.filePath, qualifiedName: $0.qualifiedName)
+        })
+        return try await wax.compact(recordedFrameIDs: recorded, liveSymbolKeys: live)
+    }
+
+    private func retractFromWaxAndSQLite(path: String) async throws {
+        // No flush here. Every flush commits, and each commit re-appends the
+        // full-corpus text index to repo.wax — flushing per retracted file was
+        // the main driver of arena growth (one file edit => two full index
+        // blobs). Deletes target frames committed by earlier runs, so they are
+        // visible without a commit; the run's single end-of-index flush
+        // commits retractions and saves together.
+        let frameIDs = try db.waxFrameIDs(path: path)
+        let mandates = try db.waxMandates(path: path)
+        try await wax.deleteFrames(frameIDs)
+        try await wax.deleteByMandates(mandates)
+        try db.deleteFile(path: path)
     }
 
     private func relativePath(for fileURL: URL, rootPath: String) -> String {

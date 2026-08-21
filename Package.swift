@@ -24,8 +24,7 @@ let package = Package(
         .package(url: "https://github.com/unum-cloud/usearch.git", from: "2.16.0"),
         .package(url: "https://github.com/tree-sitter/tree-sitter.git", from: "0.22.6"),
         .package(url: "https://github.com/tree-sitter-grammars/tree-sitter-kotlin.git", from: "1.1.0"),
-        .package(url: "https://github.com/christopherkarani/Wax.git", branch: "main"),
-        .package(url: "https://github.com/christopherkarani/ContextCore.git", branch: "main"),
+        .package(url: "https://github.com/ChristopherLarsen/Wax.git", revision: "d4de9d6a8af73b55b0fefe3a5786bab27f6d8cf1"),
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.3.0")
     ],
     targets: [
@@ -97,8 +96,7 @@ let package = Package(
                 "CodeContextKitSwiftIndex",
                 "CodeContextKitKotlinIndex",
                 "CodeContextKitStorage",
-                "CodeContextKitRetrieval",
-                .product(name: "ContextCore", package: "ContextCore")
+                "CodeContextKitRetrieval"
             ]
         ),
         .testTarget(

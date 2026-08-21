@@ -36,6 +36,14 @@ final class WebContextTests: XCTestCase {
         XCTAssertTrue(styleNames.contains(".main-container"), "Should index class selector '.main-container'")
         XCTAssertTrue(styleNames.contains("#header-title"), "Should index ID selector '#header-title'")
         XCTAssertTrue(styleNames.contains(".btn-primary"), "Should index class selector '.btn-primary'")
+        XCTAssertTrue(styleNames.contains(":root"), "Should index :root")
+        XCTAssertTrue(styleNames.contains("--link-color"), "Should index CSS custom properties")
+        XCTAssertTrue(styleNames.contains("--heading-color"), "Should index CSS custom properties")
+
+        let root = cssSymbols.first { $0.name == ":root" }
+        XCTAssertEqual(root?.kind, .style)
+        XCTAssertGreaterThan(root?.endLine ?? 0, root?.startLine ?? 0)
+        XCTAssertEqual(cssSymbols.first { $0.name == "--link-color" }?.kind, .property)
         
         // Verify JS symbols were indexed
         let jsSymbols = try db.getSymbols(path: "js/app.js")
@@ -58,10 +66,24 @@ final class WebContextTests: XCTestCase {
         let packer = ContextPacker(db: db, wax: wax, rootPath: fixtureURL.path)
         
         // Pack context based on a task that relates to our symbols
-        let packet = try await packer.pack(task: "calculate total in shopping cart", budget: 4000)
+        let packet = try await packer.pack(task: "calculate total in shopping cart", budget: 4000).packet
         
-        // ContextPacker uses Wax search to find relevant symbols
-        // So calculateTotal should be found and its file included
+        // ContextPacker uses Wax search to find relevant symbols, then emits
+        // symbol body slices (or FULL for tiny files). calculateTotal should appear.
         XCTAssertTrue(packet.contains("function calculateTotal"), "Packet should contain JS function body")
+        XCTAssertTrue(packet.contains("mode: surgical") || packet.contains("Tokens:"), "Packet should include token banner")
+    }
+
+    func testWebContextPackingFullMode() async throws {
+        try await indexer.index(at: fixtureURL.path)
+
+        let packer = ContextPacker(db: db, wax: wax, rootPath: fixtureURL.path)
+        let packet = try await packer.pack(
+            task: "calculate total in shopping cart",
+            budget: 4000,
+            mode: .full
+        ).packet
+        XCTAssertTrue(packet.contains("mode: full"))
+        XCTAssertTrue(packet.contains("function calculateTotal"), "Full pack should still contain JS function body")
     }
 }

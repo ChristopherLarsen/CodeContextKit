@@ -81,7 +81,7 @@ public struct CodeContextServer: Sendable {
         let db = try Database(path: dbPath)
         let wax = try await WaxStore(path: ".cckit/repo.wax")
         let indexer = Indexer(db: db, wax: wax)
-        let actionOrchestrator = ActionOrchestrator(db: db, wax: wax)
+        let actionOrchestrator = ActionOrchestrator(wax: wax)
 
         let currentDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let projectName = currentDirectory.lastPathComponent
@@ -510,56 +510,51 @@ public struct CodeContextServer: Sendable {
                         case "search":
                             if let query = json["query"] as? String {
                                 var results: [String: Any] = [:]
-                                
-                                // 1. Semantic Matches
-                                let semanticQuery = query.hasPrefix("semantic:") ? String(query.dropFirst(9)) : query
-                                let waxResults = (try? await wax.search(semanticQuery, limit: 8)) ?? []
-                                var semanticMatches: [[String: Any]] = []
-                                for res in waxResults {
-                                    if let sym = try db.getSymbols(qualifiedName: res.symbol).first {
-                                        semanticMatches.append([
-                                            "symbol": sym.qualifiedName,
-                                            "file": sym.filePath,
-                                            "kind": "\(sym.kind)",
-                                            "score": Double(res.score),
-                                            "refCount": (try? db.getReferenceCount(forSymbolName: sym.name)) ?? 0
-                                        ])
-                                    }
-                                }
-                                results["semanticMatches"] = semanticMatches
-                                
-                                // 2. File Matches
-                                let files = try db.getFilesLike(pattern: query.replacingOccurrences(of: "semantic:", with: ""))
-                                results["files"] = files.prefix(10).map { ["path": $0.path, "language": $0.language] }
-
-                                // 3. Exact/Symbol Matches
-                                let symbols = try db.getSymbolsLike(name: query.replacingOccurrences(of: "semantic:", with: ""))
-                                results["symbols"] = symbols.prefix(10).map { [
-                                    "symbol": $0.qualifiedName,
-                                    "file": $0.filePath,
-                                    "kind": "\($0.kind)",
-                                    "refCount": (try? db.getReferenceCount(forSymbolName: $0.name)) ?? 0
-                                ] }
-                                
-                                // 4. Literal Text Matches (Grep logic)
-                                let indexedFiles = try db.getAllFiles()
-                                var textMatches: [[String: Any]] = []
-                                let pattern = NSRegularExpression.escapedPattern(for: query.replacingOccurrences(of: "semantic:", with: ""))
-                                if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
-                                    for file in indexedFiles {
-                                        guard let content = try? String(contentsOfFile: file.path, encoding: .utf8) else { continue }
-                                        let lines = content.components(separatedBy: .newlines)
-                                        for (index, line) in lines.enumerated() {
-                                            let range = NSRange(location: 0, length: line.utf16.count)
-                                            if regex.firstMatch(in: line, options: [], range: range) != nil {
-                                                textMatches.append(["file": file.path, "line": index + 1, "content": line.trimmingCharacters(in: .whitespaces)])
-                                                break // One per file for summary
+                                switch SearchRoute.resolveVisualizer(query) {
+                                case .lexical(let stripped, _, let allowVectorFallback):
+                                    let files = try db.getFilesLike(pattern: stripped, strict: allowVectorFallback)
+                                    let symbols = try db.getSymbolsLike(name: stripped, strict: allowVectorFallback)
+                                    if allowVectorFallback && files.isEmpty && symbols.isEmpty {
+                                        let waxResults = (try? await wax.search(stripped, limit: 8)) ?? []
+                                        var semanticMatches: [[String: Any]] = []
+                                        for res in waxResults {
+                                            if let sym = try db.getSymbols(qualifiedName: res.symbol).first {
+                                                semanticMatches.append([
+                                                    "symbol": sym.qualifiedName,
+                                                    "file": sym.filePath,
+                                                    "kind": "\(sym.kind)",
+                                                    "score": Double(res.score),
+                                                    "refCount": (try? db.getReferenceCount(forSymbolName: sym.name)) ?? 0
+                                                ])
                                             }
                                         }
-                                        if textMatches.count > 10 { break }
+                                        results["semanticMatches"] = semanticMatches
+                                        results["fallback"] = "vector"
+                                    } else {
+                                        results["files"] = files.prefix(10).map { ["path": $0.path, "language": $0.language] }
+                                        results["symbols"] = symbols.prefix(10).map { [
+                                            "symbol": $0.qualifiedName,
+                                            "file": $0.filePath,
+                                            "kind": "\($0.kind)",
+                                            "refCount": (try? db.getReferenceCount(forSymbolName: $0.name)) ?? 0
+                                        ] }
                                     }
+                                case .vector(let semanticQuery):
+                                    let waxResults = (try? await wax.search(semanticQuery, limit: 8)) ?? []
+                                    var semanticMatches: [[String: Any]] = []
+                                    for res in waxResults {
+                                        if let sym = try db.getSymbols(qualifiedName: res.symbol).first {
+                                            semanticMatches.append([
+                                                "symbol": sym.qualifiedName,
+                                                "file": sym.filePath,
+                                                "kind": "\(sym.kind)",
+                                                "score": Double(res.score),
+                                                "refCount": (try? db.getReferenceCount(forSymbolName: sym.name)) ?? 0
+                                            ])
+                                        }
+                                    }
+                                    results["semanticMatches"] = semanticMatches
                                 }
-                                results["textMatches"] = textMatches
                                 
                                 let response = ["type": "search_results", "data": results]
                                 let responseData = try JSONSerialization.data(withJSONObject: response)

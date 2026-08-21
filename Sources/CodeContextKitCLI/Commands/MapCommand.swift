@@ -1,8 +1,9 @@
 import ArgumentParser
 import Foundation
+import Darwin
 import CodeContextKitStorage
 import CodeContextKitContext
-import CodeContextKitRetrieval
+import CodeContextKitCore
 
 struct MapCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -32,29 +33,56 @@ struct MapCommand: AsyncParsableCommand {
             print("Error: Index not found. Run 'cckit index' first.")
             throw ExitCode.failure
         }
-        
+
         let db = try Database(path: dbPath)
-        let wax = try await WaxStore(path: ".cckit/repo.wax")
-        let actionOrchestrator = ActionOrchestrator(db: db, wax: wax)
-        
-        let builder = RepoMapBuilder(db: db, counter: { text in await wax.countTokens(text) })
-        let delegate = CommandLineRepoMapProgressDelegate()
-        let map = try await builder.buildMap(budget: budget, focusTerms: focus, delegate: delegate, verbose: verbose)
-        
+        let estimator = TokenEstimator.shared
+        let actionOrchestrator = ActionOrchestrator(repoRoot: ".")
+
+        let builder = RepoMapBuilder(db: db, counter: { text in estimator.estimate(text) })
+        let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
+        let delegate: RepoMapProgressDelegate? = InteractiveProgress.shouldEmit(
+            verbose: verbose,
+            stdoutIsTTY: stdoutIsTTY
+        ) ? CommandLineRepoMapProgressDelegate() : nil
+        let changedPaths: Set<String>? = changed
+            ? MapBaseline.changedPaths(
+                repoRoot: FileManager.default.currentDirectoryPath,
+                base: base
+            )
+            : nil
+        let map = try await builder.buildMap(
+            budget: budget,
+            focusTerms: focus,
+            changedPaths: changedPaths,
+            delegate: delegate,
+            verbose: verbose
+        )
+
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
-        let tokens = await wax.countTokens(map)
+        let tokens = estimator.estimate(map)
         let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
-        try await actionOrchestrator.recordCLIAction(command: fullCommand, toolName: "Map Builder", durationMs: duration, tokensUsed: tokens)
-        
-        print("\n" + map)
-        try await wax.close()
+        try await actionOrchestrator.recordCLIAction(
+            command: fullCommand,
+            toolName: "map",
+            durationMs: duration,
+            tokensUsed: tokens
+        )
+
+        let freshness = IndexFreshness.check(repoRoot: ".")
+        if let warning = freshness.softWarning {
+            FileHandle.standardError.write(Data((warning + "\n").utf8))
+        }
+        print(map)
     }
 }
 
 struct CommandLineRepoMapProgressDelegate: RepoMapProgressDelegate {
     func repoMapDidProgress(completed: Int, total: Int, currentFile: String) {
-        let percent = Int(Double(completed) / Double(total) * 100)
-        print("\rRanking symbols: \(percent)% [\(completed)/\(total)] \(currentFile.split(separator: "/").last ?? "")", terminator: "")
-        fflush(stdout)
+        let line = InteractiveProgress.rankingLine(
+            completed: completed,
+            total: total,
+            currentFile: currentFile
+        )
+        InteractiveProgress.write(line, to: .standardError)
     }
 }

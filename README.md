@@ -148,38 +148,99 @@ Swift and Kotlin are indexed into the same local database. Kotlin symbols use pa
 
 | Command | Purpose |
 | :--- | :--- |
-| `cckit index` | Build the SQLite & Semantic knowledge base. |
+| `cckit index` | Build the SQLite & Semantic knowledge base. `--compact` reclaims leaked Wax vectors without re-embedding. |
 | `cckit pack` | Generate a surgical context packet for an AI task. |
+| `cckit find-symbol` | Name fragment → qualified names + paths (no bodies). |
+| `cckit find-references` | Symbol name → indexed call sites (paths + lines, no bodies). |
 | `cckit search` | Unified discovery: Symbol, Literal (Grep), and Semantic search. |
 | `cckit outline` | Get the structural "skeleton" of Swift and Kotlin files. |
 | `cckit symbol` | Retrieve the exact implementation of any named symbol. |
+| `cckit history-benchmark` | Sample git history for pack tokens + file-level recall@k. |
 
 ### 📦 Pack Examples
 
 Generate a targeted Markdown context packet for your AI assistant:
 
 ```bash
-# Basic task-based packing
+# Basic task-based packing (default: auto — smallest of surgical, full, raw)
 cckit pack --task "Implement OAuth2 login flow"
 
-# Budgeted packing (limit token output)
+# Budgeted packing (token ceiling, not a fill target)
 cckit pack --task "Add retry logic to network requests" --budget 15000
 
-# Targeted packing with a specific focus file
-cckit pack --task "Refactor the user profile view" --focus Sources/Views/UserProfile.swift
+# Cheap first look (~1500 token cap): hit list, line ranges, body sizes, map —
+# no bodies. Expand with `cckit symbol` or re-gather with --surgical/--full.
+cckit pack --task "Fix login retry" --preview
+
+# Force surgical-only or legacy full-file primaries
+cckit pack --task "Fix login retry" --surgical
+cckit pack --task "Review entire auth module" --full
 
 # Output the packet to a specific file
 cckit pack --task "Fix the crash in the CoreData migration" --output migration_context.md
 
 # Combined example
-cckit pack --task "Update the sync service to handle workout reminders" --focus Sources/Services/SyncService.swift --budget 15000 --output my_context.md
+cckit pack --task "Update the sync service to handle workout reminders" --budget 15000 --output my_context.md
 ```
+
+Default **`auto`** delivers the smallest of surgical, full, and raw — and never
+delivers a packet larger than reading its primary files outright (when even raw
+loses, chrome is stripped until it cannot lose). Raw is primary files plus the
+packet banner (not a literal `cat`). Surgical mode uses symbol body slices plus
+a compact **same-file related** list (callers / callees / siblings — names and
+line ranges only, capped at 5 per category). Files ≤100 lines (or ≥80% body
+coverage) are emitted as whole files without related-hint chrome. When same-file
+related lists are truncated, surgical packets append **Packing notes** that tell
+agents to call `gather_code_context` again with `mode=full` (CLI: `cckit pack --full`)
+for whole-file context, or `symbol` / `outline` for individual neighbors.
+Untruncated related lists omit that footer.
+
+Auto packs append savings to `.cckit/pack_savings.jsonl`. Tool calls append to
+`.cckit/action_history.jsonl` (survives `cckit index --clean`). Both JSONL
+ledgers keep **at most 7 days** of rows (override with `CCKIT_LEDGER_KEEP_DAYS`);
+prune runs **at most once per day** (stamp: `.cckit/jsonl_retention_stamp`).
+Evicted rows are folded into monthly rollups (`pack_savings_monthly.jsonl`,
+`tool_usage_monthly.jsonl`) so lifetime numbers survive pruning. Metrics compare
+**delivered tokens** to the **whole-file size of files already loaded for that
+call** — not vs Grep or other tools (dual-running those spends the tokens you
+would claim to save). MCP responses attach a one-line `savings` summary
+(`~delivered vs whole-file`) on successful gather/symbol/outline/map calls; MCP
+pack calls print a machine-readable `PACK_STATS {...}` line. Review with:
+
+```bash
+cckit pack-stats
+# Pack savings (vs whole source files already loaded into packets)
+# By month (rollups survive the 7-day ledger window) + lifetime totals
+# Tool usage (from …/action_history.jsonl)
+```
+
+---
+
+## Keep the index fresh across branch checkouts
+
+`cckit index` stamps the current git commit/branch into `.cckit/index-stamp.json`.
+MCP responses omit freshness when the index is current; a `stale: true` field
+appears only when it is not. Re-index (or let MCP auto-refresh) before trusting
+symbols from another commit. MCP also runs an incremental index when indexable
+working-tree files differ from the stored hashes, so uncommitted edits are
+picked up without a branch change.
+
+Optional refresh-only post-checkout hook (skips worktrees with no index, so shared
+`.git/hooks` across many worktrees will not trigger a full multi-minute build):
+
+```bash
+cp scripts/git-hooks/post-checkout .git/hooks/post-checkout
+chmod +x .git/hooks/post-checkout
+```
+
+The hook runs only when `[ -f "$root/.cckit/index.sqlite" ]` and a branch checkout
+occurred; it then runs an incremental `cckit index .` in the background.
 
 ---
 
 ## MCP vs CLI
 
-Use the Claude Code MCP integration when Claude Code is doing the work. MCP lets Claude call `cckit` directly for indexing, search, outlines, repo maps, and context packs, which avoids pasting command output and can save tokens by steering Claude toward indexed symbols and focused packets instead of broad file reads.
+Use the Claude Code MCP integration when Claude Code is doing the work. MCP lets Claude call `cckit` directly for context packs, outlines, repo maps, and symbols, which avoids pasting command output and can save tokens by steering Claude toward focused packets instead of broad file reads.
 
 Use the CLI when you are working manually, scripting, debugging setup, or launching the visualizer. The CLI is also the best way to verify what MCP is doing underneath:
 
@@ -220,7 +281,7 @@ CodeContextKit is **local-first**. Your code is indexed into a local SQLite data
 
 ## Claude Code MCP Installation
 
-CodeContextKit includes a local MCP shim at `mcp/cckit_mcp.py` so Claude Code can call `cckit` for indexing, search, outlines, repo maps, and context packs.
+CodeContextKit includes a local MCP shim at `mcp/cckit_mcp.py` so Claude Code can call `cckit` for context packs, outlines, repo maps, symbols, and indexing.
 
 Recommended use: install the MCP when you plan to use Claude Code on the same Swift, Android, or Kotlin repository repeatedly. Once registered, Claude Code can call `cckit` tools directly instead of asking you to paste command output or reading broad swaths of files. That usually makes project navigation more automatic and can save tokens by using indexed symbols, outlines, repo maps, and focused context packs instead of full-file dumps.
 
@@ -270,23 +331,25 @@ claude mcp list
 Smoke test in Claude Code:
 
 ```text
-Use the cckit MCP server to index this repo.
-Use cckit MCP to search for UserRepository.
+Use the cckit MCP server to gather code context for fixing login retry.
+Use cckit MCP to outline Sources/Auth/APIClient.swift.
 ```
 
 Available MCP tools:
 
 | MCP tool | cckit command | Notes |
 | :--- | :--- | :--- |
-| `index` | `cckit index .` | Supports `clean`, `include`, `exclude`, `include_build_scripts`, and `include_generated`. |
-| `search` | `cckit search --json` | Searches files, symbols, text, or `semantic:` queries. |
-| `symbol` | `cckit symbol --json` | Fetches exact qualified symbols. |
+| `gather_code_context` | `cckit pack` | Budgeted source packet for a symptom, change, multi-file task, or failure log (`auto` by default; `mode=surgical` / `mode=full` / `mode=preview` via `mode`). Successful calls carry a one-line savings summary. |
+| `find_symbol` | `cckit find-symbol` | Name lookup after gather, or when you only need a qualified name (no bodies). |
+| `find_references` | `cckit find-references` | Indexed call sites (paths + lines). Check `truncated`/`totalCount`; raise `limit` before concluding unused. |
+| `symbol` | `cckit symbol --json` | Exact qualified name → **implementation body**. |
 | `outline` | `cckit outline` | Works for Swift and Kotlin files. |
-| `map` | `cckit map` | Builds a budgeted repo map. |
-| `pack` | `cckit pack` | Generates the surgical Markdown context packet. |
-| `estimate` | `cckit estimate` | Estimates tokens for a file or raw text. |
-| `summarize` | `cckit summarize --memory` | Produces deterministic project memory. |
-| `explain` | `cckit explain` | Explains index, pack, or symbol behavior. |
+| `map` | `cckit map` | Names-only budgeted repo map; prefer gather when you need source. Skip if the packet already included a map. |
+| `index` | `cckit index .` | Supports `clean`, `include`, `exclude`, `include_build_scripts`, and `include_generated`. Stamps git HEAD. |
+
+MCP responses omit freshness metadata when the index is current; `stale: true`
+appears only when the stamp disagrees with `HEAD`. Set `CCKIT_REFRESH=never` to
+skip auto-reindex; `CCKIT_DEBUG_STDERR=1` to keep stderr on successful calls.
 
 The shim returns structured errors such as `bad_repo`, `cckit_not_found`, `timeout`, `no_index`, `bad_json`, and `cckit_failed` when setup or CLI calls fail.
 

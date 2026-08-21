@@ -4,24 +4,10 @@ import CodeContextKitCore
 public struct KotlinOutlineRenderer: OutlineRendering {
     public init() {}
 
-    public func render(filePath: String, symbols: [SymbolRecord]) -> String {
-        var output = ""
-        let sortedSymbols = symbols.sorted { $0.startLine < $1.startLine }
-
-        for symbol in sortedSymbols {
-            let indentationCount = enclosingTypeDepth(symbol.enclosingType)
-            let indentation = String(repeating: "  ", count: indentationCount)
-
-            if let doc = symbol.docComment, !doc.isEmpty {
-                for line in doc.components(separatedBy: .newlines) {
-                    output += "\(indentation)/// \(line)\n"
-                }
-            }
-
-            output += "\(indentation)\(symbol.signature) [L\(symbol.startLine)-L\(symbol.endLine)]\n"
+    public func render(filePath: String, symbols: [SymbolRecord], options: OutlineOptions = .default) -> String {
+        OutlineAssembler.render(symbols: symbols, options: options) { symbol in
+            enclosingTypeDepth(symbol.enclosingType)
         }
-
-        return output
     }
 
     private func enclosingTypeDepth(_ enclosingType: String?) -> Int {

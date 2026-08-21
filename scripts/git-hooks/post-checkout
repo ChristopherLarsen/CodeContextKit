@@ -1,0 +1,24 @@
+#!/bin/sh
+# cckit post-checkout hook — refresh an existing index after branch switches.
+# Install: cp scripts/git-hooks/post-checkout .git/hooks/post-checkout && chmod +x .git/hooks/post-checkout
+#
+# Refresh-only: if this worktree has no .cckit/index.sqlite, exit immediately.
+# That avoids a 37+ minute full build when many worktrees share .git/hooks.
+
+# post-checkout args: previous_HEAD new_HEAD flag (1 = branch checkout)
+flag="$3"
+[ "$flag" = "1" ] || exit 0
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -f "$root/.cckit/index.sqlite" ] || exit 0
+
+if command -v cckit >/dev/null 2>&1; then
+  cckit_bin="cckit"
+elif [ -x "$HOME/.local/bin/cckit" ]; then
+  cckit_bin="$HOME/.local/bin/cckit"
+else
+  exit 0
+fi
+
+# Incremental refresh in the background so checkout stays snappy.
+(cd "$root" && "$cckit_bin" index .) >/dev/null 2>&1 &

@@ -25,9 +25,14 @@ final class IncrementalIndexingTests: XCTestCase {
         packer = ContextPacker(db: db, wax: wax, rootPath: tempDir.path)
     }
     
-    override func tearDown() {
+    override func tearDown() async throws {
+        // Close deterministically: Wax enqueues background maintenance on
+        // flush(), and deallocating the store without close() leaves that task
+        // racing process teardown.
+        try? await wax.close()
+        wax = nil
         try? FileManager.default.removeItem(at: tempDir)
-        super.tearDown()
+        try await super.tearDown()
     }
     
     func testFileChangeDetection() async throws {
@@ -62,12 +67,12 @@ final class IncrementalIndexingTests: XCTestCase {
         
         // 3. Generate packet BEFORE re-indexing
         // Packer uses Wax to find relevant files, then reads from disk for bodies.
-        let packetBefore = try await packer.pack(task: "runTask", budget: 1000)
+        let packetBefore = try await packer.pack(task: "runTask", budget: 1000).packet
         XCTAssertTrue(packetBefore.contains("New Content"), "Packer should read latest content from disk even if index is stale.")
         
         // 4. Re-index and verify symbols
         try await indexer.index(at: tempDir.path)
-        let packetAfter = try await packer.pack(task: "runTask", budget: 1000)
+        let packetAfter = try await packer.pack(task: "runTask", budget: 1000).packet
         XCTAssertTrue(packetAfter.contains("New Content"))
     }
     
@@ -85,5 +90,144 @@ final class IncrementalIndexingTests: XCTestCase {
         try await indexer.index(at: tempDir.path)
         
         XCTAssertNil(try db.getFile(path: "DeleteMe.swift"), "Deleted file still exists in database.")
+    }
+
+    func testReindexDeletesStaleWaxVectors() async throws {
+        let embeddingsReady = await wax.hasEmbeddings()
+        try XCTSkipUnless(embeddingsReady, "MiniLM embeddings required")
+
+        let fileURL = tempDir.appendingPathComponent("Needle.swift")
+        try """
+        public enum AlphaZuluOrphan {
+            /// unique phrase alpha-zulu-orphan-vector-leak
+            public static func leftover() {}
+        }
+        """.write(to: fileURL, atomically: true, encoding: .utf8)
+        try await indexer.index(at: tempDir.path)
+
+        XCTAssertGreaterThan(try db.waxFrameCount(), 0, "Wax frame IDs/mandates must be persisted")
+        let originalHits = try await wax.search("unique phrase alpha-zulu-orphan-vector-leak", limit: 5)
+        XCTAssertTrue(
+            originalHits.contains { $0.symbol.contains("AlphaZuluOrphan") || $0.preview.contains("alpha-zulu-orphan") },
+            "Expected original needle in Wax. Hits: \(originalHits.map(\.symbol))"
+        )
+
+        try """
+        public enum BravoYankeeFresh {
+            /// unique phrase bravo-yankee-fresh-vector-keep
+            public static func current() {}
+        }
+        """.write(to: fileURL, atomically: true, encoding: .utf8)
+        try await indexer.index(at: tempDir.path)
+
+        let staleHits = try await wax.search("unique phrase alpha-zulu-orphan-vector-leak", limit: 8)
+        XCTAssertFalse(
+            staleHits.contains { $0.preview.contains("alpha-zulu-orphan") || $0.symbol.contains("AlphaZuluOrphan") },
+            "Stale Wax vectors leaked after re-index. Hits: \(staleHits.map { "\($0.symbol): \($0.preview.prefix(80))" })"
+        )
+
+        let freshHits = try await wax.search("unique phrase bravo-yankee-fresh-vector-keep", limit: 5)
+        XCTAssertTrue(
+            freshHits.contains { $0.symbol.contains("BravoYankeeFresh") || $0.preview.contains("bravo-yankee-fresh") },
+            "Replacement needle missing. Hits: \(freshHits.map(\.symbol))"
+        )
+    }
+
+    func testDeletedFileRetractsWaxVectors() async throws {
+        let embeddingsReady = await wax.hasEmbeddings()
+        try XCTSkipUnless(embeddingsReady, "MiniLM embeddings required")
+
+        let fileURL = tempDir.appendingPathComponent("Gone.swift")
+        try """
+        public struct WaxGoneNeedle {
+            /// unique phrase wax-gone-needle-retract
+            public func vanish() {}
+        }
+        """.write(to: fileURL, atomically: true, encoding: .utf8)
+        try await indexer.index(at: tempDir.path)
+        XCTAssertGreaterThan(try db.waxFrameCount(), 0)
+
+        try FileManager.default.removeItem(at: fileURL)
+        try await indexer.index(at: tempDir.path)
+
+        XCTAssertNil(try db.getFile(path: "Gone.swift"))
+        XCTAssertEqual(try db.waxFrameCount(), 0)
+        let hits = try await wax.search("unique phrase wax-gone-needle-retract", limit: 5)
+        XCTAssertFalse(
+            hits.contains { $0.preview.contains("wax-gone-needle-retract") || $0.symbol.contains("WaxGoneNeedle") },
+            "Deleted file still in Wax. Hits: \(hits.map(\.symbol))"
+        )
+    }
+
+    func testIndexPersistsSaveReturnedFrameIDs() async throws {
+        let embeddingsReady = await wax.hasEmbeddings()
+        try XCTSkipUnless(embeddingsReady, "MiniLM embeddings required")
+
+        let fileURL = tempDir.appendingPathComponent("IDs.swift")
+        try """
+        public struct SaveReturnedIDs {
+            /// unique phrase save-returned-frame-ids
+            public func keep() {}
+        }
+        """.write(to: fileURL, atomically: true, encoding: .utf8)
+        try await indexer.index(at: tempDir.path)
+
+        let ids = try db.waxFrameIDs(path: "IDs.swift")
+        XCTAssertFalse(ids.isEmpty, "Memory.save must persist real frame IDs, not mandate-only rows")
+    }
+
+    func testCompactDropsOrphanWaxVectorsWithoutReembed() async throws {
+        let embeddingsReady = await wax.hasEmbeddings()
+        try XCTSkipUnless(embeddingsReady, "MiniLM embeddings required")
+
+        let fileURL = tempDir.appendingPathComponent("Keep.swift")
+        try """
+        public struct CompactKeepNeedle {
+            /// unique phrase compact-keep-vector
+            public func stay() {}
+        }
+        """.write(to: fileURL, atomically: true, encoding: .utf8)
+        try await indexer.index(at: tempDir.path)
+
+        let leaked = SymbolRecord(
+            kind: .struct,
+            name: "CompactOrphanNeedle",
+            qualifiedName: "CompactOrphanNeedle",
+            signature: "struct CompactOrphanNeedle",
+            filePath: "Missing.swift",
+            startLine: 1,
+            endLine: 4,
+            docComment: "unique phrase compact-orphan-vector"
+        )
+        let ingest = try await wax.saveSymbol(
+            leaked,
+            body: """
+            /// unique phrase compact-orphan-vector
+            public struct CompactOrphanNeedle {}
+            """
+        )
+        XCTAssertTrue(ingest.didWrite)
+        try await wax.flush()
+
+        let beforeOrphan = try await wax.search("unique phrase compact-orphan-vector", limit: 5)
+        XCTAssertTrue(
+            beforeOrphan.contains { $0.preview.contains("compact-orphan-vector") || $0.symbol.contains("CompactOrphanNeedle") },
+            "Expected planted orphan. Hits: \(beforeOrphan.map(\.symbol))"
+        )
+
+        let result = try await indexer.compactWax()
+        XCTAssertGreaterThan(result.deleted, 0)
+
+        let afterOrphan = try await wax.search("unique phrase compact-orphan-vector", limit: 5)
+        XCTAssertFalse(
+            afterOrphan.contains { $0.preview.contains("compact-orphan-vector") || $0.symbol.contains("CompactOrphanNeedle") },
+            "Orphan survived compact. Hits: \(afterOrphan.map(\.symbol))"
+        )
+
+        let kept = try await wax.search("unique phrase compact-keep-vector", limit: 5)
+        XCTAssertTrue(
+            kept.contains { $0.symbol.contains("CompactKeepNeedle") || $0.preview.contains("compact-keep-vector") },
+            "Live symbol dropped by compact. Hits: \(kept.map(\.symbol))"
+        )
     }
 }
