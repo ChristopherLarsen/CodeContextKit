@@ -1,0 +1,55 @@
+{
+  "cckit": "/Users/christopherlarsen/Workspace/CodeContextKit/.build/debug/cckit",
+  "index_seconds": 1.6,
+  "B1_dedup": {
+    "gather_first_tokens": 480,
+    "gather_second_tokens": 480,
+    "gather_second_stubbed": false,
+    "outline_first_tokens": 81,
+    "outline_second_tokens": 81,
+    "outline_second_stubbed": false,
+    "symbol_restart_retention_stubbed": null
+  },
+  "B2_inline_singleton": {
+    "find_symbol_count": 1,
+    "total_count": 1,
+    "body_inlined": false,
+    "find_symbol_tokens": 35,
+    "followup_symbol_tokens": 165,
+    "flow_tokens_with_inline": 200,
+    "flow_tokens_without_inline": 200
+  },
+  "B3_prose_soft_miss": {
+    "semantic_guess_only_tagged": false,
+    "candidates_attached_chars": 0,
+    "blind_regather_policy_tokens": 960,
+    "tag_then_symbol_policy_tokens": 655
+  },
+  "B4_semantic_ranges": {
+    "corpus": "/var/folders/5t/_0yj_66d48g82cyd0b4wnc_h0000gn/T/cckit-bench-c96fc58d/BenchFix",
+    "semantic_hits": 5,
+    "hits_with_ranges": 0,
+    "enrichment_fraction": 0.0,
+    "added_tokens_total": 0
+  },
+  "B5_batch_refs": {
+    "targets": [
+      "refreshToken",
+      "validate",
+      "rotate"
+    ],
+    "individual_calls": 3,
+    "individual_tokens_sum": 198,
+    "batch_tokens": 125,
+    "batch_supported": false
+  },
+  "B6_hygiene": {
+    "failure_packet_tokens": 50129,
+    "huge_line_leaked_into_packet": true,
+    "fallback_scan_paths": [
+      "ignored/generated.swift"
+    ],
+    "fallback_scan_respects_gitignore": false,
+    "fallback_matches_in_tracked_only": false
+  }
+}

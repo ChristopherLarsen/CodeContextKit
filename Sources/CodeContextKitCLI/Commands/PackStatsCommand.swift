@@ -23,6 +23,7 @@ struct PackStatsCommand: AsyncParsableCommand {
         let entries = try ledger.loadEntries()
         let byDay = try ledger.savingsByDay()
         let actions = try history.loadEntries()
+        let dedup = PackSavingsLedger.readDedupSavings(cckitDir: ledger.cckitDir)
 
         // Monthly rollups survive the 7-day JSONL window; combine with live rows
         // so lifetime numbers keep growing after old rows are evicted.
@@ -126,6 +127,13 @@ struct PackStatsCommand: AsyncParsableCommand {
                         "tokensUsed": value.tokens,
                     ] as [String: Any]
                 },
+                "dedup": [
+                    "stubs": dedup.calls,
+                    "tokensSaved": dedup.tokensSaved,
+                    "byTool": Dictionary(uniqueKeysWithValues: dedup.byTool.map {
+                        ($0.key, ["calls": $0.value.calls, "tokensSaved": $0.value.tokensSaved] as [String: Any])
+                    }),
+                ],
             ]
             let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
             print(String(decoding: data, as: UTF8.self))
@@ -173,6 +181,25 @@ struct PackStatsCommand: AsyncParsableCommand {
             for (day, saved, _, source, packs) in byDay.reversed() {
                 let label = PackSavingsLedger.formatDayLabel(day)
                 print("  \(label): \(PackSavingsLedger.formatSavingsLine(saved: saved, sourceWholeFileTokens: source, packs: packs))")
+            }
+            print("")
+        }
+
+        if dedup.calls > 0 {
+            print("Dedup savings (stubbed re-deliveries of unchanged content)")
+            print(
+                "  ledger: \(ledger.cckitDir.appendingPathComponent("dedup_savings.jsonl").path)"
+            )
+            print(
+                "  stubs:  \(dedup.calls) · saved "
+                    + "\(PackSavingsLedger.formatTokenCount(dedup.tokensSaved)) tokens"
+            )
+            for tool in dedup.byTool.keys.sorted() {
+                let value = dedup.byTool[tool]!
+                print(
+                    "  \(tool): \(value.calls) · saved "
+                        + "\(PackSavingsLedger.formatTokenCount(value.tokensSaved)) tokens"
+                )
             }
             print("")
         }

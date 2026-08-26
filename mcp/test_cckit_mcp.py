@@ -448,6 +448,70 @@ class DeliveryDedupTests(unittest.TestCase):
         payload = {"count": 0}
         self.assertIs(mcp.apply_delivery_dedup(payload, "/repo"), payload)
 
+    def _packet(self, body: str) -> dict:
+        return {
+            "text": (
+                "# Context Packet\n\n"
+                "### Auth.refresh (SYMBOL · Sources/A.swift:10-40)\n"
+                "```swift\n" + body + "\n```\n"
+            )
+        }
+
+    def test_packet_dedup_stubs_repeat_body(self) -> None:
+        big = "let x = 1\n" * 60
+        first = mcp.apply_packet_dedup(self._packet(big), "/repo")
+        self.assertNotIn("deduplicated", first)
+        second = mcp.apply_packet_dedup(self._packet(big), "/repo")
+        self.assertTrue(second.get("deduplicated"))
+        self.assertIn("unchanged since earlier this session", second["text"])
+        self.assertIn("### Auth.refresh", second["text"])
+        self.assertGreater(second["dedupSavedTokens"], 0)
+
+    def test_packet_dedup_skips_small_bodies(self) -> None:
+        first = mcp.apply_packet_dedup(self._packet("tiny"), "/repo")
+        second = mcp.apply_packet_dedup(self._packet("tiny"), "/repo")
+        self.assertNotIn("deduplicated", first)
+        self.assertNotIn("deduplicated", second)
+
+    def test_outline_dedup_stubs_repeat(self) -> None:
+        payload = {"text": "struct X\n" + "member line\n" * 60}
+        first = mcp.apply_outline_dedup(dict(payload), "/repo", "X.swift")
+        self.assertNotIn("deduplicated", first)
+        second = mcp.apply_outline_dedup(dict(payload), "/repo", "X.swift")
+        self.assertTrue(second.get("deduplicated"))
+        self.assertIn("unchanged since earlier this session", second["text"])
+        self.assertEqual(
+            second["originalOutlineTokens"],
+            max(1, len(payload["text"]) // 4),
+        )
+
+    def test_ledger_persists_and_reloads(self) -> None:
+        import tempfile as _tf
+        from pathlib import Path as _Path
+
+        with _tf.TemporaryDirectory() as tmp:
+            repo = str(_Path(tmp))
+            mcp.apply_delivery_dedup(self._payload("persist-me"), repo)
+            path = _Path(repo) / ".cckit" / "delivery_ledger.json"
+            self.assertTrue(path.exists())
+            mcp._delivery_ledger.clear()
+            loaded = mcp.load_delivery_ledger(repo)
+            self.assertEqual(loaded, 1)
+            stubbed = mcp.apply_delivery_dedup(self._payload("persist-me"), repo)
+            self.assertTrue(stubbed["symbols"][0]["deduplicated"])
+
+    def test_dedup_savings_rows_written(self) -> None:
+        import tempfile as _tf
+        from pathlib import Path as _Path
+
+        with _tf.TemporaryDirectory() as tmp:
+            repo = str(_Path(tmp))
+            mcp.record_dedup_saving(repo, "symbol", 120)
+            mcp.record_dedup_saving(repo, "gather", 80)
+            rows_file = _Path(repo) / ".cckit" / "dedup_savings.jsonl"
+            rows = [json.loads(line) for line in rows_file.read_text().splitlines()]
+            self.assertEqual([row["savedTokens"] for row in rows], [120, 80])
+
 
 class SearchTextTests(unittest.TestCase):
     def test_collapse_ranges(self) -> None:

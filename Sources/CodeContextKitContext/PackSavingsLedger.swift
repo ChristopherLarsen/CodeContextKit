@@ -368,8 +368,7 @@ public struct PackSavingsLedger: Sendable {
     }
 
     /// Savings summed by calendar day in the given time zone (default: local).
-    public func savingsByDay(
-        timeZone: TimeZone = .current,
+    public func savingsByDay(        timeZone: TimeZone = .current,
         calendar: Calendar = .current,
         now: Date = Date()
     ) throws -> [(day: Date, tokensSaved: Int, tokensDelivered: Int, sourceWholeFileTokens: Int, packs: Int)] {
@@ -484,5 +483,38 @@ public struct ActionHistoryStore: Sendable {
     public func nextId(now: Date = Date()) throws -> Int64 {
         let maxId = try loadEntries(now: now).compactMap(\.id).max() ?? 0
         return maxId + 1
+    }
+}
+
+/// Aggregate of the MCP shim's delivery-dedup ledger (`dedup_savings.jsonl`):
+/// tokens avoided by stubbing unchanged re-deliveries (symbol/gather/outline).
+public struct DedupSavingsSummary: Sendable {
+    public var calls: Int = 0
+    public var tokensSaved: Int = 0
+    public var byTool: [String: (calls: Int, tokensSaved: Int)] = [:]
+
+    public init() {}
+}
+
+extension PackSavingsLedger {
+    /// Reads `.cckit/dedup_savings.jsonl` written by the shim's session dedup.
+    public static func readDedupSavings(cckitDir: URL) -> DedupSavingsSummary {
+        let url = cckitDir.appendingPathComponent("dedup_savings.jsonl")
+        var summary = DedupSavingsSummary()
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else {
+            return summary
+        }
+        for line in raw.split(separator: "\n") {
+            guard let data = line.data(using: .utf8),
+                  let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let saved = row["savedTokens"] as? Int
+            else { continue }
+            let tool = (row["tool"] as? String) ?? "unknown"
+            summary.calls += 1
+            summary.tokensSaved += saved
+            let prior = summary.byTool[tool] ?? (0, 0)
+            summary.byTool[tool] = (prior.calls + 1, prior.tokensSaved + saved)
+        }
+        return summary
     }
 }

@@ -1,0 +1,13 @@
+{
+  "cckit": "/Users/christopherlarsen/Workspace/CodeContextKit/.build/debug/cckit",
+  "index_seconds": 2.4,
+  "B1_dedup": {
+    "gather_first_tokens": 803,
+    "gather_second_tokens": 739,
+    "gather_second_stubbed": true,
+    "outline_first_tokens": 81,
+    "outline_second_tokens": 26,
+    "outline_second_stubbed": true,
+    "symbol_restart_retention_stubbed": true
+  }
+}

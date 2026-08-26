@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -740,6 +741,199 @@ def apply_delivery_dedup(
         _dedup_saved_total += saved
         payload["deduplicated"] = True
         payload["dedupSavedTokens"] = saved
+        record_dedup_saving(repo, "symbol", saved)
+    save_delivery_ledger(repo)
+    return payload
+
+
+_GATHER_BODY_MIN_CHARS = 200
+_GATHER_SECTION_RE = re.compile(
+    r"(?ms)^### (?P<name>.+?) \(SYMBOL · (?P<location>[^\n)]+)\)\n"
+    r"```(?P<fence>\w*)\n(?P<body>.*?)\n```$"
+)
+_DEDUP_STUB_LINE = (
+    "[unchanged since earlier this session — ~{tokens} tokens delivered "
+    "previously. Pass refresh=true to re-fetch.]"
+)
+
+
+def _ledger_path(repo: str) -> Path:
+    return Path(repo) / ".cckit" / "delivery_ledger.json"
+
+
+def load_delivery_ledger(repo: str | None) -> int:
+    """Merge persisted fingerprints for `repo` into memory; returns count loaded.
+
+    Survives shim self-reload (execv) and client reconnects.
+    """
+    if not repo:
+        return 0
+    try:
+        raw = _ledger_path(repo).read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return 0
+    entries = data.get("entries") if isinstance(data, dict) else None
+    loaded = 0
+    for row in entries or []:
+        if not isinstance(row, list) or len(row) != 3:
+            continue
+        scope, name, fingerprint = row
+        if not all(isinstance(part, str) for part in row):
+            continue
+        key = (scope, name)
+        if key not in _delivery_ledger:
+            _delivery_ledger[key] = fingerprint
+            loaded += 1
+    return loaded
+
+
+def save_delivery_ledger(repo: str | None) -> None:
+    """Write this repo's fingerprints to .cckit/delivery_ledger.json."""
+    if not repo:
+        return
+    prefix = str(repo)
+    rows = [
+        [scope, name, fingerprint]
+        for (scope, name), fingerprint in _delivery_ledger.items()
+        if scope == prefix or scope.startswith(f"outline:{prefix}") or scope.startswith(f"gather:{prefix}")
+    ]
+    if not rows:
+        return
+    path = _ledger_path(repo)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"version": 1, "entries": rows[-_DELIVERY_LEDGER_CAP:]}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def record_dedup_saving(repo: str | None, tool: str, saved_tokens: int) -> None:
+    """Append one row to .cckit/dedup_savings.jsonl for pack-stats rollups."""
+    if not repo or saved_tokens <= 0:
+        return
+    path = Path(repo) / ".cckit" / "dedup_savings.jsonl"
+    row = json.dumps({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "tool": tool,
+        "savedTokens": saved_tokens,
+    })
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(row + "\n")
+    except OSError:
+        pass
+
+
+def _record_fingerprint(key: tuple[str, str], fingerprint: str) -> None:
+    _delivery_ledger[key] = fingerprint
+    _delivery_ledger.move_to_end(key)
+    while len(_delivery_ledger) > _DELIVERY_LEDGER_CAP:
+        _delivery_ledger.popitem(last=False)
+
+
+def apply_packet_dedup(
+    payload: dict[str, Any],
+    repo: str,
+    *,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Stub unchanged primary-symbol bodies inside a gather packet.
+
+    Primary sections are '### NAME (SYMBOL · loc)' followed by a fenced body;
+    only bodies >= _GATHER_BODY_MIN_CHARS participate (smaller ones cost more
+    to stub than they save).
+    """
+    global _dedup_saved_total
+    text = payload.get("text")
+    if not isinstance(text, str) or "SYMBOL ·" not in text:
+        return payload
+
+    disabled = dedup_disabled()
+    nonlocal_saved = [0]
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group("name").strip()
+        location = match.group("location").strip()
+        body = match.group("body")
+        fence = match.group("fence")
+        if len(body) < _GATHER_BODY_MIN_CHARS:
+            return match.group(0)
+        key = (f"gather:{repo}", f"{name}@{location}")
+        fingerprint = _body_fingerprint(body)
+        prior = _delivery_ledger.get(key)
+        estimated = max(1, len(body) // 4)
+        if (
+            not refresh
+            and not disabled
+            and prior is not None
+            and prior == fingerprint
+        ):
+            stub = _DEDUP_STUB_LINE.format(tokens=estimated)
+            stubbed_tokens = max(1, len(stub) // 4)
+            _record_fingerprint(key, fingerprint)
+            nonlocal_saved[0] += max(0, estimated - stubbed_tokens)
+            return (
+                f"### {match.group('name')} (SYMBOL · {location})\n"
+                f"```{fence}\n{stub}\n```"
+            )
+        _record_fingerprint(key, fingerprint)
+        return match.group(0)
+
+    new_text = _GATHER_SECTION_RE.sub(replace, text)
+    saved = nonlocal_saved[0]
+    if saved > 0:
+        _dedup_saved_total += saved
+        payload["text"] = new_text
+        payload["deduplicated"] = True
+        payload["dedupSavedTokens"] = saved
+        record_dedup_saving(repo, "gather", saved)
+        save_delivery_ledger(repo)
+    return payload
+
+
+def apply_outline_dedup(
+    payload: dict[str, Any],
+    repo: str,
+    file_path: str,
+    *,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Stub an identical outline re-delivered this session."""
+    global _dedup_saved_total
+    text = payload.get("text")
+    if not isinstance(text, str) or len(text) < _GATHER_BODY_MIN_CHARS:
+        return payload
+    key = (f"outline:{repo}", file_path)
+    fingerprint = _body_fingerprint(text)
+    prior = _delivery_ledger.get(key)
+    estimated = max(1, len(text) // 4)
+    if (
+        not refresh
+        and not dedup_disabled()
+        and prior is not None
+        and prior == fingerprint
+    ):
+        stub = _DEDUP_STUB_LINE.format(tokens=estimated)
+        saved = max(0, estimated - max(1, len(stub) // 4))
+        _record_fingerprint(key, fingerprint)
+        payload["text"] = stub
+        payload["originalOutlineTokens"] = estimated
+        _dedup_saved_total += saved
+        payload["deduplicated"] = True
+        payload["dedupSavedTokens"] = saved
+        record_dedup_saving(repo, "outline", saved)
+        save_delivery_ledger(repo)
+        return payload
+    _record_fingerprint(key, fingerprint)
+    save_delivery_ledger(repo)
     return payload
 
 server = FastMCP("cckit", instructions=SERVER_INSTRUCTIONS)
@@ -1624,6 +1818,11 @@ def gather_code_context(
     text, stats = split_trailing_stats(out.get("text", ""), _PACK_STATS_LINE)
     if stats is not None:
         out["text"] = text
+    try:
+        out = apply_packet_dedup(out, str(resolve_repo(repo)))
+    except ValueError:
+        pass
+    if stats is not None:
         attach_savings(
             out,
             savings_footer(stats.get("deliveredTokens"), stats.get("sourceWholeFileTokens")),
@@ -1835,6 +2034,14 @@ def outline(
         bool,
         Field(description="Full member lists, docs, no size cap."),
     ] = False,
+    refresh: Annotated[
+        bool,
+        Field(
+            description=(
+                "Re-render even when unchanged since earlier this session."
+            )
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     args = ["outline", file_path]
     if full:
@@ -1846,6 +2053,11 @@ def outline(
     text, stats = split_trailing_stats(out.get("text", ""), _OUTLINE_STATS_LINE)
     if stats is not None:
         out["text"] = text
+    try:
+        out = apply_outline_dedup(out, str(resolve_repo(repo)), file_path, refresh=refresh)
+    except ValueError:
+        pass
+    if stats is not None:
         attach_savings(
             out,
             savings_footer(stats.get("deliveredTokens"), stats.get("sourceWholeFileTokens")),

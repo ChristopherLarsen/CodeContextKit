@@ -95,6 +95,7 @@ API_CLIENT = '''import Foundation
 /// Minimal API client used by fixtures.
 final class APIClient {
     let manager = AuthManager()
+    let big = BigRetryService()
 
     func fetch(url: URL) throws -> Data {
         let token = try manager.refreshToken()
@@ -108,6 +109,17 @@ final class APIClient {
         let token = try manager.refreshToken()
         return "Bearer \\(token)"
     }
+
+    func resilientFetch(url: URL) throws -> Data {
+        let payload = try big.retryWithBackoff(maxAttempts: 3) { attempt in
+            try self.fetchOnce(url: url, attempt: attempt)
+        }
+        return payload
+    }
+
+    private func fetchOnce(url: URL, attempt: Int) throws -> Data {
+        try fetch(url: url)
+    }
 }
 
 extension URLSession {
@@ -116,6 +128,42 @@ extension URLSession {
     }
 }
 '''
+
+# >100 lines so auto pack delivers surgical slices (not whole files) whose
+# bodies participate in gather-packet dedup.
+BIG_SERVICE_LINES: list[str] = [
+    "import Foundation",
+    "",
+    "/// Deliberately long service so packs use symbol slices.",
+    "final class BigRetryService {",
+    "    var log: [String] = []",
+    "",
+]
+for index in range(1, 26):
+    BIG_SERVICE_LINES += [
+        f"    /// Step {index} of the pipeline.",
+        f"    func step{index}(_ value: Int) -> Int {{",
+        f"        log.append(\"step{index}\\(value)\")",
+        f"        return value + {index}",
+        "    }",
+        "",
+    ]
+BIG_SERVICE_LINES += [
+    "    func retryWithBackoff(maxAttempts: Int, _ body: (Int) throws -> Data) rethrows -> Data {",
+    "        for attempt in 0..<maxAttempts {",
+    "            log.append(\"attempt \\(attempt)\")",
+    "            do {",
+    "                return try body(attempt)",
+    "            } catch {",
+    "                log.append(\"backoff \\(attempt)\")",
+    "            }",
+    "        }",
+    "        return Data()",
+    "    }",
+    "}",
+    "",
+]
+BIG_SERVICE = "\n".join(BIG_SERVICE_LINES)
 
 
 def make_fixture(root: Path) -> Path:
@@ -127,6 +175,7 @@ def make_fixture(root: Path) -> Path:
     (src / "AuthManager.swift").write_text(AUTH_MANAGER, encoding="utf-8")
     (src / "TokenStore.swift").write_text(TOKEN_STORE, encoding="utf-8")
     (net / "APIClient.swift").write_text(API_CLIENT, encoding="utf-8")
+    (net / "BigRetryService.swift").write_text(BIG_SERVICE, encoding="utf-8")
     (ignored / "generated.swift").write_text(
         "let needleToken = \"ignoreme\"\n", encoding="utf-8"
     )
@@ -150,9 +199,13 @@ def make_fixture(root: Path) -> Path:
 def section_b1(repo: Path) -> dict:
     """Dedup ledger v2: gather repeat, outline repeat, restart retention."""
     m._delivery_ledger.clear()
-    g1 = m.gather_code_context(task="fix refreshToken retry", repo=str(repo), budget=4000)
+    g1 = m.gather_code_context(
+        task="fix retryWithBackoff retry", repo=str(repo), budget=4000
+    )
     t1 = est(g1.get("text", ""))
-    g2 = m.gather_code_context(task="fix refreshToken retry", repo=str(repo), budget=4000)
+    g2 = m.gather_code_context(
+        task="fix retryWithBackoff retry", repo=str(repo), budget=4000
+    )
     t2 = est(g2.get("text", ""))
     gather_stubbed = bool(g2.get("deduplicated") or g2.get("dedupSavedTokens"))
 
