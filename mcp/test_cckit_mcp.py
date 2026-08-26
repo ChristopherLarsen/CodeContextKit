@@ -809,9 +809,19 @@ class WaxCompactAutoTests(unittest.TestCase):
 
     @staticmethod
     def _write_compact_stamp(repo: Path, wax_bytes: int | None = None) -> None:
-        """Test fixture: simulate a CLI-written compact stamp."""
+        """Test fixture: simulate a CLI-written compact stamp.
+
+        The fixed CLI stamps ALLOCATED bytes, so the default mirrors the same
+        basis wax_needs_compact measures in.
+        """
         wax = repo / ".cckit" / "repo.wax"
-        size = wax_bytes if wax_bytes is not None else (wax.stat().st_size if wax.is_file() else 0)
+        if wax_bytes is not None:
+            size = wax_bytes
+        elif wax.is_file():
+            stat_result = wax.stat()
+            size = max(stat_result.st_size, stat_result.st_blocks * 512)
+        else:
+            size = 0
         payload = {"waxBytes": max(0, int(size)), "deletedFrames": 0}
         stamp = repo / ".cckit" / mcp._COMPACT_STAMP
         stamp.parent.mkdir(parents=True, exist_ok=True)
@@ -828,6 +838,23 @@ class WaxCompactAutoTests(unittest.TestCase):
         self._write_compact_stamp(self.repo)
         self.wax.write_bytes(b"x" * (2 * 1024 * 1024))
         self.assertTrue(mcp.wax_needs_compact(self.repo))
+
+    def _live_allocated_bytes(self) -> int:
+        import os
+
+        return self.wax.stat().st_blocks * 512
+
+    def test_pre_cc164a8_latched_watermark_triggers_compact(self) -> None:
+        """Observed failure: 275GB stamp over a ~198MB store latched both
+        growth branches shut forever. The gate treats it as absent."""
+        allocated = max(len(b"x" * 1024), self._live_allocated_bytes())
+        self._write_compact_stamp(self.repo, wax_bytes=275_194_331_386)
+        self.assertTrue(mcp.wax_needs_compact(self.repo))
+
+    def test_stamp_within_double_live_size_is_trusted(self) -> None:
+        allocated = self._live_allocated_bytes()
+        self._write_compact_stamp(self.repo, wax_bytes=max(1024, allocated))
+        self.assertFalse(mcp.wax_needs_compact(self.repo))
 
     def test_maybe_refresh_compacts_when_index_is_current(self) -> None:
         spawned: list[tuple[Path, list[str] | None]] = []

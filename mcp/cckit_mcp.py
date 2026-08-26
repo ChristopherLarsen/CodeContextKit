@@ -45,6 +45,9 @@ _COMPACT_STAMP = "wax-compact-stamp.json"
 # Soft-delete does not shrink repo.wax; only compact again after real growth.
 _WAX_COMPACT_GROWTH_BYTES = 64 * 1024 * 1024
 _WAX_COMPACT_GROWTH_RATIO = 1.5
+# A compact stamp claiming more than this multiple of the live store's size is
+# a latched artifact of the pre-cc164a8 stamper, not a real watermark.
+_COMPACT_STAMP_MAX_LIVE_RATIO = 2
 # Self-reload: long-lived MCP shims keep serving a stale cckit_mcp.py until a
 # human reconnects every session. Watch this file and execv ourselves when it
 # changes so `swift build`-side fixes deploy fleet-wide without manual action.
@@ -1498,13 +1501,20 @@ def parse_compact_result(stdout: str) -> dict[str, Any] | None:
 
 
 def wax_needs_compact(repo: Path) -> bool:
-    """True when repo.wax exists and has never been compacted, or has grown since."""
+    """True when repo.wax exists and has never been compacted, or has grown since.
+
+    Sizes are ALLOCATED bytes (st_blocks): repo.wax is sparse AND Wax keeps a
+    huge logical length across rewrites (~278MB apparent / ~12MB materialized
+    right now), so st_size both overstates today and lies after every reclaim.
+    cckit's operating guidance is du, not ls/stat.
+    """
     wax = repo / ".cckit" / "repo.wax"
     db = repo / ".cckit" / "index.sqlite"
     if not wax.is_file() or not db.is_file():
         return False
-    size = wax.stat().st_size
-    if size <= 0:
+    stat_result = wax.stat()
+    live = stat_result.st_blocks * 512
+    if stat_result.st_size <= 0 and live <= 0:
         return False
     stamp_path = repo / ".cckit" / _COMPACT_STAMP
     if not stamp_path.is_file():
@@ -1516,8 +1526,16 @@ def wax_needs_compact(repo: Path) -> bool:
         return True
     if last <= 0:
         return True
-    grown = size - last
-    return grown >= _WAX_COMPACT_GROWTH_BYTES or size >= int(last * _WAX_COMPACT_GROWTH_RATIO)
+    # cc164a8 guarded new stamp writes but shipped no migration: repos indexed
+    # before it can carry a latched watermark far above the live store
+    # (observed: 275GB stamp over a 198MB-allocated file). Both growth branches
+    # then stay false forever and auto-compaction is silently dead — exactly
+    # the population the guard was written for. An impossible stamp is treated
+    # as absent so the next run restamps from the CLI.
+    if last > live * _COMPACT_STAMP_MAX_LIVE_RATIO:
+        return True
+    grown = live - last
+    return grown >= _WAX_COMPACT_GROWTH_BYTES or live >= int(last * _WAX_COMPACT_GROWTH_RATIO)
 
 
 def working_tree_needs_index(repo: Path) -> bool:

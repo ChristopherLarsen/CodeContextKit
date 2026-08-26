@@ -215,6 +215,29 @@ struct IndexCommand: AsyncParsableCommand {
         return "\(indexSkippedMarkerName)\(json)"
     }
 
+    /// A latched watermark from the pre-cc164a8 stamper can exceed the live
+    /// arena by orders of magnitude (observed: 275GB stamp over a ~198MB file).
+    /// Compaction that reclaims nothing would leave it latched forever — MCP
+    /// would flag needs-compact on every call. The CLI is the sole stamper, so
+    /// an impossible watermark gets replaced with an allocated-bytes baseline.
+    /// Threshold mirrors mcp/cckit_mcp.py:_COMPACT_STAMP_MAX_LIVE_RATIO.
+    @discardableResult
+    static func replaceImpossibleWatermark(cckitDir: String, liveAllocatedBytes: Int) throws -> Bool {
+        let stampPath = (cckitDir as NSString).appendingPathComponent(WaxCompactStamp.fileName)
+        guard let data = FileManager.default.contents(atPath: stampPath),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let last = (obj["waxBytes"] as? NSNumber)?.intValue else {
+            return false
+        }
+        let ceiling = max(1, liveAllocatedBytes) * 2
+        guard last > ceiling else { return false }
+        print(
+            "Compact stamp impossible vs live store (\(last) > \(ceiling), pre-cc164a8 latched watermark); restamping baseline."
+        )
+        try WaxCompactStamp.writeBaseline(cckitDir: cckitDir)
+        return true
+    }
+
     /// Take the repo-wide indexer lock (.cckit/refresh.lock) without blocking.
     /// Returns the held file descriptor, or nil when another indexing process
     /// holds it. One writer per repo regardless of trigger source (MCP shim,
@@ -317,7 +340,7 @@ struct IndexCommand: AsyncParsableCommand {
             let bytesAfter = Self.waxFileAllocatedBytes(at: waxPath)
             // Stamp only real reclamations; a no-shrink stamp would latch bloat
             // as the healthy watermark and hide future growth from MCP.
-            let stamped = try WaxCompactStamp.writeIfReclaimed(
+            var stamped = try WaxCompactStamp.writeIfReclaimed(
                 cckitDir: cckitDir,
                 deleted: result.deleted,
                 bytesBefore: result.bytesBefore,
@@ -332,6 +355,13 @@ struct IndexCommand: AsyncParsableCommand {
                 } else {
                     print("Nothing to reclaim (deleted 0 frames); stamp withheld.")
                 }
+                // Self-heal a pre-cc164a8 latched watermark so MCP stops
+                // flagging needs-compact on every call.
+                let restamped = try Self.replaceImpossibleWatermark(
+                    cckitDir: cckitDir,
+                    liveAllocatedBytes: bytesAfter
+                )
+                if restamped { stamped = true }
             }
             let measured = WaxCompactResult(
                 scanned: result.scanned,
