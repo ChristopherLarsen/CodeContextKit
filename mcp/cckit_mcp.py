@@ -185,6 +185,7 @@ _DIRTY_PATH_CAP = 8
 _OUTLINE_ATTACH_CAP = 2
 _OUTLINE_ATTACH_MAX_CHARS = 8000
 _CANDIDATE_CAP = 5
+_INLINE_BODY_MAX_LINES = 40
 # Dumping a body this large is usually worse than a windowed Read.
 # Keep in sync with SymbolSpanLimits.hugeLines.
 _HUGE_SPAN_LINES = 200
@@ -262,6 +263,51 @@ def hits_from_find_symbol_block(results: str) -> list[LocatorHit]:
 def is_symbol_query(name: str) -> bool:
     """True for a symbol leaf or qualified name (Foo or Foo.bar), not a string."""
     return bool(_SYMBOL_QUERY.fullmatch(name.strip()))
+
+
+def inline_singleton_body(
+    payload: dict[str, Any],
+    repo: str | None,
+) -> dict[str, Any]:
+    """Attach the body when find_symbol resolves exactly one small symbol.
+
+    Saves the follow-up symbol() round trip (envelope + latency + the Read
+    fallback it sometimes degenerates into). Skipped for huge spans — the
+    member-list path handles those.
+    """
+    if payload.get("count") != 1 or payload.get("totalCount") != 1:
+        return payload
+    results = payload.get("results")
+    if not isinstance(results, str):
+        return payload
+    hits = hits_from_find_symbol_block(results)
+    if len(hits) != 1 or hits[0].is_huge or hits[0].span > _INLINE_BODY_MAX_LINES:
+        return payload
+    target = hits[0].name
+    body_payload = run_cckit(
+        ["symbol", target, "--json"],
+        repo=repo,
+        parse_json=True,
+        skip_auto_refresh=True,
+    )
+    symbols = body_payload.get("symbols")
+    if "error" in body_payload or not isinstance(symbols, list) or len(symbols) != 1:
+        return payload
+    item = symbols[0]
+    if not isinstance(item, dict) or not isinstance(item.get("body"), str):
+        return payload
+    try:
+        dedup_repo = str(resolve_repo(repo))
+    except ValueError:
+        dedup_repo = str(repo or "")
+    deduped = apply_delivery_dedup({"symbols": [item]}, dedup_repo)
+    payload["inlinedBody"] = deduped["symbols"][0]
+    if isinstance(payload.get("results"), str):
+        payload["results"] = (
+            results.rstrip()
+            + "\n(single exact hit — full body attached as 'inlinedBody')"
+        )
+    return payload
 
 
 def hide_small_locator_ranges(results: str) -> str:
@@ -1879,7 +1925,12 @@ def find_symbol(
         )
     out = strip_internal_keys(payload)
     if isinstance(out.get("results"), str):
-        out["results"] = hide_small_locator_ranges(out["results"])
+        try:
+            out = inline_singleton_body(out, repo)
+        except ValueError:
+            pass
+        if not isinstance(out.get("inlinedBody"), dict):
+            out["results"] = hide_small_locator_ranges(out["results"])
     return out
 
 

@@ -376,6 +376,51 @@ class OutlineGatingTests(unittest.TestCase):
         run_mock.assert_not_called()
 
 
+class InlineSingletonTests(unittest.TestCase):
+    @staticmethod
+    def _results_block(span: str = "1-12") -> str:
+        return (
+            "Sources/Auth.swift\n"
+            f"  function AuthManager.rotate  {span}\n"
+        )
+
+    def test_singleton_small_hit_gets_body(self) -> None:
+        payload = {
+            "count": 1,
+            "totalCount": 1,
+            "results": self._results_block(),
+        }
+        fake_symbol = {
+            "symbols": [
+                {"qualifiedName": "AuthManager.rotate", "kind": "function",
+                 "filePath": "Sources/Auth.swift", "startLine": 1,
+                 "endLine": 12, "body": "func rotate() {\n}\n"}
+            ]
+        }
+
+        def fake_run(args, **kwargs):
+            assert args[0] == "symbol"
+            return dict(fake_symbol)
+
+        with mock.patch.object(mcp, "run_cckit", side_effect=fake_run), \
+             mock.patch.object(mcp, "_delivery_ledger", mcp.OrderedDict()):
+            out = mcp.inline_singleton_body(payload, "/repo")
+        self.assertIsInstance(out.get("inlinedBody"), dict)
+        self.assertEqual(out["inlinedBody"]["qualifiedName"], "AuthManager.rotate")
+        self.assertIn("inlinedBody", out["results"])
+
+    def test_multi_hit_and_huge_span_skip_inlining(self) -> None:
+        multi = {"count": 3, "totalCount": 3, "results": self._results_block()}
+        out_multi = mcp.inline_singleton_body(dict(multi), "/repo")
+        self.assertNotIn("inlinedBody", out_multi)
+        huge = {"count": 1, "totalCount": 1,
+                "results": self._results_block("1-400")}
+        with mock.patch.object(mcp, "run_cckit") as run_mock:
+            out = mcp.inline_singleton_body(huge, "/repo")
+        run_mock.assert_not_called()
+        self.assertNotIn("inlinedBody", out)
+
+
 class DeliveryDedupTests(unittest.TestCase):
     def setUp(self) -> None:
         mcp._delivery_ledger.clear()

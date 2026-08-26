@@ -1,0 +1,13 @@
+{
+  "cckit": "/Users/christopherlarsen/Workspace/CodeContextKit/.build/debug/cckit",
+  "index_seconds": 2.6,
+  "B2_inline_singleton": {
+    "find_symbol_count": 1,
+    "total_count": 1,
+    "body_inlined": true,
+    "find_symbol_tokens": 167,
+    "followup_symbol_tokens": 173,
+    "flow_tokens_with_inline": 167,
+    "flow_tokens_without_inline": 340
+  }
+}
