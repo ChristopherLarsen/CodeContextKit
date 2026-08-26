@@ -215,27 +215,41 @@ struct IndexCommand: AsyncParsableCommand {
         return "\(indexSkippedMarkerName)\(json)"
     }
 
-    /// A latched watermark from the pre-cc164a8 stamper can exceed the live
-    /// arena by orders of magnitude (observed: 275GB stamp over a ~198MB file).
-    /// Compaction that reclaims nothing would leave it latched forever — MCP
-    /// would flag needs-compact on every call. The CLI is the sole stamper, so
-    /// an impossible watermark gets replaced with an allocated-bytes baseline.
+    /// Called when a compact pass stamped nothing because nothing was
+    /// reclaimed or shrunken. Three outcomes:
+    ///  1. Watermark impossible vs live (>2× allocated, the pre-cc164a8 latch)
+    ///     → restamp baseline immediately.
+    ///  2. Second consecutive no-progress compact → the arena legitimately
+    ///     grew past its watermark with nothing reclaimable; relatch baseline
+    ///     so the shim's needs-compact gate stops respawning no-op compacts
+    ///     forever. A real bloat case never reaches this: it shrinks and
+    ///     stamps via writeIfReclaimed.
+    ///  3. First no-progress compact → bump the counter, keep the watermark,
+    ///     allow one more attempt (cheap guard against a shrink racing us).
     /// Threshold mirrors mcp/cckit_mcp.py:_COMPACT_STAMP_MAX_LIVE_RATIO.
     @discardableResult
-    static func replaceImpossibleWatermark(cckitDir: String, liveAllocatedBytes: Int) throws -> Bool {
-        let stampPath = (cckitDir as NSString).appendingPathComponent(WaxCompactStamp.fileName)
-        guard let data = FileManager.default.contents(atPath: stampPath),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let last = (obj["waxBytes"] as? NSNumber)?.intValue else {
+    static func settleWithheldCompactStamp(cckitDir: String, waxBytesAfter: Int) throws -> Bool {
+        guard let prior = WaxCompactStamp.readWatermark(cckitDir: cckitDir) else {
             return false
         }
-        let ceiling = max(1, liveAllocatedBytes) * 2
-        guard last > ceiling else { return false }
-        print(
-            "Compact stamp impossible vs live store (\(last) > \(ceiling), pre-cc164a8 latched watermark); restamping baseline."
-        )
-        try WaxCompactStamp.writeBaseline(cckitDir: cckitDir)
-        return true
+        let ceiling = max(1, waxBytesAfter) * 2
+        if prior.waxBytes > ceiling {
+            print(
+                "Compact stamp impossible vs live store (\(prior.waxBytes) > \(ceiling), pre-cc164a8 latched watermark); restamping baseline."
+            )
+            try WaxCompactStamp.relatchBaseline(allocatedBytes: waxBytesAfter, cckitDir: cckitDir)
+            return true
+        }
+        if prior.noShrinkRuns >= 1 {
+            print(
+                "No-progress compact again (\(prior.noShrinkRuns + 1) consecutive); relatching baseline at \(waxBytesAfter) so needs-compact stops respawning."
+            )
+            try WaxCompactStamp.relatchBaseline(allocatedBytes: waxBytesAfter, cckitDir: cckitDir)
+            return true
+        }
+        let runs = try WaxCompactStamp.recordNoShrinkRun(cckitDir: cckitDir)
+        _ = runs
+        return false
     }
 
     /// Take the repo-wide indexer lock (.cckit/refresh.lock) without blocking.
@@ -355,11 +369,11 @@ struct IndexCommand: AsyncParsableCommand {
                 } else {
                     print("Nothing to reclaim (deleted 0 frames); stamp withheld.")
                 }
-                // Self-heal a pre-cc164a8 latched watermark so MCP stops
-                // flagging needs-compact on every call.
-                let restamped = try Self.replaceImpossibleWatermark(
+                // Self-heal a pre-cc164a8 latched watermark, or converge a
+                // healthy-but-grown store that has nothing reclaimable.
+                let restamped = try Self.settleWithheldCompactStamp(
                     cckitDir: cckitDir,
-                    liveAllocatedBytes: bytesAfter
+                    waxBytesAfter: bytesAfter
                 )
                 if restamped { stamped = true }
             }

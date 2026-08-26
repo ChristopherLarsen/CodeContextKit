@@ -569,10 +569,53 @@ public enum WaxCompactStamp {
         try write(cckitDir: cckitDir, waxBytes: waxBytes, deletedFrames: 0)
     }
 
-    private static func write(cckitDir: String, waxBytes: Int, deletedFrames: Int) throws {
+    public struct Watermark {
+        public let waxBytes: Int
+        public let noShrinkRuns: Int
+    }
+
+    /// Parse an existing stamp; nil when missing or unparseable.
+    /// The shim treats those identically ("never compacted"), but settle logic
+    /// must NOT act on it — only a CLI-produced watermark counts as progress.
+    public static func readWatermark(cckitDir: String = ".cckit") -> Watermark? {
+        let path = (cckitDir as NSString).appendingPathComponent(fileName)
+        guard let data = FileManager.default.contents(atPath: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let waxBytes = (obj["waxBytes"] as? NSNumber)?.intValue else {
+            return nil
+        }
+        let noShrinkRuns = (obj["noShrinkRuns"] as? NSNumber)?.intValue ?? 0
+        return Watermark(waxBytes: waxBytes, noShrinkRuns: noShrinkRuns)
+    }
+
+    /// Count one more consecutive no-progress compact while preserving the
+    /// watermark verbatim. Returns the new count.
+    @discardableResult
+    public static func recordNoShrinkRun(cckitDir: String = ".cckit") throws -> Int {
+        guard let watermark = readWatermark(cckitDir: cckitDir) else { return 0 }
+        let runs = watermark.noShrinkRuns + 1
+        try write(cckitDir: cckitDir, waxBytes: watermark.waxBytes, deletedFrames: 0, noShrinkRuns: runs)
+        return runs
+    }
+
+    /// Relatch an allocated-bytes baseline. The convergence valve for a store
+    /// that legitimately grew past its watermark yet has nothing reclaimable:
+    /// without it the shim's needs-compact gate respawns no-op compacts
+    /// forever. Future growth detection restarts from this new floor.
+    public static func relatchBaseline(allocatedBytes: Int, cckitDir: String = ".cckit") throws {
+        try write(cckitDir: cckitDir, waxBytes: allocatedBytes, deletedFrames: 0)
+    }
+
+    private static func write(
+        cckitDir: String,
+        waxBytes: Int,
+        deletedFrames: Int,
+        noShrinkRuns: Int = 0
+    ) throws {
         let payload: [String: Any] = [
             "waxBytes": waxBytes,
             "deletedFrames": deletedFrames,
+            "noShrinkRuns": noShrinkRuns,
             "compactedAt": ISO8601DateFormatter().string(from: Date())
         ]
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])

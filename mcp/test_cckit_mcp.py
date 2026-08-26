@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import threading
 import unittest
 from pathlib import Path
@@ -852,6 +853,50 @@ class RefreshLockTests(unittest.TestCase):
         self.assertTrue(out.get("triggered"))
         self.assertFalse(out.get("refreshed"))
         self.assertEqual(spawned, [(self.repo, None)])
+
+    def test_spawn_cooldown_blocks_immediate_respawn(self) -> None:
+        """Race guard: fresh callers must not steal the lock from a child that
+        is still in CLI startup — bounded by the per-repo cooldown."""
+        mcp._LAST_REFRESH_SPAWN[str(self.repo)] = time.monotonic()  # just spawned
+        spawned: list[Path] = []
+        with (
+            mock.patch.object(mcp, "_index_is_current", return_value=False),
+            mock.patch.object(
+                mcp,
+                "spawn_detached_index",
+                side_effect=lambda repo, extra_args=None: spawned.append(repo)
+                or {"triggered": True},
+            ),
+        ):
+            out = mcp.maybe_refresh_index(self.repo, ["find-symbol", "Foo"])
+
+        self.assertTrue(out and out.get("skipped"))
+        self.assertEqual(out.get("reason"), "spawn_cooldown")
+        self.assertGreaterEqual(out.get("cooldownRemainingSeconds", 0), 0)
+        self.assertEqual(spawned, [])
+        del mcp._LAST_REFRESH_SPAWN[str(self.repo)]
+
+    def test_spawn_cooldown_allows_after_window(self) -> None:
+        mcp._LAST_REFRESH_SPAWN[str(self.repo)] = (
+            time.monotonic() - mcp._SPAWN_COOLDOWN_SECONDS - 1
+        )
+        with (
+            mock.patch.object(mcp, "_index_is_current", return_value=False),
+            mock.patch.object(
+                mcp,
+                "spawn_detached_index",
+                return_value={"triggered": True},
+            ),
+        ):
+            out = mcp.maybe_refresh_index(self.repo, ["find-symbol", "Foo"])
+
+        self.assertTrue(out and out.get("triggered"))
+        self.assertIn(str(self.repo), mcp._LAST_REFRESH_SPAWN)
+        del mcp._LAST_REFRESH_SPAWN[str(self.repo)]
+
+    def test_fresh_repo_has_no_cooldown(self) -> None:
+        self.assertTrue(mcp._spawn_allowed(self.repo))
+        self.assertEqual(mcp._cooldown_remaining(self.repo), 0.0)
 
 
 class WaxCompactAutoTests(unittest.TestCase):

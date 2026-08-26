@@ -1467,10 +1467,30 @@ _REFRESH_LOG_NAME = "refresh.log"
 _REFRESH_LOG_MAX_BYTES = 512 * 1024
 # How much of the log tail is scanned for WaxCompact telemetry per tool call.
 _REFRESH_LOG_TAIL_BYTES = 64 * 1024
+# Per-repo cooldown between detached refresh spawns. The lock probe is racy by
+# design (fd released before Popen): a fresh tool call can win the lock from a
+# just-spawned child still in Swift startup (~0.5s), starving older work into
+# endless IndexSkipped drops. Once the compact convergence lands this only
+# trims junk children during long builds' aftermath.
+_SPAWN_COOLDOWN_SECONDS = float(os.environ.get("CCKIT_REFRESH_SPAWN_COOLDOWN", "60"))
+_LAST_REFRESH_SPAWN: dict[str, float] = {}
 
 
 def _refresh_log_path(repo: Path) -> Path:
     return repo / ".cckit" / _REFRESH_LOG_NAME
+
+
+def _spawn_allowed(repo: Path) -> bool:
+    """True outside the per-repo spawn cooldown window."""
+    last = _LAST_REFRESH_SPAWN.get(str(repo))
+    return last is None or (time.monotonic() - last) >= _SPAWN_COOLDOWN_SECONDS
+
+
+def _cooldown_remaining(repo: Path) -> float:
+    last = _LAST_REFRESH_SPAWN.get(str(repo))
+    if last is None:
+        return 0.0
+    return max(0.0, _SPAWN_COOLDOWN_SECONDS - (time.monotonic() - last))
 
 
 def refresh_lock_is_free(repo: Path) -> bool:
@@ -1715,8 +1735,17 @@ def maybe_refresh_index(repo: Path, args: list[str]) -> dict[str, Any] | None:
         needs_compact = wax_needs_compact(repo)
         if not needs_index and not needs_compact:
             return None
+        if not _spawn_allowed(repo):
+            return {
+                "refreshed": False,
+                "skipped": True,
+                "reason": "spawn_cooldown",
+                "cooldownRemainingSeconds": round(_cooldown_remaining(repo), 1),
+                **freshness,
+            }
         extra = ["--compact"] if (needs_compact and not needs_index) else None
         triggered = spawn_detached_index(repo, extra_args=extra)
+        _LAST_REFRESH_SPAWN[str(repo)] = time.monotonic()
         return {
             "refreshed": False,
             **triggered,
@@ -1743,10 +1772,19 @@ def force_refresh_index(repo: Path) -> dict[str, Any]:
             }
         if _index_is_current(repo) and not wax_needs_compact(repo):
             return {"refreshed": False, "skipped": True, "reason": "already_fresh", **freshness}
+        if not _spawn_allowed(repo):
+            return {
+                "refreshed": False,
+                "skipped": True,
+                "reason": "spawn_cooldown",
+                "cooldownRemainingSeconds": round(_cooldown_remaining(repo), 1),
+                **freshness,
+            }
         needs_index = not _index_is_current(repo)
         needs_compact = wax_needs_compact(repo)
         extra = ["--compact"] if (needs_compact and not needs_index) else None
         triggered = spawn_detached_index(repo, extra_args=extra)
+        _LAST_REFRESH_SPAWN[str(repo)] = time.monotonic()
         return {"refreshed": False, **triggered, **freshness}
 
 
