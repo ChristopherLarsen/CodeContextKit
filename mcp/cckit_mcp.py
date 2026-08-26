@@ -366,6 +366,7 @@ def semantic_candidates(
         ["search", inner, "--vector", "--json", "--limit", str(limit)],
         repo=repo,
         timeout=60,
+        parse_json=True,
         skip_auto_refresh=True,
     )
     if "error" in payload:
