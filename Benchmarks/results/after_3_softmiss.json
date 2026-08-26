@@ -1,0 +1,10 @@
+{
+  "cckit": "/Users/christopherlarsen/Workspace/CodeContextKit/.build/debug/cckit",
+  "index_seconds": 2.2,
+  "B3_prose_soft_miss": {
+    "semantic_guess_only_tagged": true,
+    "candidates_attached_chars": 396,
+    "blind_regather_policy_tokens": 981,
+    "tag_then_symbol_policy_tokens": 666
+  }
+}

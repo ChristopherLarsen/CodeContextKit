@@ -421,6 +421,32 @@ class InlineSingletonTests(unittest.TestCase):
         self.assertNotIn("inlinedBody", out)
 
 
+class SemanticGuessHintTests(unittest.TestCase):
+    def test_prose_task_gets_tag_and_candidates(self) -> None:
+        payload = {"text": "# Context Packet\n\nSome guessed content.\n"}
+        with mock.patch.object(
+            mcp,
+            "semantic_candidates",
+            return_value=[("Auth.refreshToken", "Sources/Auth.swift")],
+        ) as cand_mock:
+            out = mcp.attach_semantic_guess_hint(payload, "/repo", "make retries resilient")
+        self.assertTrue(out["semanticGuessOnly"])
+        self.assertIn("semantic guesses", out["text"])
+        self.assertIn("- Auth.refreshToken — Sources/Auth.swift", out["text"])
+        self.assertIn("Auth.refreshToken", out["candidatesBlock"])
+        cand_mock.assert_called_once()
+
+    def test_identifier_task_untouched(self) -> None:
+        payload = {"text": "# Context Packet\nbody\n"}
+        with mock.patch.object(mcp, "semantic_candidates") as cand_mock:
+            out = mcp.attach_semantic_guess_hint(
+                payload, "/repo", "fix refreshToken retry"
+            )
+        self.assertNotIn("semanticGuessOnly", out)
+        self.assertEqual(out["text"], payload["text"])
+        cand_mock.assert_not_called()
+
+
 class DeliveryDedupTests(unittest.TestCase):
     def setUp(self) -> None:
         mcp._delivery_ledger.clear()

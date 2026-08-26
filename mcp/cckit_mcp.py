@@ -1262,6 +1262,36 @@ def search_text_tool(
         return payload
 
 
+def attach_semantic_guess_hint(
+    payload: dict[str, Any],
+    repo: str | None,
+    task: str,
+) -> dict[str, Any]:
+    """Tag packets whose primaries are pure semantic guesses (prose-only task).
+
+    With no identifier-shaped tokens in the task, packOnce has zero lexical
+    primaries — every delivered symbol came from Wax similarity. Agents that
+    know this refine once via candidates instead of blindly re-gathering.
+    """
+    text = payload.get("text")
+    if not isinstance(text, str) or "error" in payload:
+        return payload
+    if task_identifiers(task):
+        return payload
+    payload["semanticGuessOnly"] = True
+    candidates = semantic_candidates(repo, task)
+    block = format_candidates_block(candidates)
+    if block:
+        payload["candidatesBlock"] = block
+        note = (
+            "Note: the task named no identifiers, so these matches are "
+            "semantic guesses. Candidate symbols attached — symbol() one of "
+            "them instead of re-gathering."
+        )
+        payload["text"] = text.rstrip() + "\n\n" + note + "\n" + block + "\n"
+    return payload
+
+
 def resolve_repo(repo: str | None) -> Path:
     path = Path(repo or DEFAULT_REPO or os.getcwd()).expanduser()
     if not path.is_absolute():
@@ -1868,6 +1898,7 @@ def gather_code_context(
         out = apply_packet_dedup(out, str(resolve_repo(repo)))
     except ValueError:
         pass
+    out = attach_semantic_guess_hint(out, repo, task)
     if stats is not None:
         attach_savings(
             out,
