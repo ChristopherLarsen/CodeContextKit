@@ -5,36 +5,41 @@ import CodeContextKitStorage
 import CodeContextKitRetrieval
 import CodeContextKitContext
 
-/// Reverse lookup of indexed references/call sites for a symbol name (no bodies).
+/// Reverse lookup of indexed references/call sites for symbol names (no bodies).
+/// Accepts one name or a batch; batched output nests under `batches`.
 struct FindReferencesCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "find-references",
-        abstract: "Find indexed references/call sites for a symbol name (paths and lines, no bodies)."
+        abstract: "Find indexed references/call sites for symbol names (paths and lines, no bodies)."
     )
 
-    @Argument(help: "Symbol leaf name or qualified name (leaf is used for lookup).")
-    var name: String
+    @Argument(help: "One or more symbol leaf/qualified names (leaf is used for lookup).")
+    var names: [String]
 
-    @Option(help: "Maximum hits to return.")
+    @Option(help: "Maximum hits per name to return.")
     var limit: Int = 100
 
     @Flag(help: "Output in JSON format.")
     var json: Bool = false
 
-    func run() async throws {
-        let startTime = Date()
-        let dbPath = ".cckit/index.sqlite"
-        guard FileManager.default.fileExists(atPath: dbPath) else {
-            print("Error: Index not found. Run 'cckit index' first.")
-            throw ExitCode.failure
-        }
+    private struct Resolution {
+        let leaf: String
+        let matchedAs: String
+        let matchMode: String
+        let refs: [SymbolRecord.Reference]
+        let candidates: [String]
+    }
 
-        let db = try Database(path: dbPath)
-        let leaf = SymbolRanking.leafName(name)
+    /// Exact leaf → normalized variants → names containing the leaf →
+    /// did-you-mean candidates from the symbol table. Each rung avoids a
+    /// repo-wide Grep fallback for near-name queries.
+    private func resolve(
+        _ requested: String,
+        db: Database,
+        limit: Int
+    ) throws -> Resolution {
+        let leaf = SymbolRanking.leafName(requested)
 
-        // Resolution ladder: exact leaf → normalized variants → names
-        // containing the leaf → did-you-mean candidates from the symbol table.
-        // Each rung avoids a repo-wide Grep fallback for near-name queries.
         var refs = try db.getReferences(forSymbolName: leaf)
         var matchedAs = leaf
         var matchMode = "exact"
@@ -53,7 +58,7 @@ struct FindReferencesCommand: AsyncParsableCommand {
         }
 
         if refs.isEmpty {
-            let loose = try db.getReferencesLike(name: leaf, limit: max(1, limit))
+            let loose = try db.getReferencesLike(name: leaf, limit: limit)
             if !loose.isEmpty {
                 refs = loose
                 matchedAs = leaf
@@ -69,20 +74,35 @@ struct FindReferencesCommand: AsyncParsableCommand {
                 .map(\.qualifiedName)
         }
 
-        let totalCount = refs.count
-        let cappedLimit = max(1, limit)
-        let truncated = totalCount > cappedLimit
-        let limited = Array(refs.prefix(cappedLimit))
+        return Resolution(
+            leaf: leaf,
+            matchedAs: matchedAs,
+            matchMode: matchMode,
+            refs: refs,
+            candidates: candidates
+        )
+    }
 
-        var blockParts: [String] = []
-        if matchMode == "contains" && totalCount > 0 {
-            blockParts.append(
-                "Approximate: reference names containing '\(leaf)' — verify before editing."
+    private func makeBlock(for name: String, resolution: Resolution, limit: Int) -> (
+        block: String,
+        totalCount: Int,
+        truncated: Bool,
+        item: [String: Any]
+    ) {
+        let totalCount = resolution.refs.count
+        let truncated = totalCount > limit
+        let limited = Array(resolution.refs.prefix(limit))
+
+        var notes: [String] = []
+        if resolution.matchMode == "contains" && totalCount > 0 {
+            notes.append(
+                "Approximate: reference names containing '\(resolution.leaf)' — verify before editing."
             )
         }
-        if !candidates.isEmpty {
-            blockParts.append(
-                "No references to '\(leaf)'. Did you mean: \(candidates.joined(separator: ", "))?"
+        if !resolution.candidates.isEmpty {
+            notes.append(
+                "No references to '\(resolution.leaf)'. Did you mean: "
+                    + resolution.candidates.joined(separator: ", ") + "?"
             )
         }
 
@@ -94,32 +114,77 @@ struct FindReferencesCommand: AsyncParsableCommand {
             )
         }
         let resultsBlock = ReferenceResultFormatting.formatBlock(
-            leaf: matchedAs,
+            leaf: resolution.matchedAs,
             hits: hits,
             totalCount: totalCount,
             truncated: truncated
         )
         let annotatedBlock =
-            blockParts.isEmpty
+            notes.isEmpty
                 ? resultsBlock
-                : resultsBlock + "\n\n" + blockParts.joined(separator: "\n")
+                : resultsBlock + "\n\n" + notes.joined(separator: "\n")
+
+        var item: [String: Any] = [
+            "name": name,
+            "matchMode": resolution.matchMode,
+            "totalCount": totalCount,
+            "truncated": truncated,
+            "results": annotatedBlock,
+        ]
+        if resolution.matchedAs != resolution.leaf {
+            item["matchedAs"] = resolution.matchedAs
+        }
+        if !resolution.candidates.isEmpty {
+            item["candidates"] = resolution.candidates
+        }
+        return (annotatedBlock, totalCount, truncated, item)
+    }
+
+    func run() async throws {
+        let startTime = Date()
+        guard !names.isEmpty else {
+            print("Error: pass at least one symbol name.")
+            throw ExitCode.failure
+        }
+        let dbPath = ".cckit/index.sqlite"
+        guard FileManager.default.fileExists(atPath: dbPath) else {
+            print("Error: Index not found. Run 'cckit index' first.")
+            throw ExitCode.failure
+        }
+
+        let db = try Database(path: dbPath)
+        let cappedLimit = max(1, limit)
+
+        var batches: [[String: Any]] = []
+        var blocks: [String] = []
+        var totalCountAll = 0
+        for requested in names {
+            let resolution = try resolve(requested, db: db, limit: cappedLimit)
+            let built = makeBlock(
+                for: requested,
+                resolution: resolution,
+                limit: cappedLimit
+            )
+            batches.append(built.item)
+            blocks.append(built.block)
+            totalCountAll += built.totalCount
+        }
 
         let freshness = IndexFreshness.check(repoRoot: ".")
         let responseText: String
 
         if json {
-            var payload: [String: Any] = [
-                "totalCount": totalCount,
-                "truncated": truncated,
-                "limit": cappedLimit,
-                "matchMode": matchMode,
-                "results": annotatedBlock,
-            ]
-            if matchedAs != leaf {
-                payload["matchedAs"] = matchedAs
-            }
-            if !candidates.isEmpty {
-                payload["candidates"] = candidates
+            var payload: [String: Any]
+            if batches.count == 1 {
+                // Single-name shape is unchanged (backward compatible).
+                payload = batches[0]
+                payload["limit"] = cappedLimit
+            } else {
+                payload = [
+                    "limit": cappedLimit,
+                    "totalCount": totalCountAll,
+                    "batches": batches,
+                ]
             }
             for (key, value) in freshness.compactDictionary {
                 payload[key] = value
@@ -132,7 +197,7 @@ struct FindReferencesCommand: AsyncParsableCommand {
             if let warning = freshness.softWarning {
                 lines.append(warning)
             }
-            lines.append(resultsBlock)
+            lines.append(blocks.joined(separator: "\n\n"))
             responseText = lines.joined(separator: "\n")
             print(responseText)
         }

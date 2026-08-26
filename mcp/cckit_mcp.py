@@ -1975,7 +1975,8 @@ def find_symbol(
     title="Find references to a symbol",
     description=(
         "Indexed references as a compact grouped text block (file + lines, no "
-        "bodies). Skips comments. Name must be a symbol leaf or qualified name "
+        "bodies). Batch several names via names=[...] in one call. Skips "
+        "comments. Name must be a symbol leaf or qualified name "
         "(Foo or Foo.bar), not a string — search_text for literals/comments. "
         "Check truncated/totalCount and raise limit before concluding unused. "
         "On a miss, MCP indexes once and retries, then outlines dirty files. "
@@ -1984,29 +1985,42 @@ def find_symbol(
 )
 def find_references(
     name: Annotated[
-        str,
+        str | None,
         Field(
             description=(
                 "Symbol leaf name or qualified name "
                 "(e.g. 'refresh' or 'AuthSession.refresh')."
             ),
         ),
-    ],
+    ] = None,
+    names: Annotated[
+        list[str] | None,
+        Field(description="Batch of names to look up in one call."),
+    ] = None,
     repo: RepoPath = None,
     limit: Annotated[
         int,
-        Field(description="Max hits (default 100). Raise when truncated=true.", ge=1, le=10000),
+        Field(description="Max hits per name (default 100). Raise when truncated=true.", ge=1, le=10000),
     ] = 100,
 ) -> dict[str, Any]:
-    if not is_symbol_query(name):
-        return {
-            "error": "not_a_symbol_name",
-            "message": (
-                "find_references wants a symbol name, not a string. "
-                "search_text for literals/comments. find_symbol for identifiers."
-            ),
-        }
-    args = ["find-references", name, "--json", "--limit", str(limit)]
+    merged: list[str] = []
+    if name:
+        merged.append(name)
+    if names:
+        merged.extend(n for n in names if n)
+    merged = [n for n in merged if isinstance(n, str) and n.strip()]
+    if not merged:
+        return {"error": "bad_args", "message": "pass name or names"}
+    for candidate_name in merged:
+        if not is_symbol_query(candidate_name):
+            return {
+                "error": "not_a_symbol_name",
+                "message": (
+                    "find_references wants a symbol name, not a string. "
+                    "search_text for literals/comments. find_symbol for identifiers."
+                ),
+            }
+    args = ["find-references", *merged, "--json", "--limit", str(limit)]
     payload = run_cckit_with_miss_retry(
         args,
         repo=repo,
@@ -2027,7 +2041,7 @@ def find_references(
             dirty_paths=dirty,
             after_refresh=after,
             repo=repo,
-            query=name,
+            query=merged[0],
             replace_body=False,
             extra_candidates=extra,
         )

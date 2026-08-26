@@ -1,0 +1,15 @@
+{
+  "cckit": "/Users/christopherlarsen/Workspace/CodeContextKit/.build/debug/cckit",
+  "index_seconds": 85.4,
+  "B5_batch_refs": {
+    "targets": [
+      "refreshToken",
+      "validate",
+      "rotate"
+    ],
+    "individual_calls": 3,
+    "individual_tokens_sum": 213,
+    "batch_tokens": 201,
+    "batch_supported": true
+  }
+}
