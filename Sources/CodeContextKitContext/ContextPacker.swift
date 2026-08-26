@@ -91,6 +91,9 @@ public final class ContextPacker {
     /// Prefer a full-file dump (no related-hint chrome) at or below this many lines.
     /// ~100 Swift lines ≈ related-name chrome cost; whole file is clearer and usually smaller.
     public static let tinyFileLineThreshold: Int = 100
+
+    /// Per-line cap for failure-log summaries (minified bundles are unbounded).
+    public static let failureLineMaxChars: Int = 500
     /// Preview packets stay under this many tokens regardless of requested budget —
     /// the tier exists so looking is cheap.
     public static let previewBudgetCap: Int = 1500
@@ -855,7 +858,11 @@ public final class ContextPacker {
             if errorLines.isEmpty {
                 return "No explicit errors found in log."
             }
-            return errorLines.prefix(10).joined(separator: "\n")
+            // Cap per-line length: one minified-bundle error line once leaked
+            // ~50k tokens into a packet.
+            return errorLines.prefix(10)
+                .map { String($0.prefix(Self.failureLineMaxChars)) }
+                .joined(separator: "\n")
         } catch {
             return "Could not read failure log: \(error.localizedDescription)"
         }

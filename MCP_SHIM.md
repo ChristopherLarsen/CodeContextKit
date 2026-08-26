@@ -118,25 +118,35 @@ Ideal MCP v1 (keep small):
 
 | MCP tool | Wraps | Notes |
 |---|---|---|
-| `find_symbol` | `cckit find-symbol` | Name lookup after gather, or when you only need a qualified name, not a packet (line ranges only for huge hits). |
-| `find_references` | `cckit find-references` | Indexed call sites. Rejects non-symbol strings. Returns `truncated` + `totalCount`. |
-| `gather_code_context` | `cckit pack` | Budgeted source packet for a symptom, change, multi-file task, or failure log. Names in `task` help matching. Identifier miss → short miss, not a filler packet. |
-| `symbol` | `cckit symbol --json` | Exact qualified **body**. Batch names after `find_symbol`, or for a name a gather packet did not include. |
-| `outline` | `cckit outline` | Structural skeleton before full-file reads (metadata only). |
+| `find_symbol` | `cckit find-symbol` | Name lookup after gather, or when you only need a qualified name, not a packet. Zero-hit queries retry normalized variants (snake_case ↔ CamelCase). A single exact hit ≤40 lines returns its body inline as `inlinedBody`. |
+| `find_references` | `cckit find-references` | Indexed call sites. Batch via `names=[...]` (single-name JSON shape unchanged). Resolution ladder: exact → variants → names-containing (labeled Approximate) → did-you-mean candidates. Rejects non-symbol strings. Returns `truncated` + `totalCount`. |
+| `gather_code_context` | `cckit pack` | Budgeted source packet for a symptom, change, multi-file task, or failure log. Names in `task` help matching. Identifier miss → short miss, not a filler packet. Prose-only tasks (no identifiers ⇒ all matches are Wax guesses) are tagged `semanticGuessOnly` with an attached candidate block. |
+| `symbol` | `cckit symbol --json` | Exact qualified **body**. Batch names after `find_symbol`, or for a name a gather packet did not include. Bodies unchanged since earlier this session return as one-line stubs (`refresh=true` forces full). |
+| `outline` | `cckit outline` | Structural skeleton before full-file reads (metadata only). Identical re-deliveries stub like `symbol` (`refresh=true` bypasses). |
 | `map` | `cckit map` | Names-only repo map; prefer gather when you need source. Skip if the gather packet already included a repository map. |
+| `search_text` | `rg` / in-process scan | Budgeted literal text search over the working tree: capped hits, per-file grouped ranges, one preview per file, honors .gitignore (ripgrep path) and skips junk dirs. Use instead of raw Grep so output stays bounded; regex/case/glob params available. |
 | `index` | `cckit index .` | Last. Usually unnecessary — MCP auto-refreshes on HEAD drift / dirty files, auto-compacts leaked Wax vectors, and retries once on locator miss (`CCKIT_REFRESH=auto`). |
 
 Responses omit freshness when the index is current; `stale: true` appears only when it is not. MCP flattens CLI JSON fields to the top level (not nested under `data`). Set `CCKIT_REFRESH=never` to disable auto-reindex. `CCKIT_CALLER=mcp` is set on subprocesses so `pack-stats` can separate agent traffic from shell runs.
 
+### Miss behavior
+
+On any locator miss (`find_symbol`, `find_references`, `symbol`, `gather`), the shim retries once after a forced incremental index (dirty files), then returns a short miss response containing: ranked dirty-file outlines (only files lexically related to the query), plus a **Nearest indexed symbols** block of up to 5 Wax semantic candidates (names + `path:lines`, ~15 tokens each). Grep is the last resort, not the default.
+
+### Session dedup ledger
+
+The shim fingerprints delivered content per session (LRU 512): `symbol` bodies, gather primary bodies (≥200 chars), and whole outlines. Identical re-deliveries come back as one-line stubs with the prior token estimate; changed content always delivers in full and updates the fingerprint. State persists to `.cckit/delivery_ledger.json` (survives shim self-reload/reconnect) and savings append to `.cckit/dedup_savings.jsonl`, which `cckit pack-stats` reports under "Dedup savings". Opt out with `CCKIT_DEDUP=off`; per-call `refresh=true` forces full delivery.
+
 Omit from MCP (still available via CLI):
 
-- `search`
 - `estimate`
 - `summarize`
 - `explain`
 - `serve`
 - `benchmark-serve`
 - `history-benchmark`
+
+(`search` remains CLI-first; its forced-vector mode powers the shim's candidate blocks.)
 
 ## Repo Resolution
 

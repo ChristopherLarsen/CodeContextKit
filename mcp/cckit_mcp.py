@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import fnmatch
 import shutil
 import sqlite3
 import subprocess
@@ -1143,12 +1144,46 @@ def _stream_rg(
     return matches
 
 
+def _load_gitignore_patterns(root: Path) -> list[str]:
+    """Non-negated .gitignore lines (comments/blanks/negations skipped).
+
+    Limitation, documented: `!` re-includes are not honored by the fallback
+    scanner — the rg path handles full semantics when ripgrep is installed.
+    """
+    patterns: list[str] = []
+    try:
+        raw = (root / ".gitignore").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return patterns
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("!"):
+            continue
+        patterns.append(stripped.lstrip("/"))
+    return patterns
+
+
+def _is_gitignored(rel_path: str, patterns: list[str]) -> bool:
+    parts = rel_path.split("/")
+    for pattern in patterns:
+        dir_pattern = pattern.endswith("/")
+        clean = pattern.rstrip("/")
+        if dir_pattern and clean in parts:
+            return True
+        if fnmatch.fnmatch(parts[-1], clean):
+            return True
+        if any(fnmatch.fnmatch(part, clean) for part in parts[:-1]):
+            return True
+    return False
+
+
 def _python_text_search(
     root: Path,
     pattern: re.Pattern[str],
     stop_after: int,
 ) -> list[tuple[str, int, str]]:
-    """gitignore-free fallback scanner over indexable text suffixes."""
+    """Fallback scanner over indexable text suffixes honoring .gitignore."""
+    ignore_patterns = _load_gitignore_patterns(root)
     matches: list[tuple[str, int, str]] = []
     files_seen = 0
     for dirpath, dirnames, filenames in os.walk(root):
@@ -1161,10 +1196,15 @@ def _python_text_search(
                 return matches
             path = Path(dirpath) / filename
             try:
+                rel = str(path.relative_to(root))
+            except ValueError:
+                continue
+            if ignore_patterns and _is_gitignored(rel, ignore_patterns):
+                continue
+            try:
                 text = path.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-            rel = str(path.relative_to(root))
             for index, line in enumerate(text.splitlines(), start=1):
                 if pattern.search(line):
                     matches.append((rel, index, line.strip()))

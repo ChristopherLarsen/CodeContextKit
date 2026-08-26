@@ -315,11 +315,15 @@ public final class Database: @unchecked Sendable {
     private static let likeEscape = "\\"
 
     private static func likeContains(_ column: Column, _ term: String) -> SQLExpression {
+        return column.like(likePattern(term), escape: likeEscape)
+    }
+
+    private static func likePattern(_ term: String) -> String {
         let escaped = term
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "%", with: "\\%")
             .replacingOccurrences(of: "_", with: "\\_")
-        return column.like("%\(escaped)%", escape: likeEscape)
+        return "%\(escaped)%"
     }
 
     public func getFilesLike(pattern: String, strict: Bool = false) throws -> [FileRecord] {
@@ -382,42 +386,39 @@ public final class Database: @unchecked Sendable {
         let terms = name.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
         if terms.isEmpty { return [] }
 
+        // Single joined query — the per-row FileRecord fetch was N+1 on hot
+        // locator paths (find-symbol / pack primaries / candidates blocks).
+        let patterns = terms.map { Self.likePattern($0) }
+        let joiner = strict ? " AND " : " OR "
+        let whereClause = patterns
+            .map { _ in "(s.name LIKE ? ESCAPE '\\' OR s.qualifiedName LIKE ? ESCAPE '\\')" }
+            .joined(separator: joiner)
+        let arguments = patterns.flatMap { [$0, $0] }
+        let sql = """
+            SELECT s.kind, s.name, s.qualifiedName, s.signature, s.enclosingType, \
+                   s.accessLevel, s.docComment, s.startLine, s.endLine, s.estimatedTokens, \
+                   f.path AS resolvedPath
+            FROM symbolRecordInternal s
+            JOIN fileRecord f ON f.id = s.fileId
+            WHERE \(whereClause)
+            ORDER BY s.qualifiedName ASC
+            """
+
         return try writer.read { db in
-            var request = SymbolRecordInternal.all()
-            if strict {
-                for term in terms {
-                    request = request.filter(
-                        Self.likeContains(Column("name"), term)
-                            || Self.likeContains(Column("qualifiedName"), term)
-                    )
-                }
-            } else {
-                let filters = terms.map {
-                    Self.likeContains(Column("name"), $0)
-                        || Self.likeContains(Column("qualifiedName"), $0)
-                }
-                request = request.filter(filters.joined(operator: .or))
-            }
-
-            let records = try request
-                .order(Column("qualifiedName").asc)
-                .fetchAll(db)
-
-            
-            return try records.map { record in
-                let file = try FileRecord.filter(Column("id") == record.fileId).fetchOne(db)
-                return SymbolRecord(
-                    kind: SymbolRecord.Kind(rawValue: record.kind) ?? .function,
-                    name: record.name,
-                    qualifiedName: record.qualifiedName,
-                    signature: record.signature ?? "",
-                    filePath: file?.path ?? "",
-                    startLine: record.startLine,
-                    endLine: record.endLine,
-                    enclosingType: record.enclosingType,
-                    accessLevel: record.accessLevel,
-                    docComment: record.docComment,
-                    estimatedTokens: record.estimatedTokens ?? 0
+            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
+            return rows.map { row in
+                SymbolRecord(
+                    kind: SymbolRecord.Kind(rawValue: row["kind"] as String) ?? .function,
+                    name: row["name"] as String,
+                    qualifiedName: row["qualifiedName"] as String,
+                    signature: row["signature"] as? String ?? "",
+                    filePath: row["resolvedPath"] as String,
+                    startLine: row["startLine"] as Int,
+                    endLine: row["endLine"] as Int,
+                    enclosingType: row["enclosingType"] as? String,
+                    accessLevel: row["accessLevel"] as? String,
+                    docComment: row["docComment"] as? String,
+                    estimatedTokens: row["estimatedTokens"] as? Int ?? 0
                 )
             }
         }
@@ -483,13 +484,22 @@ public final class Database: @unchecked Sendable {
     }
 
     public func getReferences(forSymbolName name: String) throws -> [SymbolRecord.Reference] {
-        try writer.read { db in
-            let records = try SymbolReferenceInternal
-                .filter(Column("name") == name)
-                .fetchAll(db)
-            return try records.map {
-                let file = try FileRecord.filter(Column("id") == $0.fileId).fetchOne(db)
-                return SymbolRecord.Reference(name: $0.name, startLine: $0.startLine, endLine: $0.endLine, context: $0.context, file: file?.path ?? "")
+        let sql = """
+            SELECT r.name AS refName, r.startLine, r.endLine, r.context, f.path AS resolvedPath
+            FROM symbolReferenceInternal r
+            JOIN fileRecord f ON f.id = r.fileId
+            WHERE r.name = ?
+            """
+        return try writer.read { db in
+            let rows = try Row.fetchAll(db, sql: sql, arguments: [name])
+            return rows.map { row in
+                SymbolRecord.Reference(
+                    name: row["refName"] as String,
+                    startLine: row["startLine"] as Int,
+                    endLine: row["endLine"] as Int,
+                    context: row["context"] as? String,
+                    file: row["resolvedPath"] as String
+                )
             }
         }
     }
@@ -501,16 +511,31 @@ public final class Database: @unchecked Sendable {
     public func getReferencesLike(name: String, limit: Int = 200) throws -> [SymbolRecord.Reference] {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
+        let sql = """
+            SELECT r.name AS refName, r.startLine, r.endLine, r.context, f.path AS resolvedPath
+            FROM symbolReferenceInternal r
+            JOIN fileRecord f ON f.id = r.fileId
+            WHERE r.name LIKE ? ESCAPE '\\'
+            LIMIT ?
+            """
         return try writer.read { db in
-            let records = try SymbolReferenceInternal
-                .filter(Self.likeContains(Column("name"), trimmed))
-                .limit(limit * 4)
-                .fetchAll(db)
-            let ranked = records.sorted { ($0.name.count, $0.name) < ($1.name.count, $1.name) }
-            return try ranked.prefix(limit).map {
-                let file = try FileRecord.filter(Column("id") == $0.fileId).fetchOne(db)
-                return SymbolRecord.Reference(name: $0.name, startLine: $0.startLine, endLine: $0.endLine, context: $0.context, file: file?.path ?? "")
+            let rows = try Row.fetchAll(
+                db,
+                sql: sql,
+                arguments: [Self.likePattern(trimmed), limit * 4]
+            )
+            let references = rows.map { row -> SymbolRecord.Reference in
+                SymbolRecord.Reference(
+                    name: row["refName"] as String,
+                    startLine: row["startLine"] as Int,
+                    endLine: row["endLine"] as Int,
+                    context: row["context"] as? String,
+                    file: row["resolvedPath"] as String
+                )
             }
+            return Array(references.sorted {
+                ($0.name.count, $0.name) < ($1.name.count, $1.name)
+            }.prefix(limit))
         }
     }
 

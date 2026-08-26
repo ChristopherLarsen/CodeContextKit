@@ -1,0 +1,11 @@
+{
+  "cckit": "/Users/christopherlarsen/Workspace/CodeContextKit/.build/debug/cckit",
+  "index_seconds": 85.5,
+  "B6_hygiene": {
+    "failure_packet_tokens": 1357,
+    "huge_line_leaked_into_packet": false,
+    "fallback_scan_paths": [],
+    "fallback_scan_respects_gitignore": true,
+    "fallback_matches_in_tracked_only": true
+  }
+}
