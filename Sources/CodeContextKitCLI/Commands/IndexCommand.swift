@@ -215,20 +215,43 @@ struct IndexCommand: AsyncParsableCommand {
         return "\(indexSkippedMarkerName)\(json)"
     }
 
+    /// Ratio above which a withheld-stamp compaction must NOT relatch a
+    /// baseline: certifying materialized bytes >= this multiple of
+    /// expectedLiveBytes would hide known bloat behind a healthy watermark.
+    /// Matches the compact-run warning print. Env-tunable for tests.
+    static func settleBloatRatioThreshold() -> Double {
+        guard let raw = ProcessInfo.processInfo.environment["CCKIT_WAX_SETTLE_RATIO"],
+              let value = Double(raw.trimmingCharacters(in: .whitespaces)), value > 0 else {
+            return 2.0
+        }
+        return value
+    }
+
     /// Called when a compact pass stamped nothing because nothing was
-    /// reclaimed or shrunken. Three outcomes:
+    /// reclaimed or shrunken. Four outcomes:
     ///  1. Watermark impossible vs live (>2× allocated, the pre-cc164a8 latch)
     ///     → restamp baseline immediately.
-    ///  2. Second consecutive no-progress compact → the arena legitimately
-    ///     grew past its watermark with nothing reclaimable; relatch baseline
-    ///     so the shim's needs-compact gate stops respawning no-op compacts
-    ///     forever. A real bloat case never reaches this: it shrinks and
-    ///     stamps via writeIfReclaimed.
-    ///  3. First no-progress compact → bump the counter, keep the watermark,
+    ///  2. The post-close arena still breaches its expected live size → do NOT
+    ///     relatch and do NOT count toward convergence: a run whose own
+    ///     diagnostics say "repo.wax is Nx expected live" must not certify
+    ///     those same bytes as healthy. Delegates to the breaker verdict so
+    ///     the existing breach-marker contract arms (--clean owns remediation).
+    ///  3. Second consecutive no-progress compact on a HEALTHY-ratio store →
+    ///     relatch baseline so the shim's gate stops respawning forever.
+    ///     Frame-level bloat shrinks and stamps via writeIfReclaimed;
+    ///     stale-segment bloat ("scanned == kept") is excluded by (2) — it is
+    ///     invisible to frame diffing, so deleted==0 proves nothing there.
+    ///  4. First no-progress compact → bump the counter, keep the watermark,
     ///     allow one more attempt (cheap guard against a shrink racing us).
-    /// Threshold mirrors mcp/cckit_mcp.py:_COMPACT_STAMP_MAX_LIVE_RATIO.
+    /// Impossible-watermark ceiling mirrors
+    /// mcp/cckit_mcp.py:_COMPACT_STAMP_MAX_LIVE_RATIO.
     @discardableResult
-    static func settleWithheldCompactStamp(cckitDir: String, waxBytesAfter: Int) throws -> Bool {
+    static func settleWithheldCompactStamp(
+        cckitDir: String,
+        waxBytesAfter: Int,
+        expectedLiveBytes: Int? = nil,
+        reclaimableBytes: Int? = nil
+    ) throws -> Bool {
         guard let prior = WaxCompactStamp.readWatermark(cckitDir: cckitDir) else {
             return false
         }
@@ -240,6 +263,36 @@ struct IndexCommand: AsyncParsableCommand {
             try WaxCompactStamp.relatchBaseline(allocatedBytes: waxBytesAfter, cckitDir: cckitDir)
             return true
         }
+        // Bloat veto: deleted==0 proves only that frame diffing found nothing —
+        // segment-level dead weight never shows up there. Refuse certification
+        // whenever the excess is RECOVERABLE (arm the marker, --clean owns it).
+        // A breach whose excess has zero reclaimable bytes is fixed store
+        // overhead by the breaker's own doctrine — same rationale as
+        // settleWaxBreakerVerdict — so certification may proceed through the
+        // normal convergence path below rather than looping loudly forever.
+        let reclaimable = UInt64(exactly: max(0, reclaimableBytes ?? 0)) ?? 0
+        if let expected = expectedLiveBytes, expected > 0,
+           waxBytesAfter >= Int(Double(expected) * settleBloatRatioThreshold()) {
+            if reclaimable > 0 {
+                print(
+                    "Withholding compact stamp: arena is past \(String(format: "%.1f", settleBloatRatioThreshold()))x its expected live size (\(waxBytesAfter)B vs ~\(expected)B, \(reclaimable)B reclaimable); refusing to latch bloat as healthy."
+                )
+                Self.writeBreachMarker(
+                    cckitDir: cckitDir,
+                    allocatedBytes: UInt64(max(0, waxBytesAfter)),
+                    expectedLiveBytes: UInt64(expected),
+                    reclaimableBytes: reclaimable,
+                    factor: settleBloatRatioThreshold()
+                )
+                print(
+                    "Breach marker armed: NEXT 'cckit index' aborts until 'cckit index . --clean' rebuilds from scratch."
+                )
+                return false
+            }
+            print(
+                "Breach at \(String(format: "%.1f", settleBloatRatioThreshold()))x expected live size has no reclaimable bytes (store overhead); certifying is safe."
+            )
+        }
         if prior.noShrinkRuns >= 1 {
             print(
                 "No-progress compact again (\(prior.noShrinkRuns + 1) consecutive); relatching baseline at \(waxBytesAfter) so needs-compact stops respawning."
@@ -247,8 +300,7 @@ struct IndexCommand: AsyncParsableCommand {
             try WaxCompactStamp.relatchBaseline(allocatedBytes: waxBytesAfter, cckitDir: cckitDir)
             return true
         }
-        let runs = try WaxCompactStamp.recordNoShrinkRun(cckitDir: cckitDir)
-        _ = runs
+        _ = try WaxCompactStamp.recordNoShrinkRun(cckitDir: cckitDir)
         return false
     }
 
@@ -325,6 +377,15 @@ struct IndexCommand: AsyncParsableCommand {
 
         if compactOnly {
             print("Compacting Wax against SQLite symbols (no re-embed)...")
+            if Self.hasBreachMarker(cckitDir: cckitDir) {
+                // Armed by a prior bloat-vetoed compact: refusing keeps the
+                // loop from respawning itself into the same veto forever.
+                print(
+                    "Error: repo.wax remains over its live-set ceiling after a withheld compact " +
+                        "(breach marker present). Run 'cckit index . --clean' to rebuild from scratch."
+                )
+                throw ExitCode.failure
+            }
             // Frame-level truth first: what compaction CAN see.
             if let diag = try? await wax.storeDiagnostics() {
                 let bloatRatio = diag.expectedLiveBytes > 0
@@ -348,8 +409,10 @@ struct IndexCommand: AsyncParsableCommand {
             let result = try await indexer.compactWax()
             print("Compact complete. Scanned: \(result.scanned), kept: \(result.kept), deleted: \(result.deleted)")
             // Closing the store is what triggers Wax's close-time live-set
-            // rewrite (payload-level reclaim, frame-ID preserving). Measure and
-            // stamp only afterwards so decisions use post-reclaim bytes.
+            // rewrite (payload-level reclaim, frame-ID preserving). Snapshot
+            // expectations BEFORE close — diagnostics die with the handle —
+            // and stamp only afterwards so decisions use post-reclaim bytes.
+            let preCloseDiagnostics = try? await wax.storeDiagnostics()
             try await wax.close()
             let bytesAfter = Self.waxFileAllocatedBytes(at: waxPath)
             // Stamp only real reclamations; a no-shrink stamp would latch bloat
@@ -369,11 +432,14 @@ struct IndexCommand: AsyncParsableCommand {
                 } else {
                     print("Nothing to reclaim (deleted 0 frames); stamp withheld.")
                 }
-                // Self-heal a pre-cc164a8 latched watermark, or converge a
-                // healthy-but-grown store that has nothing reclaimable.
+                // Self-heal a pre-cc164a8 latched watermark, converge a
+                // healthy-ratio grown store, or veto-and-arm when the arena
+                // still breaches its expected live size.
                 let restamped = try Self.settleWithheldCompactStamp(
                     cckitDir: cckitDir,
-                    waxBytesAfter: bytesAfter
+                    waxBytesAfter: bytesAfter,
+                    expectedLiveBytes: preCloseDiagnostics.map { Int(max(0, $0.expectedLiveBytes)) },
+                    reclaimableBytes: preCloseDiagnostics.map { Int(max(0, $0.reclaimableBytes)) }
                 )
                 if restamped { stamped = true }
             }

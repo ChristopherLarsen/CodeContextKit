@@ -959,6 +959,15 @@ class WaxCompactAutoTests(unittest.TestCase):
         self._write_compact_stamp(self.repo, wax_bytes=max(1024, allocated))
         self.assertFalse(mcp.wax_needs_compact(self.repo))
 
+    def test_armed_breach_marker_suppresses_compact_gate(self) -> None:
+        """The CLI's bloat veto owns remediation once armed; respawning the
+        compact it just refused would only burn CPU on a guaranteed no-op."""
+        marker = self.repo / ".cckit" / mcp._BREACH_MARKER
+        marker.write_text("{}", encoding="utf-8")
+        self.assertFalse(mcp.wax_needs_compact(self.repo))
+        marker.unlink()
+        self.assertTrue(mcp.wax_needs_compact(self.repo))
+
     def test_maybe_refresh_compacts_when_index_is_current(self) -> None:
         spawned: list[tuple[Path, list[str] | None]] = []
 

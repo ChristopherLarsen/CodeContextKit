@@ -1569,6 +1569,9 @@ def parse_compact_result(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+_BREACH_MARKER = "wax-breach-marker.json"
+
+
 def wax_needs_compact(repo: Path) -> bool:
     """True when repo.wax exists and has never been compacted, or has grown since.
 
@@ -1576,10 +1579,16 @@ def wax_needs_compact(repo: Path) -> bool:
     huge logical length across rewrites (~278MB apparent / ~12MB materialized
     right now), so st_size both overstates today and lies after every reclaim.
     cckit's operating guidance is du, not ls/stat.
+
+    An armed wax-breach-marker means the CLI's bloat veto already refused to
+    certify this arena; remediation is `cckit index . --clean`, not an endless
+    respawn of compacts the veto will reject again.
     """
     wax = repo / ".cckit" / "repo.wax"
     db = repo / ".cckit" / "index.sqlite"
     if not wax.is_file() or not db.is_file():
+        return False
+    if (repo / ".cckit" / _BREACH_MARKER).is_file():
         return False
     stat_result = wax.stat()
     live = stat_result.st_blocks * 512
