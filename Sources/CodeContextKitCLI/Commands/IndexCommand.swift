@@ -44,15 +44,9 @@ struct IndexCommand: AsyncParsableCommand {
     @Flag(help: "Include generated Gradle/Kotlin source directories.")
     var includeGenerated: Bool = false
 
-    /// repo.wax on-disk size, for post-close reclaim measurement.
-    static func waxFileBytes(at path: String) -> Int {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-              let size = attrs[.size] as? NSNumber else { return 0 }
-        return size.intValue
-    }
-
     /// Bytes actually materialized on disk (st_blocks). Wax preallocates
     /// arenas sparsely, so growth detection must use this, not st_size.
+    /// Supersedes the apparent-size reader; one measurement for all callers.
     static func waxFileAllocatedBytes(at path: String) -> Int {
         guard let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: [
             .totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .fileSizeKey,
@@ -282,7 +276,7 @@ struct IndexCommand: AsyncParsableCommand {
         }
         
         let db = try Database(path: dbPath)
-        let bytesBeforeIndexing = Self.waxFileBytes(at: waxPath)
+        let bytesBeforeIndexing = Self.waxFileAllocatedBytes(at: waxPath)
         let wax = try await WaxStore(path: waxPath)
         guard await wax.isAvailable(), await wax.hasEmbeddings() else {
             print("Error: Failed to open MiniLM semantic store at \(waxPath).")
@@ -320,7 +314,7 @@ struct IndexCommand: AsyncParsableCommand {
             // rewrite (payload-level reclaim, frame-ID preserving). Measure and
             // stamp only afterwards so decisions use post-reclaim bytes.
             try await wax.close()
-            let bytesAfter = Self.waxFileBytes(at: waxPath)
+            let bytesAfter = Self.waxFileAllocatedBytes(at: waxPath)
             // Stamp only real reclamations; a no-shrink stamp would latch bloat
             // as the healthy watermark and hide future growth from MCP.
             let stamped = try WaxCompactStamp.writeIfReclaimed(
@@ -406,7 +400,7 @@ struct IndexCommand: AsyncParsableCommand {
         // Closing may trigger Wax's close-time live-set rewrite; measure and
         // stamp against post-close bytes so decisions reflect reality.
         try await wax.close()
-        let bytesAfterIndexing = Self.waxFileBytes(at: waxPath)
+        let bytesAfterIndexing = Self.waxFileAllocatedBytes(at: waxPath)
 
         // Circuit breaker, phase 2: judge this run's forced reclaim against
         // the promoted file and arm (or clear) the fail-fast marker for the

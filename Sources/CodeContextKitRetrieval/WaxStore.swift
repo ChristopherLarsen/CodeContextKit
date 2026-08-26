@@ -333,10 +333,21 @@ public actor WaxStore {
         return try await memory.runLiveSetMaintenanceNow()
     }
 
+    /// Bytes actually materialized on disk (st_blocks). Wax preallocates its
+    /// arena sparsely, so apparent size overstates by ~2x and drifts further
+    /// with use — growth detection and watermarks must use allocated bytes.
+    /// Mirrors IndexCommand.waxFileAllocatedBytes(at:); this module cannot see
+    /// the CLI target. Internal so WaxCompactStamp.writeBaseline shares it.
+    static func waxFileAllocatedBytes(at path: String) -> Int {
+        guard let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: [
+            .totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .fileSizeKey,
+        ]) else { return 0 }
+        let allocated = values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? values.fileSize ?? 0
+        return max(0, allocated)
+    }
+
     private func waxFileBytes() -> Int {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-              let size = attrs[.size] as? NSNumber else { return 0 }
-        return size.intValue
+        Self.waxFileAllocatedBytes(at: path)
     }
 
     private func framesMatching(mandate: String) async throws -> [UInt64] {
@@ -549,17 +560,12 @@ public enum WaxCompactStamp {
     }
 
     /// Baseline stamp for a freshly rebuilt store (no leaked payloads yet), so
-    /// MCP does not compact a brand-new index.
+    /// MCP does not compact a brand-new index. Records allocated bytes: this
+    /// watermark gates compaction, and an apparent-size stamp reintroduces the
+    /// latched-watermark failure shape on the next --clean.
     public static func writeBaseline(cckitDir: String = ".cckit") throws {
-        let fm = FileManager.default
         let waxPath = (cckitDir as NSString).appendingPathComponent("repo.wax")
-        let waxBytes: Int
-        if let attrs = try? fm.attributesOfItem(atPath: waxPath),
-           let size = attrs[.size] as? NSNumber {
-            waxBytes = size.intValue
-        } else {
-            waxBytes = 0
-        }
+        let waxBytes = WaxStore.waxFileAllocatedBytes(at: waxPath)
         try write(cckitDir: cckitDir, waxBytes: waxBytes, deletedFrames: 0)
     }
 
