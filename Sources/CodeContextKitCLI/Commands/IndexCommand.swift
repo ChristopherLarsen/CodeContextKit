@@ -207,6 +207,35 @@ struct IndexCommand: AsyncParsableCommand {
         return "\(name) {\"deleted\": \(result.deleted), \"shrank\": \(result.shrank), \"stamped\": \(stamped)}"
     }
 
+    /// Marker prefix on stdout when this run dropped its work because another
+    /// process already holds the refresh lock. The MCP shim parses it to report
+    /// an honest skip instead of inferring success from exit 0.
+    static let indexSkippedMarkerName = "IndexSkipped "
+
+    static func indexSkippedLine(reason: String) -> String {
+        let payload: [String: Any] = ["reason": reason]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8) else {
+            return "\(indexSkippedMarkerName){\"reason\": \"locked\"}"
+        }
+        return "\(indexSkippedMarkerName)\(json)"
+    }
+
+    /// Take the repo-wide indexer lock (.cckit/refresh.lock) without blocking.
+    /// Returns the held file descriptor, or nil when another indexing process
+    /// holds it. One writer per repo regardless of trigger source (MCP shim,
+    /// git hooks, human invocations): contended callers DROP, they never queue
+    /// a second rebuild behind the first.
+    static func tryAcquireRefreshLock(lockPath: String) -> Int32? {
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o644)
+        guard fd >= 0 else { return nil }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            return nil
+        }
+        return fd
+    }
+
     func run() async throws {
         let startTime = Date()
         let cckitDir = ".cckit"
@@ -215,6 +244,15 @@ struct IndexCommand: AsyncParsableCommand {
         let fm = FileManager.default
 
         try fm.createDirectory(atPath: cckitDir, withIntermediateDirectories: true)
+
+        // Single-writer gate before any store mutation (including --clean
+        // rebuilds deleting db/wax). Held until run() returns; release happens
+        // implicitly on process exit even on crash.
+        guard let fd = Self.tryAcquireRefreshLock(lockPath: "\(cckitDir)/refresh.lock") else {
+            print(Self.indexSkippedLine(reason: "locked"))
+            throw ExitCode.success
+        }
+        defer { close(fd) }
 
         let storedEmbedderId = WaxEmbedderIdentity.storedId(cckitDir: cckitDir)
         let embedderMismatch = storedEmbedderId != WaxEmbedderIdentity.current

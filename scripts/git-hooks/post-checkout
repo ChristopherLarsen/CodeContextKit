@@ -20,5 +20,13 @@ else
   exit 0
 fi
 
-# Incremental refresh in the background so checkout stays snappy.
-(cd "$root" && "$cckit_bin" index .) >/dev/null 2>&1 &
+# Incremental refresh in the background so checkout stays snappy — but only if
+# no indexer is already running. Six git ops in one second used to spawn six
+# concurrent near-full rebuilds (~66 min summed CPU for one checkout storm).
+# macOS ships no flock(1); perl's Fcntl is always present. Contended callers
+# drop in ~14 ms, exit 0, without exec'ing the binary. Current cckit binaries
+# also take this lock themselves (IndexCommand.run), so the perl guard only
+# needs to protect against stale installed binaries.
+(cd "$root" && perl -e 'use Fcntl ":flock"; open(my $f,">>",$ARGV[0]) or exit 0;
+         flock($f, LOCK_EX|LOCK_NB) or exit 0; exec @ARGV[1..$#ARGV];' \
+  "$root/.cckit/refresh.lock" "$cckit_bin" index .) >/dev/null 2>&1 &

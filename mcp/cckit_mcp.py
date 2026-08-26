@@ -459,7 +459,7 @@ def miss_footer(
     has_candidates: bool = False,
 ) -> str:
     prefix = (
-        "No indexed hit after refresh."
+        "No indexed hit; indexing was triggered in the background — retry shortly."
         if after_refresh
         else "No indexed hit."
     )
@@ -1410,17 +1410,71 @@ def refresh_disabled() -> bool:
     return CCKIT_REFRESH in {"never", "off", "0", "false"}
 
 
-@contextmanager
-def cross_process_refresh_lock(repo: Path) -> Iterator[None]:
-    """Serialize incremental index across MCP processes (Wax flock is per-open, too late)."""
-    lock_dir = repo / ".cckit"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    with open(lock_dir / "refresh.lock", "a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+_REFRESH_LOG_NAME = "refresh.log"
+# Out-of-band runs append CLI stdout/stderr here; cap so a storm cannot grow it.
+_REFRESH_LOG_MAX_BYTES = 512 * 1024
+# How much of the log tail is scanned for WaxCompact telemetry per tool call.
+_REFRESH_LOG_TAIL_BYTES = 64 * 1024
+
+
+def _refresh_log_path(repo: Path) -> Path:
+    return repo / ".cckit" / _REFRESH_LOG_NAME
+
+
+def refresh_lock_is_free(repo: Path) -> bool:
+    """True when no indexer holds .cckit/refresh.lock right now.
+
+    Non-blocking peek so the shim avoids spawning a child that would drop
+    itself anyway. The fd (and lock) is released before any spawn — a race
+    after the peek is harmless: the losing child self-drops via its own flock.
+    """
+    try:
+        handle = open(repo / ".cckit" / "refresh.lock", "a+")
+    except OSError:
+        return True
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+    finally:
+        handle.close()
+
+
+def spawn_detached_index(
+    repo: Path,
+    extra_args: list[str] | None = None,
+) -> dict[str, Any]:
+    """Launch `cckit index .` detached from this process; never wait in-turn.
+
+    A cross-branch checkout can cost ~19 minutes of indexing. Running that
+    synchronously inside a tool handler hits the subprocess timeout cap,
+    SIGKILLs a half-written SQLite+Wax pair mid-rebuild, and then serves the
+    wounded index. Detached runs survive MCP restarts, write their output to
+    `.cckit/refresh.log`, and are serialized by the CLI's own refresh lock —
+    concurrent triggers DROP instead of queueing another rebuild.
+    """
+    log_path = _refresh_log_path(repo)
+    try:
+        if log_path.stat().st_size > _REFRESH_LOG_MAX_BYTES:
+            log_path.write_bytes(b"")
+    except OSError:
+        pass
+    cmd = [CCKIT, "index", ".", *(extra_args or [])]
+    try:
+        with open(log_path, "ab") as log_handle:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(repo),
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=cckit_subprocess_env(),
+            )
+    except (OSError, FileNotFoundError) as error:
+        return {"triggered": False, "refreshError": str(error)}
+    return {"triggered": True, "pid": proc.pid}
 
 
 def _index_is_current(repo: Path) -> bool:
@@ -1566,42 +1620,67 @@ def with_freshness(payload: dict[str, Any], repo: Path) -> dict[str, Any]:
 
 
 def maybe_refresh_index(repo: Path, args: list[str]) -> dict[str, Any] | None:
-    """Incremental index when HEAD drifted or indexable dirty files hash-mismatch.
+    """Trigger an out-of-band index when HEAD drifted or dirty files hash-mismatch.
 
     Also auto-compacts a leaked Wax store even when the SQLite stamp is current.
+    Never runs indexing in-turn: returns as soon as a detached `cckit index`
+    has been spawned (or skipped because one already holds the refresh lock).
     """
     if refresh_disabled():
         return None
     if args and args[0] == "index":
         return None
-    needs_index = not _index_is_current(repo)
-    needs_compact = wax_needs_compact(repo)
-    if not needs_index and not needs_compact:
+    freshness = index_freshness(repo)
+    if not (not _index_is_current(repo) or wax_needs_compact(repo)):
         return None
 
     with _REFRESH_LOCK:
-        with cross_process_refresh_lock(repo):
-            needs_index = not _index_is_current(repo)
-            needs_compact = wax_needs_compact(repo)
-            if needs_index:
-                return _run_incremental_index(repo, index_freshness(repo))
-            if needs_compact:
-                return _run_compact(repo)
+        if not refresh_lock_is_free(repo):
+            return {
+                "refreshed": False,
+                "skipped": True,
+                "reason": "index_in_progress",
+                **freshness,
+            }
+        # Recheck under the process mutex so parallel tool calls in this MCP
+        # process spawn at most one indexer between the check and the spawn.
+        needs_index = not _index_is_current(repo)
+        needs_compact = wax_needs_compact(repo)
+        if not needs_index and not needs_compact:
             return None
+        extra = ["--compact"] if (needs_compact and not needs_index) else None
+        triggered = spawn_detached_index(repo, extra_args=extra)
+        return {
+            "refreshed": False,
+            **triggered,
+            **freshness,
+        }
 
 
 def force_refresh_index(repo: Path) -> dict[str, Any]:
-    """Force one incremental index (miss-time retry). Honors CCKIT_REFRESH=never."""
+    """Trigger one out-of-band incremental index (miss-time retry). Honors CCKIT_REFRESH=never.
+
+    Fire-and-forget: the immediate query retry runs against the existing index;
+    results improve once the detached run lands.
+    """
     if refresh_disabled():
         return {"refreshed": False, "skipped": True}
     with _REFRESH_LOCK:
-        with cross_process_refresh_lock(repo):
-            if not _index_is_current(repo):
-                return _run_incremental_index(repo, index_freshness(repo))
-            if wax_needs_compact(repo):
-                return _run_compact(repo)
-            freshness = index_freshness(repo)
+        freshness = index_freshness(repo)
+        if not refresh_lock_is_free(repo):
+            return {
+                "refreshed": False,
+                "skipped": True,
+                "reason": "index_in_progress",
+                **freshness,
+            }
+        if _index_is_current(repo) and not wax_needs_compact(repo):
             return {"refreshed": False, "skipped": True, "reason": "already_fresh", **freshness}
+        needs_index = not _index_is_current(repo)
+        needs_compact = wax_needs_compact(repo)
+        extra = ["--compact"] if (needs_compact and not needs_index) else None
+        triggered = spawn_detached_index(repo, extra_args=extra)
+        return {"refreshed": False, **triggered, **freshness}
 
 
 def _wax_growth_warning(compact: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1634,78 +1713,41 @@ def _wax_growth_warning(compact: dict[str, Any] | None) -> dict[str, Any] | None
     return warning
 
 
-def _run_incremental_index(
-    repo: Path,
-    freshness: dict[str, Any],
-) -> dict[str, Any]:
+_REFRESH_TELEMETRY_CACHE: dict[str, Any] = {}
+
+
+def _recent_refresh_log_telemetry(repo: Path) -> dict[str, Any]:
+    """Best-effort telemetry from detached index runs, parsed lazily.
+
+    Out-of-band runs leave no captured stdout in this process, so their
+    machine-readable lines are read back from `.cckit/refresh.log`: the last
+    `WaxCompact {...}` line is surfaced as waxCompact/waxGrowthWarning on
+    subsequent tool calls. Cached per (mtime_ns, size); a miss is just no data.
+    """
+    log_path = _refresh_log_path(repo)
     try:
-        proc = subprocess.run(
-            [CCKIT, "index", "."],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-            timeout=max(DEFAULT_TIMEOUT, 300),
-            env=cckit_subprocess_env(),
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
-        return {
-            "refreshed": False,
-            "refreshError": str(error),
-            **freshness,
-        }
-    after = index_freshness(repo)
-    compact = parse_compact_result(proc.stdout)
-    out: dict[str, Any] = {
-        "refreshed": proc.returncode == 0,
-        "refreshReturncode": proc.returncode,
-        "refreshStdout": (proc.stdout or "")[-500:],
-        "refreshStderr": (proc.stderr or "")[-500:],
-        **after,
-    }
+        stat = log_path.stat()
+        cache_key = f"{repo}:{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        return {}
+    if _REFRESH_TELEMETRY_CACHE.get("key") == cache_key:
+        return _REFRESH_TELEMETRY_CACHE.get("payload", {})
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(max(0, stat.st_size - _REFRESH_LOG_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return {}
+    payload: dict[str, Any] = {}
+    compact = parse_compact_result(tail)
     if compact is not None:
-        out["waxCompact"] = compact
+        payload["waxCompact"] = compact
         warning = _wax_growth_warning(compact)
         if warning is not None:
-            out["waxGrowthWarning"] = warning
-    return out
-
-
-def _run_compact(repo: Path) -> dict[str, Any]:
-    """Heal leaked Wax vectors without re-embedding. Best-effort; does not fail the tool.
-
-    The CLI is the sole stamper: it stamps only real reclamations. The shim
-    never writes wax-compact-stamp.json itself — latching a bloat watermark
-    from here is exactly the defect that let an arena grow past 480 GiB.
-    """
-    freshness = index_freshness(repo)
-    try:
-        proc = subprocess.run(
-            [CCKIT, "index", ".", "--compact"],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-            timeout=max(DEFAULT_TIMEOUT, 600),
-            env=cckit_subprocess_env(),
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
-        return {
-            "refreshed": False,
-            "compacted": False,
-            "compactError": str(error),
-            **freshness,
-        }
-    out: dict[str, Any] = {
-        "refreshed": False,
-        "compacted": proc.returncode == 0,
-        "compactReturncode": proc.returncode,
-        "compactStdout": (proc.stdout or "")[-500:],
-        "compactStderr": (proc.stderr or "")[-500:],
-        **freshness,
-    }
-    result = parse_compact_result(proc.stdout)
-    if result is not None:
-        out["waxCompact"] = result
-    return out
+            payload["waxGrowthWarning"] = warning
+    _REFRESH_TELEMETRY_CACHE["key"] = cache_key
+    _REFRESH_TELEMETRY_CACHE["payload"] = payload
+    return payload
 
 
 def run_cckit(
@@ -1759,19 +1801,16 @@ def run_cckit(
     def finish(payload: dict[str, Any]) -> dict[str, Any]:
         out = with_freshness(payload, cwd)
         refreshed = bool(refresh_meta and refresh_meta.get("refreshed"))
-        # Attach refresh only when it ran and failed / did not refresh.
-        if refresh_meta and (
-            not refresh_meta.get("refreshed")
-            or refresh_meta.get("refreshReturncode", 0) != 0
-        ):
+        # Refresh triggers are fire-and-forget now: whenever one fired we know
+        # the index WAS stale, so stale markers stay visible until the detached
+        # run actually lands.
+        if refresh_meta:
             out["refresh"] = refresh_meta
-        elif refresh_meta and refresh_meta.get("refreshed"):
-            # Successful silent refresh — drop stale keys if present.
-            out.pop("stale", None)
-            out.pop("indexedCommit", None)
-            out.pop("headCommit", None)
-            out.pop("indexedBranch", None)
-            out.pop("headBranch", None)
+        # Surface telemetry from previously-detached runs (WaxCompact growth).
+        telemetry = _recent_refresh_log_telemetry(cwd)
+        for key in ("waxCompact", "waxGrowthWarning"):
+            if key in telemetry:
+                out.setdefault(key, telemetry[key])
         out[_REFRESHED_KEY] = refreshed
         return out
 

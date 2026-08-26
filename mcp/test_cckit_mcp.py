@@ -104,7 +104,7 @@ class MissFooterTests(unittest.TestCase):
             dirty_paths=["a.swift", "b.swift"],
             after_refresh=True,
         )
-        self.assertIn("No indexed hit after refresh.", hint)
+        self.assertIn("No indexed hit; indexing was triggered in the background", hint)
         self.assertIn('outline("a.swift")', hint)
         self.assertIn("Dirty files: a.swift, b.swift", hint)
         self.assertIn("Grep only if outline lacks the name", hint)
@@ -708,12 +708,14 @@ class RefreshLockTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
         _seed_repo(self.repo)
+        mcp._REFRESH_TELEMETRY_CACHE.clear()
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
     def test_maybe_refresh_skips_when_fresh_after_lock(self) -> None:
-        run_calls: list[Path] = []
+        """First check says stale, recheck under the process mutex says fresh."""
+        spawned: list[Path] = []
         checks = {"n": 0}
 
         def fake_current(repo: Path) -> bool:
@@ -724,31 +726,74 @@ class RefreshLockTests(unittest.TestCase):
             mock.patch.object(mcp, "_index_is_current", side_effect=fake_current),
             mock.patch.object(
                 mcp,
-                "_run_incremental_index",
-                side_effect=lambda repo, freshness: run_calls.append(repo) or {"refreshed": True},
+                "spawn_detached_index",
+                side_effect=lambda repo, extra_args=None: spawned.append(repo)
+                or {"triggered": True},
             ),
         ):
             out = mcp.maybe_refresh_index(self.repo, ["find-symbol", "Foo"])
 
         self.assertIsNone(out)
-        self.assertEqual(run_calls, [])
+        self.assertEqual(spawned, [])
         self.assertGreaterEqual(checks["n"], 2)
 
     def test_force_refresh_skips_when_another_session_already_indexed(self) -> None:
-        run_calls: list[Path] = []
+        spawned: list[Path] = []
         with (
             mock.patch.object(mcp, "_index_is_current", return_value=True),
             mock.patch.object(
                 mcp,
-                "_run_incremental_index",
-                side_effect=lambda repo, freshness: run_calls.append(repo) or {"refreshed": True},
+                "spawn_detached_index",
+                side_effect=lambda repo, extra_args=None: spawned.append(repo)
+                or {"triggered": True},
             ),
         ):
             out = mcp.force_refresh_index(self.repo)
 
         self.assertTrue(out.get("skipped"))
         self.assertEqual(out.get("reason"), "already_fresh")
-        self.assertEqual(run_calls, [])
+        self.assertEqual(spawned, [])
+
+    def test_maybe_refresh_reports_contention_without_spawning(self) -> None:
+        """A held CLI lock means an indexer is already running: report, don't queue."""
+        spawned: list[Path] = []
+        lock_path = self.repo / ".cckit" / "refresh.lock"
+        with open(lock_path, "a+") as handle:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (
+                mock.patch.object(mcp, "_index_is_current", return_value=False),
+                mock.patch.object(
+                    mcp,
+                    "spawn_detached_index",
+                    side_effect=lambda repo, extra_args=None: spawned.append(repo)
+                    or {"triggered": True},
+                ),
+            ):
+                out = mcp.maybe_refresh_index(self.repo, ["find-symbol", "Foo"])
+
+        self.assertTrue(out and out.get("skipped"))
+        self.assertEqual(out.get("reason"), "index_in_progress")
+        self.assertFalse(out.get("triggered"))
+        self.assertEqual(spawned, [])
+
+    def test_force_refresh_triggers_out_of_band_on_stale(self) -> None:
+        spawned: list[tuple[Path, list[str] | None]] = []
+
+        def fake_spawn(repo: Path, extra_args: list[str] | None = None) -> dict:
+            spawned.append((repo, extra_args))
+            return {"triggered": True, "pid": 4242}
+
+        with (
+            mock.patch.object(mcp, "_index_is_current", return_value=False),
+            mock.patch.object(mcp, "spawn_detached_index", side_effect=fake_spawn),
+        ):
+            out = mcp.force_refresh_index(self.repo)
+
+        self.assertTrue(out.get("triggered"))
+        self.assertFalse(out.get("refreshed"))
+        self.assertEqual(spawned, [(self.repo, None)])
 
 
 class WaxCompactAutoTests(unittest.TestCase):
@@ -785,62 +830,59 @@ class WaxCompactAutoTests(unittest.TestCase):
         self.assertTrue(mcp.wax_needs_compact(self.repo))
 
     def test_maybe_refresh_compacts_when_index_is_current(self) -> None:
-        compact_calls: list[Path] = []
+        spawned: list[tuple[Path, list[str] | None]] = []
+
+        def fake_spawn(repo: Path, extra_args: list[str] | None = None) -> dict:
+            spawned.append((repo, extra_args))
+            return {"triggered": True}
+
         with (
             mock.patch.object(mcp, "_index_is_current", return_value=True),
-            mock.patch.object(
-                mcp,
-                "_run_compact",
-                side_effect=lambda repo: compact_calls.append(repo) or {"compacted": True},
-            ),
-            mock.patch.object(mcp, "_run_incremental_index") as index_mock,
+            mock.patch.object(mcp, "spawn_detached_index", side_effect=fake_spawn),
         ):
             out = mcp.maybe_refresh_index(self.repo, ["find-symbol", "Foo"])
 
-        self.assertEqual(compact_calls, [self.repo])
-        self.assertTrue(out and out.get("compacted"))
-        index_mock.assert_not_called()
+        self.assertEqual(spawned, [(self.repo, ["--compact"])])
+        self.assertTrue(out and out.get("triggered"))
+        self.assertFalse(out.get("refreshed"))
 
     def test_maybe_refresh_indexes_instead_of_compact_when_stale(self) -> None:
-        index_calls: list[Path] = []
+        spawned: list[tuple[Path, list[str] | None]] = []
+
+        def fake_spawn(repo: Path, extra_args: list[str] | None = None) -> dict:
+            spawned.append((repo, extra_args))
+            return {"triggered": True}
+
         with (
             mock.patch.object(mcp, "_index_is_current", return_value=False),
-            mock.patch.object(
-                mcp,
-                "_run_incremental_index",
-                side_effect=lambda repo, freshness: index_calls.append(repo)
-                or {"refreshed": True},
-            ),
-            mock.patch.object(mcp, "_run_compact") as compact_mock,
+            mock.patch.object(mcp, "spawn_detached_index", side_effect=fake_spawn),
         ):
             out = mcp.maybe_refresh_index(self.repo, ["find-symbol", "Foo"])
 
-        self.assertEqual(index_calls, [self.repo])
-        self.assertTrue(out and out.get("refreshed"))
-        compact_mock.assert_not_called()
+        self.assertEqual(spawned, [(self.repo, None)])
+        self.assertTrue(out and out.get("triggered"))
 
     def test_maybe_refresh_skips_compact_when_stamp_current(self) -> None:
         self._write_compact_stamp(self.repo)
         with (
             mock.patch.object(mcp, "_index_is_current", return_value=True),
-            mock.patch.object(mcp, "_run_compact") as compact_mock,
-            mock.patch.object(mcp, "_run_incremental_index") as index_mock,
+            mock.patch.object(mcp, "spawn_detached_index") as spawn_mock,
         ):
             out = mcp.maybe_refresh_index(self.repo, ["find-symbol", "Foo"])
 
         self.assertIsNone(out)
-        compact_mock.assert_not_called()
-        index_mock.assert_not_called()
+        spawn_mock.assert_not_called()
 
 
 class WaxStampUnificationTests(unittest.TestCase):
-    """The CLI is the sole stamper; the shim only reads the WaxCompact line."""
+    """The CLI is the sole stamper; the shim only reads detached-run telemetry."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
         _seed_repo(self.repo)
         (self.repo / ".cckit" / "repo.wax").write_bytes(b"x" * 1024)
+        mcp._REFRESH_TELEMETRY_CACHE.clear()
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -848,84 +890,65 @@ class WaxStampUnificationTests(unittest.TestCase):
     def _stamp_path(self) -> Path:
         return self.repo / ".cckit" / mcp._COMPACT_STAMP
 
-    def _run_index_proc(
-        self,
-        *,
-        returncode: int = 0,
-        stdout: str = "",
-    ) -> mock.MagicMock:
-        proc = mock.Mock()
-        proc.returncode = returncode
-        proc.stdout = stdout
-        proc.stderr = ""
-        return proc
+    def _log_path(self) -> Path:
+        return mcp._refresh_log_path(self.repo)
 
-    def test_run_compact_never_stamps_even_without_shrink(self) -> None:
-        stdout = (
-            'WaxCompact {"scanned": 21668, "deleted": 0, "kept": 21668, '
-            '"bytesBefore": 14789726662, "bytesAfter": 14789726662, '
-            '"shrank": false, "stamped": false}'
-        )
-        with mock.patch.object(
-            mcp.subprocess,
-            "run",
-            return_value=self._run_index_proc(stdout=stdout),
+    def test_trigger_compact_does_not_stamp_itself(self) -> None:
+        """Triggering compaction never writes the stamp — only the CLI can."""
+        with (
+            mock.patch.object(mcp, "_index_is_current", return_value=True),
+            mock.patch.object(
+                mcp, "spawn_detached_index", return_value={"triggered": True}
+            ) as spawn_mock,
         ):
-            out = mcp._run_compact(self.repo)
+            out = mcp.maybe_refresh_index(self.repo, ["find-symbol", "Foo"])
 
-        self.assertTrue(out.get("compacted"))
-        self.assertFalse(self._stamp_path().is_file())
-        self.assertEqual(out["waxCompact"]["deleted"], 0)
-
-    def test_run_compact_does_not_stamp_when_cli_withheld(self) -> None:
-        stdout = (
-            'WaxCompact {"scanned": 10, "deleted": 5, "kept": 5, '
-            '"bytesBefore": 1000000, "bytesAfter": 1000000, '
-            '"shrank": false, "stamped": false}'
-        )
-        with mock.patch.object(
-            mcp.subprocess,
-            "run",
-            return_value=self._run_index_proc(stdout=stdout),
-        ):
-            mcp._run_compact(self.repo)
-
+        extra = spawn_mock.call_args.kwargs.get("extra_args")
+        self.assertEqual(extra, ["--compact"])
+        self.assertTrue(out and out.get("triggered"))
         self.assertFalse(self._stamp_path().is_file())
 
-    def test_run_incremental_index_attaches_wax_compact_and_growth_warning(self) -> None:
-        stdout = (
+    def test_recent_refresh_log_telemetry_attaches_warning(self) -> None:
+        self._log_path().write_text(
+            "Indexing...\n"
             'WaxCompact {"scanned": 21668, "deleted": 0, "kept": 21668, '
             '"bytesBefore": 1000000, "bytesAfter": 1170000000, '
-            '"shrank": false, "stamped": false}'
+            '"shrank": false, "stamped": false}\n',
+            encoding="utf-8",
         )
-        with mock.patch.object(
-            mcp.subprocess,
-            "run",
-            return_value=self._run_index_proc(stdout=stdout),
-        ):
-            out = mcp._run_incremental_index(self.repo, {"stale": False})
+        out = mcp._recent_refresh_log_telemetry(self.repo)
 
-        self.assertTrue(out.get("refreshed"))
         self.assertEqual(out["waxCompact"]["bytesAfter"], 1170000000)
         warning = out.get("waxGrowthWarning")
         self.assertIsNotNone(warning)
         self.assertEqual(warning["grownBytes"], 1169000000)
 
-    def test_run_incremental_index_quiet_on_small_growth(self) -> None:
-        stdout = (
+    def test_recent_refresh_log_telemetry_quiet_on_small_growth(self) -> None:
+        self._log_path().write_text(
             'WaxCompact {"scanned": 21668, "deleted": 0, "kept": 21668, '
             '"bytesBefore": 1000000, "bytesAfter": 1010000, '
-            '"shrank": false, "stamped": false}'
+            '"shrank": false, "stamped": false}\n',
+            encoding="utf-8",
         )
-        with mock.patch.object(
-            mcp.subprocess,
-            "run",
-            return_value=self._run_index_proc(stdout=stdout),
-        ):
-            out = mcp._run_incremental_index(self.repo, {"stale": False})
+        out = mcp._recent_refresh_log_telemetry(self.repo)
 
         self.assertNotIn("waxGrowthWarning", out)
         self.assertIn("waxCompact", out)
+
+    def test_recent_refresh_log_telemetry_uses_last_line_and_tolerates_junk(self) -> None:
+        self._log_path().write_text(
+            'WaxCompact {"bytesBefore": 1, "bytesAfter": 2}\n'
+            "some runtime chatter without json\n",
+            encoding="utf-8",
+        )
+        out = mcp._recent_refresh_log_telemetry(self.repo)
+
+        # The trailing non-marker line does not crash parsing; the last valid
+        # marker before it wins.
+        self.assertIn("waxCompact", out)
+
+    def test_recent_refresh_log_telemetry_missing_log_is_empty(self) -> None:
+        self.assertEqual(mcp._recent_refresh_log_telemetry(self.repo), {})
 
     def test_growth_warning_thresholds(self) -> None:
         below = {"bytesBefore": 1000, "bytesAfter": 1100}
