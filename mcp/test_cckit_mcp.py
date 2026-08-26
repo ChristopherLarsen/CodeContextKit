@@ -703,6 +703,64 @@ class WorkingTreeNeedsIndexTests(unittest.TestCase):
         self.assertIn(".css", mcp.INDEXABLE_SUFFIXES)
 
 
+class ReloadWatcherTests(unittest.TestCase):
+    """execv under load strands in-flight stdio requests forever; the watcher
+    must defer until idle. Observed live: find_symbol stuck 4+ min after an
+    edit-storm triggered a mid-request swap."""
+
+    def setUp(self) -> None:
+        self.baseline = (1, 100, 1000)
+
+    def test_tick_unchanged_file_never_execs(self) -> None:
+        with mock.patch.object(mcp, "_shim_identity", return_value=self.baseline):
+            action, pending = mcp._reload_tick(self.baseline, None)
+        self.assertIsNone(action)
+        self.assertIsNone(pending)
+
+    def test_tick_first_change_only_marks_pending(self) -> None:
+        changed = (1, 120, 2000)
+        with mock.patch.object(mcp, "_shim_identity", return_value=changed):
+            action, pending = mcp._reload_tick(self.baseline, None)
+        self.assertIsNone(action)
+        self.assertEqual(pending, changed)
+
+    def test_tick_execs_when_stable_and_idle(self) -> None:
+        changed = (1, 120, 2000)
+        with (
+            mock.patch.object(mcp, "_shim_identity", return_value=changed),
+            mock.patch.object(mcp, "_REQUESTS_INFLIGHT", 0),
+        ):
+            action, pending = mcp._reload_tick(self.baseline, changed)
+        self.assertEqual(action, "exec")
+        self.assertIsNone(pending)
+
+    def test_tick_defers_while_requests_inflight(self) -> None:
+        """The hang fix: a stable identity change must NOT swap mid-request."""
+        changed = (1, 120, 2000)
+        with (
+            mock.patch.object(mcp, "_shim_identity", return_value=changed),
+            mock.patch.object(mcp, "_REQUESTS_INFLIGHT", 1),
+        ):
+            action, pending = mcp._reload_tick(self.baseline, changed)
+        self.assertIsNone(action)  # deferred
+        self.assertEqual(pending, changed)  # still armed once idle
+
+    def test_request_inflight_counter_round_trips(self) -> None:
+        before = mcp._REQUESTS_INFLIGHT
+        with mcp._request_inflight():
+            self.assertEqual(mcp._REQUESTS_INFLIGHT, before + 1)
+        self.assertEqual(mcp._REQUESTS_INFLIGHT, before)
+
+    def test_track_inflight_wraps_without_changing_signature(self) -> None:
+        @mcp.track_inflight
+        def sample(x: int) -> int:
+            self.assertEqual(mcp._REQUESTS_INFLIGHT, 1)
+            return x * 2
+
+        self.assertEqual(sample(21), 42)
+        self.assertEqual(mcp._REQUESTS_INFLIGHT, 0)
+
+
 class RefreshLockTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

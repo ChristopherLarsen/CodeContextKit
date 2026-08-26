@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -95,35 +96,83 @@ def shim_reload_disabled() -> bool:
     }
 
 
+_REQUEST_STATE_LOCK = threading.Lock()
+# >0 while any tool request is mid-handler. The reload watcher refuses to
+# execv until this drains: swapping the process image kills handler threads
+# while stdio fds stay open, so the client's pending request never errors,
+# never EOFs — it just hangs forever (observed: find_symbol stuck 4+ min).
+_REQUESTS_INFLIGHT = 0
+
+
+@contextmanager
+def _request_inflight() -> Iterator[None]:
+    global _REQUESTS_INFLIGHT
+    with _REQUEST_STATE_LOCK:
+        _REQUESTS_INFLIGHT += 1
+    try:
+        yield
+    finally:
+        with _REQUEST_STATE_LOCK:
+            _REQUESTS_INFLIGHT -= 1
+
+
+def track_inflight(func: Callable) -> Callable:
+    """Mark a tool entrypoint as in-flight so reload defers to it."""
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any):
+        with _request_inflight():
+            return func(*args, **kwargs)
+    return wrapper
+
+
 def start_self_reload_watcher() -> None:
     """Replace this process with a fresh run of cckit_mcp.py once the file on
-    disk changes. In-process state dies with execv; the MCP client sees one
-    dropped connection and reconnects to the new code."""
+    disk changes AND no request is mid-flight.
+
+    execv keeps pid and stdio fds open, so a swap under load does NOT drop the
+    connection — it strands the caller's unresolved request forever. Deferring
+    until idle keeps every issued request answerable; the swap happens between
+    turns instead.
+    """
     if shim_reload_disabled():
         return
     baseline = _shim_identity()
 
     def watch() -> None:
-        import time
-
         pending: ShimIdentity | None = None
         while True:
             time.sleep(_SHIM_RELOAD_POLL_SECONDS)
-            current = _shim_identity()
-            if current is None or current == baseline:
-                pending = None
-                continue
-            if not _should_exec_reload(baseline, current, pending):
-                pending = current
-                continue
-            sys.stderr.write(
-                f"cckit_mcp.py changed on disk; restarting in place "
-                f"(pid {os.getpid()}, identity {current})\n"
-            )
-            sys.stderr.flush()
-            os.execv(sys.executable, [sys.executable, str(_SHIM_SELF_PATH), *sys.argv[1:]])
+            action, pending = _reload_tick(baseline, pending)
+            if action == "exec":
+                sys.stderr.write(
+                    f"cckit_mcp.py changed on disk; restarting in place "
+                    f"(pid {os.getpid()}, identity {_shim_identity()})\n"
+                )
+                sys.stderr.flush()
+                os.execv(sys.executable, [sys.executable, str(_SHIM_SELF_PATH), *sys.argv[1:]])
 
     threading.Thread(target=watch, name="cckit-shim-reload", daemon=True).start()
+
+
+def _reload_tick(
+    baseline: ShimIdentity | None,
+    pending: ShimIdentity | None,
+) -> tuple[str | None, ShimIdentity | None]:
+    """One poll of the reload watcher.
+
+    Returns ("exec", None) when safe to swap, else (None, next_pending).
+    Two consecutive identical changed identities are required (write-stability),
+    and at least one fully idle poll is required before executing — a request
+    arriving during the stability window must not be decapitated.
+    """
+    current = _shim_identity()
+    if current is None or current == baseline:
+        return None, None
+    if not _should_exec_reload(baseline, current, pending):
+        return None, current
+    if _REQUESTS_INFLIGHT > 0:
+        return None, current
+    return "exec", None
 
 
 def cckit_subprocess_env() -> dict[str, str]:
@@ -1768,6 +1817,7 @@ def _recent_refresh_log_telemetry(repo: Path) -> dict[str, Any]:
     return payload
 
 
+@track_inflight
 def run_cckit(
     args: list[str],
     repo: str | None = None,
@@ -1867,6 +1917,7 @@ def run_cckit(
     return finish(attach_stderr(text_payload, stderr, success=True))
 
 
+@track_inflight
 def run_cckit_with_miss_retry(
     args: list[str],
     repo: str | None = None,
