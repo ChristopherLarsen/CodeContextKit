@@ -429,7 +429,12 @@ def semantic_candidates(
         if not isinstance(name, str) or not name:
             continue
         file = match.get("file")
-        out.append((name, file if isinstance(file, str) else ""))
+        location = file if isinstance(file, str) else ""
+        start = match.get("startLine")
+        end = match.get("endLine")
+        if isinstance(start, int) and isinstance(end, int) and location:
+            location = f"{location}:{start}-{end}"
+        out.append((name, location))
     return out
 
 

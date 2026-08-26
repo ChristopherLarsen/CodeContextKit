@@ -1,0 +1,11 @@
+{
+  "cckit": "/Users/christopherlarsen/Workspace/CodeContextKit/.build/debug/cckit",
+  "index_seconds": 85.7,
+  "B4_semantic_ranges": {
+    "corpus": "/var/folders/5t/_0yj_66d48g82cyd0b4wnc_h0000gn/T/cckit-bench-bame3l06/BenchFix",
+    "semantic_hits": 5,
+    "hits_with_ranges": 5,
+    "enrichment_fraction": 1.0,
+    "added_tokens_total": 39
+  }
+}

@@ -72,7 +72,7 @@ struct SearchCommand: AsyncParsableCommand {
     private func performUnifiedSearch(db: Database, wax: WaxStore, route: SearchRoute) async throws -> [String: Any] {
         switch route {
         case .vector(let semanticQuery):
-            var payload = try await vectorPayload(wax: wax, query: semanticQuery)
+            var payload = try await vectorPayload(db: db, wax: wax, query: semanticQuery)
             if strict {
                 payload["warning"] = "strict_ignored"
                 payload["message"] = "--strict applies to lexical file/symbol/grep match only; vector meaning search does not AND terms."
@@ -90,7 +90,7 @@ struct SearchCommand: AsyncParsableCommand {
             let useful = !files.isEmpty || !symbols.isEmpty || !textMatches.isEmpty
             if !useful && allowVectorFallback {
                 try await requireVectorReady(wax: wax)
-                var payload = try await vectorPayload(wax: wax, query: pattern)
+                var payload = try await vectorPayload(db: db, wax: wax, query: pattern)
                 payload["fallback"] = "vector"
                 payload["message"] = "No AND lexical matches for multi-word identifier query; fell back to vector search."
                 return payload
@@ -159,11 +159,22 @@ struct SearchCommand: AsyncParsableCommand {
         }
     }
 
-    private func vectorPayload(wax: WaxStore, query: String) async throws -> [String: Any] {
+    private func vectorPayload(db: Database, wax: WaxStore, query: String) async throws -> [String: Any] {
         let waxResults = try await wax.search(query, limit: limit)
         return [
-            "semanticMatches": waxResults.map {
-                ["symbol": $0.symbol, "score": $0.score, "file": $0.file] as [String: Any]
+            "semanticMatches": waxResults.map { result in
+                // Line ranges make hits actionable without a resolution round trip.
+                var row: [String: Any] = [
+                    "symbol": result.symbol,
+                    "score": result.score,
+                    "file": result.file,
+                ]
+                if let sym = try? db.getSymbols(qualifiedName: result.symbol).first {
+                    row["startLine"] = sym.startLine
+                    row["endLine"] = sym.endLine
+                    row["kind"] = "\(sym.kind)"
+                }
+                return row
             }
         ]
     }
