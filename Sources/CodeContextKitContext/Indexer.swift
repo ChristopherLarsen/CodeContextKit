@@ -19,6 +19,21 @@ public protocol IndexerProgressDelegate: Sendable {
     func indexerDidFail(error: Error)
 }
 
+public enum IndexerError: LocalizedError {
+    /// The arena crossed its mid-run growth cap. Aborting while the bytes are
+    /// still being written beats the post-hoc bloat veto, which can only arm a
+    /// marker after 186 GB are already on disk.
+    case arenaGrowthCapExceeded(allocatedBytes: Int, capBytes: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .arenaGrowthCapExceeded(let allocated, let cap):
+            return "Aborting index run: repo.wax reached \(allocated)B materialized, over the mid-run cap of \(cap)B. " +
+                "Run 'cckit index . --clean' to rebuild from scratch."
+        }
+    }
+}
+
 /// The core engine responsible for scanning the filesystem, extracting symbols, and persisting them to the database and vector store.
 /// 
 /// `Indexer` coordinates the entire indexing pipeline:
@@ -44,6 +59,7 @@ public final class Indexer: Sendable {
         exclude: [String] = [],
         includeBuildScripts: Bool = false,
         includeGenerated: Bool = false,
+        maxArenaBytes: Int? = nil,
         delegate: IndexerProgressDelegate? = nil
     ) async throws -> WaxCompactResult {
         let absolutePath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
@@ -81,6 +97,18 @@ public final class Indexer: Sendable {
             let relativePath = relativePath(for: fileURL, rootPath: absolutePath)
             
             delegate?.indexerDidProgress(completedFiles: index, totalFiles: files.count, currentFile: relativePath)
+            
+            // Mid-run growth cap: a single stat per file. When the arena
+            // crosses the cap, stop before more bytes land on disk instead of
+            // arming a marker after a 929x blowup has fully materialized.
+            if let cap = maxArenaBytes, cap > 0 {
+                let allocated = await wax.allocatedBytes()
+                if allocated > cap {
+                    let error = IndexerError.arenaGrowthCapExceeded(allocatedBytes: allocated, capBytes: cap)
+                    delegate?.indexerDidFail(error: error)
+                    throw error
+                }
+            }
             
             do {
                 let content = try String(contentsOf: fileURL, encoding: .utf8)
@@ -175,7 +203,19 @@ public final class Indexer: Sendable {
         }
 
         delegate?.indexerDidFinish(updated: updatedCount, skipped: skippedCount, totalSymbols: totalSymbols)
-        return compacted
+        // Carry this run's counts on the result so the CLI can persist them on
+        // the ledger row (ActionRecord) — durationMs alone cannot distinguish
+        // a no-op pass from a near-full re-embed.
+        return WaxCompactResult(
+            scanned: compacted.scanned,
+            deleted: compacted.deleted,
+            kept: compacted.kept,
+            bytesBefore: compacted.bytesBefore,
+            bytesAfter: compacted.bytesAfter,
+            updated: updatedCount,
+            skipped: skippedCount,
+            totalSymbols: totalSymbols
+        )
     }
 
     /// Drop Wax vectors that are not in the current SQLite keep-set. No re-embed.

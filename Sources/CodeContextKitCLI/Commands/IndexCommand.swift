@@ -184,7 +184,7 @@ struct IndexCommand: AsyncParsableCommand {
     /// Single-line JSON summary for tooling; MCP keys off this instead of
     /// snapshotting repo.wax st_size after the run.
     static func machineReadableLine(for result: WaxCompactResult, stamped: Bool) -> String {
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "scanned": result.scanned,
             "deleted": result.deleted,
             "kept": result.kept,
@@ -193,6 +193,14 @@ struct IndexCommand: AsyncParsableCommand {
             "shrank": result.shrank,
             "stamped": stamped
         ]
+        // Present only when the run actually indexed (compact-only passes
+        // leave these out); a ledger row with durationMs but no counts cannot
+        // distinguish a no-op from a near-full re-embed.
+        if result.updated > 0 || result.skipped > 0 || result.totalSymbols > 0 {
+            payload["updated"] = result.updated
+            payload["skipped"] = result.skipped
+            payload["symbols"] = result.totalSymbols
+        }
         let name = "WaxCompact"
         if let data = try? JSONSerialization.data(withJSONObject: payload),
            let json = String(data: data, encoding: .utf8) {
@@ -304,19 +312,35 @@ struct IndexCommand: AsyncParsableCommand {
         return false
     }
 
-    /// Take the repo-wide indexer lock (.cckit/refresh.lock) without blocking.
-    /// Returns the held file descriptor, or nil when another indexing process
-    /// holds it. One writer per repo regardless of trigger source (MCP shim,
-    /// git hooks, human invocations): contended callers DROP, they never queue
-    /// a second rebuild behind the first.
-    static func tryAcquireRefreshLock(lockPath: String) -> Int32? {
-        let fd = open(lockPath, O_CREAT | O_RDWR, 0o644)
-        guard fd >= 0 else { return nil }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
-            close(fd)
+    /// Mid-run arena cap (ask F): abort indexing while bytes are still being
+    /// written, instead of the strictly post-hoc bloat veto. Cap is a factor
+    /// over the larger of expected-live bytes and the pre-run arena, with an
+    /// absolute floor so legitimately large repos are never clipped.
+    /// Env-tunable: CCKIT_WAX_MIDRUN_FACTOR (default 8), CCKIT_WAX_MIN_BYTES
+    /// (default 8 GiB), CCKIT_WAX_MIDRUN_CAP=off disables entirely.
+    static func midRunArenaCap(
+        mustRebuild: Bool,
+        bytesBefore: Int,
+        expectedLiveBytes: Int?
+    ) -> Int? {
+        let env = ProcessInfo.processInfo.environment
+        if let mode = env["CCKIT_WAX_MIDRUN_CAP"],
+           mode.trimmingCharacters(in: .whitespaces).lowercased() == "off" {
             return nil
         }
-        return fd
+        var factor = 8.0
+        if let raw = env["CCKIT_WAX_MIDRUN_FACTOR"], let parsed = Double(raw), parsed > 0 {
+            factor = parsed
+        }
+        var floorBytes = 8 * 1024 * 1024 * 1024
+        if let raw = env["CCKIT_WAX_MIDRUN_MIN_BYTES"], let parsed = Int(raw), parsed > 0 {
+            floorBytes = parsed
+        }
+        // On a rebuild the arena starts empty, so bytesBefore and the old
+        // diagnostics say nothing about what this run SHOULD produce; the
+        // floor alone bounds it.
+        let base = mustRebuild ? 0 : max(bytesBefore, max(0, expectedLiveBytes ?? 0))
+        return max(Int(Double(base) * factor), floorBytes)
     }
 
     func run() async throws {
@@ -330,12 +354,26 @@ struct IndexCommand: AsyncParsableCommand {
 
         // Single-writer gate before any store mutation (including --clean
         // rebuilds deleting db/wax). Held until run() returns; release happens
-        // implicitly on process exit even on crash.
-        guard let fd = Self.tryAcquireRefreshLock(lockPath: "\(cckitDir)/refresh.lock") else {
+        // implicitly on process exit even on crash. RefreshLock verifies the
+        // flocked inode still matches the path, so a delete-and-recreate of
+        // refresh.lock mid-run (git clean, .cckit pruning) can no longer let
+        // a second writer in — the failure shape behind the concurrent
+        // full-index pileups.
+        let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
+        guard let lock = RefreshLock.tryAcquire(lockPath: "\(cckitDir)/refresh.lock") else {
             print(Self.indexSkippedLine(reason: "locked"))
+            // Record the drop so pileups are visible in the ledger instead of
+            // silently disappearing (a skipped run previously left no trace).
+            let orchestrator = ActionOrchestrator(repoRoot: ".")
+            try? await orchestrator.recordCLIAction(
+                command: fullCommand,
+                toolName: "index",
+                durationMs: 0,
+                status: "skipped"
+            )
             throw ExitCode.success
         }
-        defer { close(fd) }
+        defer { lock.release() }
 
         let storedEmbedderId = WaxEmbedderIdentity.storedId(cckitDir: cckitDir)
         let embedderMismatch = storedEmbedderId != WaxEmbedderIdentity.current
@@ -362,13 +400,27 @@ struct IndexCommand: AsyncParsableCommand {
             if fm.fileExists(atPath: waxPath) {
                 try fm.removeItem(atPath: waxPath)
             }
+            // Ask G: --clean must remove Wax's orphaned live-set rewrite
+            // candidates too; the 2026-08-27 rebuild left a 398 MB
+            // repo-liveset-<UUID>.wax behind that had to be deleted by hand.
+            if let entries = try? fm.contentsOfDirectory(atPath: cckitDir) {
+                for entry in entries where entry.hasPrefix("repo-liveset-") && entry.hasSuffix(".wax") {
+                    try? fm.removeItem(atPath: (cckitDir as NSString).appendingPathComponent(entry))
+                }
+            }
         }
         
         let db = try Database(path: dbPath)
         let bytesBeforeIndexing = Self.waxFileAllocatedBytes(at: waxPath)
         let wax = try await WaxStore(path: waxPath)
         guard await wax.isAvailable(), await wax.hasEmbeddings() else {
-            print("Error: Failed to open MiniLM semantic store at \(waxPath).")
+            // Ask B: name the real cause instead of pointing operators at
+            // resource bundles that were fine during the 186 GB incident.
+            var message = "Error: Failed to open MiniLM semantic store at \(waxPath)."
+            if let openError = await wax.lastOpenError {
+                message += " Cause: \(openError)"
+            }
+            print(message)
             throw ExitCode.failure
         }
         let actionOrchestrator = ActionOrchestrator(wax: wax)
@@ -452,7 +504,6 @@ struct IndexCommand: AsyncParsableCommand {
             )
             print(Self.machineReadableLine(for: measured, stamped: stamped))
             let duration = Int(Date().timeIntervalSince(startTime) * 1000)
-            let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
             try await actionOrchestrator.recordCLIAction(command: fullCommand, toolName: "index", durationMs: duration)
             return
         }
@@ -477,16 +528,48 @@ struct IndexCommand: AsyncParsableCommand {
             Self.clearBreachMarker(cckitDir: cckitDir)
         }
 
-        let compacted = try await indexer.index(
-            at: path,
-            include: include,
-            exclude: exclude,
-            includeBuildScripts: includeBuildScripts,
-            includeGenerated: includeGenerated,
-            delegate: CommandLineProgressDelegate(
-                emitProgress: InteractiveProgress.shouldEmitTTYProgress(stdoutIsTTY: stdoutIsTTY)
-            )
+        // Ask F: mid-run growth cap. expectedLiveBytes comes from the
+        // pre-run snapshot (diagnostics die with the handle only at close —
+        // here the store is still open).
+        let preRunDiagnostics = try? await wax.storeDiagnostics()
+        let arenaCap = Self.midRunArenaCap(
+            mustRebuild: mustRebuild,
+            bytesBefore: bytesBeforeIndexing,
+            expectedLiveBytes: preRunDiagnostics.map { Int(max(0, $0.expectedLiveBytes)) }
         )
+
+        let compacted: WaxCompactResult
+        do {
+            compacted = try await indexer.index(
+                at: path,
+                include: include,
+                exclude: exclude,
+                includeBuildScripts: includeBuildScripts,
+                includeGenerated: includeGenerated,
+                maxArenaBytes: arenaCap,
+                delegate: CommandLineProgressDelegate(
+                    emitProgress: InteractiveProgress.shouldEmitTTYProgress(stdoutIsTTY: stdoutIsTTY)
+                )
+            )
+        } catch let error as IndexerError {
+            // The cap tripped mid-run: arm the breach marker so the next run
+            // refuses and points at --clean, using the same numbers the cap
+            // just measured.
+            if case .arenaGrowthCapExceeded(let allocated, _) = error {
+                let expected = max(1, max(bytesBeforeIndexing, preRunDiagnostics.map { Int(max(0, $0.expectedLiveBytes)) } ?? 0))
+                Self.writeBreachMarker(
+                    cckitDir: cckitDir,
+                    allocatedBytes: UInt64(max(0, allocated)),
+                    expectedLiveBytes: UInt64(expected),
+                    reclaimableBytes: UInt64(max(0, allocated - expected)),
+                    factor: 8.0
+                )
+                print(
+                    "Breach marker armed: NEXT 'cckit index' aborts until 'cckit index . --clean' rebuilds from scratch."
+                )
+            }
+            throw error
+        }
 
         try WaxEmbedderIdentity.writeSidecar(cckitDir: cckitDir)
         if let stamp = IndexFreshness.captureStamp(repoRoot: absolutePath) {
@@ -497,8 +580,17 @@ struct IndexCommand: AsyncParsableCommand {
         }
 
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
-        let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
-        try await actionOrchestrator.recordCLIAction(command: fullCommand, toolName: "index", durationMs: duration)
+        // Ask H: persist the run's counts. The 21-minute 186 GB run recorded
+        // only durationMs — there was no way to tell whether it re-embedded
+        // the corpus or skipped it.
+        try await actionOrchestrator.recordCLIAction(
+            command: fullCommand,
+            toolName: "index",
+            durationMs: duration,
+            updated: compacted.updated,
+            skipped: compacted.skipped,
+            symbols: compacted.totalSymbols
+        )
 
         // Snapshot the breaker's inputs BEFORE close: close() releases the
         // file handle, so post-close diagnostics are impossible. The live set
@@ -553,7 +645,10 @@ struct IndexCommand: AsyncParsableCommand {
                 deleted: compacted.deleted,
                 kept: compacted.kept,
                 bytesBefore: bytesBeforeIndexing,
-                bytesAfter: bytesAfterIndexing
+                bytesAfter: bytesAfterIndexing,
+                updated: compacted.updated,
+                skipped: compacted.skipped,
+                totalSymbols: compacted.totalSymbols
             ),
             stamped: stamped
         ))

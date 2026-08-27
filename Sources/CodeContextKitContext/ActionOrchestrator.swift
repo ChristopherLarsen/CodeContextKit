@@ -84,7 +84,10 @@ public actor ActionOrchestrator {
         durationMs: Int,
         tokensUsed: Int = 0,
         sourceWholeFileTokens: Int = 0,
-        status: String = "completed"
+        status: String = "completed",
+        updated: Int? = nil,
+        skipped: Int? = nil,
+        symbols: Int? = nil
     ) throws {
         let id = try history.nextId()
         let record = ActionRecord(
@@ -95,7 +98,10 @@ public actor ActionOrchestrator {
             tokensUsed: tokensUsed,
             sourceWholeFileTokens: sourceWholeFileTokens,
             durationMs: durationMs,
-            status: status
+            status: status,
+            updated: updated,
+            skipped: skipped,
+            symbols: symbols
         )
         try history.append(record)
     }

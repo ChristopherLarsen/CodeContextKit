@@ -123,13 +123,19 @@ public struct ActionRecord: Codable, Hashable, Sendable {
     /// Whole-file token estimate for files already read by this call (outline/symbol), when known.
     public var sourceWholeFileTokens: Int
     public var durationMs: Int
-    public var status: String // "pending", "completed", "failed"
+    public var status: String // "pending", "completed", "failed", "skipped"
     public var timestamp: Date
     public var response: String?
+    /// Index-run outcome counts (index rows only). `durationMs` alone cannot
+    /// distinguish a 3 s no-op pass from a 21-minute near-full re-embed.
+    public var updated: Int?
+    public var skipped: Int?
+    public var symbols: Int?
 
     enum CodingKeys: String, CodingKey {
         case id, prompt, toolName, type, tokensUsed, sourceWholeFileTokens
         case durationMs, status, timestamp, response
+        case updated, skipped, symbols
     }
 
     public init(
@@ -142,7 +148,10 @@ public struct ActionRecord: Codable, Hashable, Sendable {
         durationMs: Int = 0,
         status: String = "pending",
         timestamp: Date = Date(),
-        response: String? = nil
+        response: String? = nil,
+        updated: Int? = nil,
+        skipped: Int? = nil,
+        symbols: Int? = nil
     ) {
         self.id = id
         self.prompt = prompt
@@ -154,6 +163,9 @@ public struct ActionRecord: Codable, Hashable, Sendable {
         self.status = status
         self.timestamp = timestamp
         self.response = response
+        self.updated = updated
+        self.skipped = skipped
+        self.symbols = symbols
     }
 
     public init(from decoder: Decoder) throws {
@@ -168,6 +180,9 @@ public struct ActionRecord: Codable, Hashable, Sendable {
         status = try c.decodeIfPresent(String.self, forKey: .status) ?? "pending"
         timestamp = try c.decodeIfPresent(Date.self, forKey: .timestamp) ?? Date()
         response = try c.decodeIfPresent(String.self, forKey: .response)
+        updated = try c.decodeIfPresent(Int.self, forKey: .updated)
+        skipped = try c.decodeIfPresent(Int.self, forKey: .skipped)
+        symbols = try c.decodeIfPresent(Int.self, forKey: .symbols)
     }
 
     /// Tokens avoided versus whole files already loaded for this call.

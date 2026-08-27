@@ -251,7 +251,31 @@ public struct CodeContextServer: Sendable {
                             try await outbound.write(.text(String(data: responseData, encoding: .utf8)!))
 
                         case "reindex":
-                            Task { try? await indexer.index(at: ".", delegate: ServerProgressDelegate(state: indexingState)) }
+                            // The dashboard's reindex used to run Indexer
+                            // directly — a writer completely outside the CLI's
+                            // refresh lock, able to interleave with a CLI
+                            // rebuild on the same arena. Take the same
+                            // single-writer lock and DROP when held.
+                            Task {
+                                let lockPath = FileManager.default.currentDirectoryPath + "/.cckit/refresh.lock"
+                                guard let lock = RefreshLock.tryAcquire(lockPath: lockPath) else {
+                                    await indexingState.broadcast([
+                                        "type": "indexing_error",
+                                        "error": "Another indexer holds .cckit/refresh.lock; reindex skipped."
+                                    ])
+                                    return
+                                }
+                                defer { lock.release() }
+                                do {
+                                    try await indexer.index(at: ".", delegate: ServerProgressDelegate(state: indexingState))
+                                } catch {
+                                    print("Dashboard reindex failed: \(error)")
+                                    await indexingState.broadcast([
+                                        "type": "indexing_error",
+                                        "error": error.localizedDescription
+                                    ])
+                                }
+                            }
 
                         case "save_settings":
                             if let settingsData = json["settings"] as? [String: Any] {

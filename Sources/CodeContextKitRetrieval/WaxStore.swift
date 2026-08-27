@@ -13,6 +13,11 @@ public actor WaxStore {
     private var memory: Memory?
     /// True only when Memory was opened with MiniLM (vector search enabled).
     private var embeddingsEnabled: Bool = false
+    /// Why the last open attempt degraded or failed (embeddings or store).
+    /// Previously both open failures were swallowed, so every consumer saw a
+    /// generic "MiniLM failed to load" while the real cause — an unopenable
+    /// arena, a permissions error, a missing bundle — stayed invisible.
+    public private(set) var lastOpenError: String?
 
     public init(path: String) async throws {
         self.path = path
@@ -259,11 +264,66 @@ public actor WaxStore {
     /// True when MiniLM embeddings are active (required for semantic search).
     public func hasEmbeddings() -> Bool { embeddingsEnabled }
 
-    /// Throws unless MiniLM-backed Memory is ready for vector search.
+    /// Throws unless MiniLM-backed Memory is ready for vector search. The
+    /// error carries the real cause: the retained open error, the breach
+    /// marker's own numbers when the arena is over its ceiling, and the
+    /// bundle hint only when the bundle is genuinely absent.
     public func requireEmbeddings() throws {
         guard memory != nil, embeddingsEnabled else {
-            throw WaxEmbedderIdentity.ReadinessError.embeddingsUnavailable
+            throw WaxEmbedderIdentity.ReadinessError.embeddingsUnavailable(detail: unavailabilityDetail())
         }
+    }
+
+    /// Human-readable reason embeddings are off, for operators. Combines the
+    /// retained open error with the breach-marker contract when present.
+    private func unavailabilityDetail() -> String {
+        var parts: [String] = []
+        if let lastOpenError {
+            parts.append(lastOpenError)
+        }
+        if let marker = Self.readBreachMarker(near: path) {
+            parts.append(
+                "repo.wax breached its live-set ceiling " +
+                    "(allocated \(marker.allocatedBytes)B vs ~\(marker.expectedLiveBytes)B live" +
+                    (marker.reclaimableBytes > 0 ? ", \(marker.reclaimableBytes)B reclaimable" : "") +
+                    "); run 'cckit index . --clean' to rebuild from scratch."
+            )
+        }
+        if parts.isEmpty {
+            parts.append("store opened without embeddings")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private struct BreachMarkerInfo {
+        let allocatedBytes: Int
+        let expectedLiveBytes: Int
+        let reclaimableBytes: Int
+    }
+
+    /// The CLI's bloat veto writes `wax-breach-marker.json` next to repo.wax
+    /// when an arena stays over its ceiling. Read-path consumers (pack,
+    /// search, serve) must surface it instead of blaming the MiniLM bundle —
+    /// it sat unread for 5.5 hours during the 2026-08-27 186 GB incident
+    /// while the tool diagnosed the one component that was working.
+    private static func readBreachMarker(near waxPath: String) -> BreachMarkerInfo? {
+        let dir = (waxPath as NSString).deletingLastPathComponent
+        let markerPath = (dir as NSString).appendingPathComponent("wax-breach-marker.json")
+        guard let data = FileManager.default.contents(atPath: markerPath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        func intValue(_ key: String) -> Int {
+            (json[key] as? NSNumber)?.intValue ?? 0
+        }
+        let allocated = intValue("allocatedBytes")
+        let expected = intValue("expectedLiveBytes")
+        guard allocated > 0 else { return nil }
+        return BreachMarkerInfo(
+            allocatedBytes: allocated,
+            expectedLiveBytes: expected,
+            reclaimableBytes: intValue("reclaimableBytes")
+        )
     }
 
     private func openMemory() async {
@@ -274,16 +334,29 @@ public actor WaxStore {
             self.memory = try await Memory(at: url, config: config, builtInEmbedding: .miniLM)
             self.embeddingsEnabled = true
         } catch {
+            let miniLMError = Self.describeOpenError(error)
             // Last-resort text-only open so non-semantic flows (token count) can
             // still work; semantic search will refuse via `requireEmbeddings()`.
             do {
                 self.memory = try await Memory(at: url, config: config)
                 self.embeddingsEnabled = false
+                self.lastOpenError = "\(miniLMError); text-only open succeeded"
             } catch {
                 self.memory = nil
                 self.embeddingsEnabled = false
+                self.lastOpenError = "Wax store failed to open: \(Self.describeOpenError(error)); MiniLM attempt: \(miniLMError)"
             }
         }
+    }
+
+    /// LocalizedError message when available, full description otherwise —
+    /// `String(describing:)` on a Swift error often hides the useful part.
+    static func describeOpenError(_ error: Error) -> String {
+        if let localized = (error as? LocalizedError)?.errorDescription, !localized.isEmpty {
+            return localized
+        }
+        let text = String(describing: error)
+        return text.isEmpty ? String(describing: type(of: error)) : text
     }
 
     /// Live-set reclamation knobs, overridable per run:
@@ -347,6 +420,13 @@ public actor WaxStore {
     }
 
     private func waxFileBytes() -> Int {
+        Self.waxFileAllocatedBytes(at: path)
+    }
+
+    /// Bytes currently materialized on disk for this arena (st_blocks).
+    /// Public so index runs can enforce a mid-run growth cap (ask F) instead
+    /// of discovering 186 GB after close.
+    public func allocatedBytes() -> Int {
         Self.waxFileAllocatedBytes(at: path)
     }
 
@@ -432,6 +512,15 @@ public struct WaxCompactResult: Sendable, Equatable {
     /// reclaim bytes (that happens on close), so this mirrors `bytesBefore`
     /// unless the caller updates it with a post-close measurement.
     public let bytesAfter: Int
+    /// Files re-embedded by the index run that produced this result (0 for
+    /// compact-only callers). Without these counts a ledger row cannot tell
+    /// a 3 s no-op from a 21-minute near-full re-embed — the exact gap that
+    /// made the 2026-08-27 186 GB incident undiagnosable from the ledger.
+    public let updated: Int
+    /// Files skipped (content hash unchanged) by the index run.
+    public let skipped: Int
+    /// Total symbols extracted by the index run.
+    public let totalSymbols: Int
 
     /// True when the recorded sizes show an actual file shrink.
     public var shrank: Bool { bytesAfter < bytesBefore }
@@ -441,13 +530,19 @@ public struct WaxCompactResult: Sendable, Equatable {
         deleted: Int,
         kept: Int,
         bytesBefore: Int = 0,
-        bytesAfter: Int = 0
+        bytesAfter: Int = 0,
+        updated: Int = 0,
+        skipped: Int = 0,
+        totalSymbols: Int = 0
     ) {
         self.scanned = scanned
         self.deleted = deleted
         self.kept = kept
         self.bytesBefore = bytesBefore
         self.bytesAfter = bytesAfter
+        self.updated = updated
+        self.skipped = skipped
+        self.totalSymbols = totalSymbols
     }
 }
 
@@ -487,7 +582,7 @@ public enum WaxEmbedderIdentity {
     public enum ReadinessError: Error, LocalizedError, Equatable {
         case missingIndex
         case outdated(stored: String?)
-        case embeddingsUnavailable
+        case embeddingsUnavailable(detail: String)
 
         public var errorDescription: String? {
             switch self {
@@ -496,9 +591,44 @@ public enum WaxEmbedderIdentity {
             case .outdated(let stored):
                 let from = stored ?? "none"
                 return "Semantic vector index is outdated (\(from) → \(current)). Run 'cckit index .' to rebuild."
-            case .embeddingsUnavailable:
-                return "Semantic embeddings unavailable (MiniLM failed to load). Check Wax resource bundles and re-run 'cckit index .'."
+            case .embeddingsUnavailable(let detail):
+                // Only point at resource bundles when the bundle is actually
+                // absent. During the 2026-08-27 186 GB incident this message
+                // blamed MiniLM — which was working — for 5.5 hours while an
+                // unopenable arena was the real cause.
+                var message = "Semantic embeddings unavailable."
+                if !detail.isEmpty {
+                    message += " \(detail)"
+                }
+                if !Self.miniLMResourceBundleIsPresent() {
+                    message += " Check Wax resource bundles (Wax_WaxVectorSearchMiniLM.bundle)."
+                }
+                return message
             }
+        }
+
+        /// True when the MiniLM Core ML model can be located next to the
+        /// executable or Wax's own bundle. SPM CLI builds place resource
+        /// bundles beside the binary; the honest check keeps the hint from
+        /// firing when the bundle is present and something else broke.
+        public static func miniLMResourceBundleIsPresent() -> Bool {
+            let bundleName = "Wax_WaxVectorSearchMiniLM.bundle"
+            let modelPath = "all-MiniLM-L6-v2.mlmodelc"
+            let waxBundleURL = Bundle(for: Memory.self).bundleURL
+            var candidates = [
+                Bundle.main.bundleURL.appendingPathComponent(bundleName),
+                waxBundleURL.appendingPathComponent(bundleName),
+                waxBundleURL.deletingLastPathComponent().appendingPathComponent(bundleName),
+            ]
+            if let resourceURL = Bundle(for: Memory.self).resourceURL {
+                candidates.append(resourceURL.appendingPathComponent(bundleName))
+            }
+            for candidate in candidates {
+                if FileManager.default.fileExists(atPath: candidate.appendingPathComponent(modelPath).path) {
+                    return true
+                }
+            }
+            return false
         }
     }
 
