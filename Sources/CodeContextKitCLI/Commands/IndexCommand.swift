@@ -132,6 +132,9 @@ struct IndexCommand: AsyncParsableCommand {
             "stamped": stamped,
             "rebuiltWax": result.rebuiltWax
         ]
+        if result.deltaApplied {
+            payload["delta"] = true
+        }
         // Present only when the run actually indexed (compact-only passes
         // leave these out); a ledger row with durationMs but no counts cannot
         // distinguish a no-op from a near-full re-embed.
@@ -500,7 +503,8 @@ struct IndexCommand: AsyncParsableCommand {
                 updated: compacted.updated,
                 skipped: compacted.skipped,
                 totalSymbols: compacted.totalSymbols,
-                rebuiltWax: compacted.rebuiltWax
+                rebuiltWax: compacted.rebuiltWax,
+                deltaApplied: compacted.deltaApplied
             ),
             stamped: stamped
         ))

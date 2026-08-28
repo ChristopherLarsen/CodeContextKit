@@ -78,6 +78,20 @@ struct PackCommand: AsyncParsableCommand {
             print("Error: \(error.localizedDescription)")
             throw ExitCode.failure
         }
+
+        // Read-path integrity gate: the store opening is not proof it is
+        // serviceable. A truncated arena (interrupted rebuild) or an armed
+        // breach marker must be visible here — a silent `0 symbols` packet
+        // reads as a confident negative to any agent consuming it.
+        let gate = await WaxReadGate.evaluate(waxPath: waxPath, cckitDir: ".cckit", db: db, wax: wax)
+        if let fault = gate.hardFault {
+            print("Error: \(fault.localizedDescription)")
+            throw ExitCode.failure
+        }
+        if let warning = gate.breachWarning {
+            InteractiveProgress.write("Warning: \(warning)\n", to: .standardError)
+        }
+
         let actionOrchestrator = ActionOrchestrator(wax: wax)
         let packer = ContextPacker(db: db, wax: wax, rootPath: ".")
         if full && surgical {
@@ -124,8 +138,26 @@ struct PackCommand: AsyncParsableCommand {
             InteractiveProgress.write(warning + "\n", to: .standardError)
         }
 
+        // Zero primaries from a run that DID consult Wax against a populated
+        // keep-set is far more likely a retrieval fault than a true absence.
+        // Distinguish it (and the armed breach marker) inside the packet and
+        // the machine-readable stats so callers can tell a real negative from
+        // a broken one.
+        var semanticUnavailable = false
+        if result.primaryCount == 0, result.waxFillRan, result.waxHitCount == 0 {
+            semanticUnavailable = ((try? db.waxMandateCount()) ?? 0) > 0
+        }
+        var packet = result.packet
+        if semanticUnavailable || gate.breachWarning != nil {
+            packet = Self.appendDegradedNotice(
+                to: packet,
+                semanticUnavailable: semanticUnavailable,
+                breachWarning: gate.breachWarning
+            )
+        }
+
         if let outputPath = output {
-            try result.packet.write(toFile: outputPath, atomically: true, encoding: .utf8)
+            try packet.write(toFile: outputPath, atomically: true, encoding: .utf8)
             print("Context packet written to \(outputPath)")
             print(
                 "Pack metrics: delivered \(result.deliveredTokens) (\(result.deliveredMode.rawValue)) · "
@@ -133,7 +165,7 @@ struct PackCommand: AsyncParsableCommand {
                 + "saved \(PackSavingsLedger.formatTokenCount(result.tokensSavedVersusSourceFiles))"
             )
         } else {
-            print(result.packet)
+            print(packet)
             // Machine-readable trailing line for the MCP shim (CCKIT_CALLER=mcp):
             // powers the per-response savings footer without parsing prose.
             if ProcessInfo.processInfo.environment["CCKIT_CALLER"] == "mcp", mode != .preview {
@@ -143,11 +175,40 @@ struct PackCommand: AsyncParsableCommand {
                     "tokensSaved": result.tokensSavedVersusSourceFiles,
                     "deliveredMode": result.deliveredMode.rawValue,
                 ]
-                if let data = try? JSONSerialization.data(withJSONObject: stats, options: [.sortedKeys]) {
+                var enriched = stats
+                if semanticUnavailable {
+                    enriched["semanticUnavailable"] = true
+                }
+                if let warning = gate.breachWarning {
+                    enriched["breachWarning"] = warning
+                }
+                if let data = try? JSONSerialization.data(withJSONObject: enriched, options: [.sortedKeys]) {
                     print("PACK_STATS \(String(decoding: data, as: UTF8.self))")
                 }
             }
         }
         try await wax.close()
+    }
+
+    /// Append a degraded-retrieval notice to a packet body. Kept as a trailing
+    /// section so packet consumers see it without disturbing the banner.
+    static func appendDegradedNotice(
+        to packet: String,
+        semanticUnavailable: Bool,
+        breachWarning: String?
+    ) -> String {
+        var lines: [String] = []
+        if semanticUnavailable {
+            lines.append(
+                "Semantic retrieval returned zero hits against a populated index; " +
+                    "this packet's `primary: 0 symbols` may be a retrieval fault, not a true absence. " +
+                    "Verify with lexical search before concluding something does not exist."
+            )
+        }
+        if let breachWarning {
+            lines.append(breachWarning)
+        }
+        guard !lines.isEmpty else { return packet }
+        return packet.trimmingCharacters(in: .newlines) + "\n\n## Warning\n\n" + lines.joined(separator: "\n") + "\n"
     }
 }

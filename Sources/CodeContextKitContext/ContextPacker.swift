@@ -37,6 +37,14 @@ public struct PackResult: Sendable {
     /// Sum of whole-file token counts for every source file drawn into the packet.
     /// This is the honest "what you'd pay if you Read each file" baseline.
     public let sourceWholeFileTokens: Int
+    /// Primary symbols the packet actually delivered (slices + full files).
+    public let primaryCount: Int
+    /// True when the Wax semantic fill actually ran for this packet. When
+    /// false (identifier-only tasks skip the filler), a zero-symbol packet is
+    /// a real lexical miss — never evidence of a semantic fault.
+    public let waxFillRan: Bool
+    /// Raw Wax search hits behind the fill (0 when the fill did not run).
+    public let waxHitCount: Int
 
     public init(
         packet: String,
@@ -45,7 +53,10 @@ public struct PackResult: Sendable {
         deliveredTokens: Int,
         surgicalTokens: Int? = nil,
         fullBaselineTokens: Int? = nil,
-        sourceWholeFileTokens: Int = 0
+        sourceWholeFileTokens: Int = 0,
+        primaryCount: Int = 0,
+        waxFillRan: Bool = false,
+        waxHitCount: Int = 0
     ) {
         self.packet = packet
         self.requestedMode = requestedMode
@@ -54,6 +65,9 @@ public struct PackResult: Sendable {
         self.surgicalTokens = surgicalTokens
         self.fullBaselineTokens = fullBaselineTokens
         self.sourceWholeFileTokens = sourceWholeFileTokens
+        self.primaryCount = primaryCount
+        self.waxFillRan = waxFillRan
+        self.waxHitCount = waxHitCount
     }
 
     /// Tokens avoided versus reading whole source files drawn into the packet.
@@ -153,7 +167,10 @@ public final class ContextPacker {
                     deliveredTokens: delivered.tokens,
                     surgicalTokens: surgicalTokens,
                     fullBaselineTokens: nil,
-                    sourceWholeFileTokens: sourceWhole
+                    sourceWholeFileTokens: sourceWhole,
+                    primaryCount: delivered.primaryCount,
+                    waxFillRan: delivered.waxFillRan,
+                    waxHitCount: delivered.waxHitCount
                 )
             }
             let surgical = try await packOnce(
@@ -194,7 +211,10 @@ public final class ContextPacker {
                     deliveredTokens: delivered.tokens,
                     surgicalTokens: surgicalTokens,
                     fullBaselineTokens: nil,
-                    sourceWholeFileTokens: sourceWhole
+                    sourceWholeFileTokens: sourceWhole,
+                    primaryCount: delivered.primaryCount,
+                    waxFillRan: delivered.waxFillRan,
+                    waxHitCount: delivered.waxHitCount
                 )
             }
             let full = try await packOnce(
@@ -229,7 +249,10 @@ public final class ContextPacker {
                 deliveredTokens: delivered.tokens,
                 surgicalTokens: surgicalTokens,
                 fullBaselineTokens: fullTokens,
-                sourceWholeFileTokens: sourceWhole
+                sourceWholeFileTokens: sourceWhole,
+                primaryCount: delivered.primaryCount,
+                waxFillRan: delivered.waxFillRan,
+                waxHitCount: delivered.waxHitCount
             )
         }
 
@@ -252,7 +275,10 @@ public final class ContextPacker {
                 requestedMode: .preview,
                 deliveredMode: .preview,
                 deliveredTokens: tokens,
-                sourceWholeFileTokens: sourceWhole
+                sourceWholeFileTokens: sourceWhole,
+                primaryCount: assembled.primaryCount,
+                waxFillRan: assembled.waxFillRan,
+                waxHitCount: assembled.waxHitCount
             )
         }
 
@@ -277,7 +303,10 @@ public final class ContextPacker {
             deliveredTokens: tokens,
             surgicalTokens: mode == .surgical ? tokens : nil,
             fullBaselineTokens: (mode == .full || mode == .raw) ? tokens : nil,
-            sourceWholeFileTokens: sourceWhole
+            sourceWholeFileTokens: sourceWhole,
+            primaryCount: assembled.primaryCount,
+            waxFillRan: assembled.waxFillRan,
+            waxHitCount: assembled.waxHitCount
         )
     }
 
@@ -286,12 +315,18 @@ public final class ContextPacker {
         /// Primary files actually emitted (slices or full dumps). Savings baseline
         /// uses this set — associated skeletons are not whole-file Reads.
         var primaryFilePaths: Set<String>
+        var primaryCount: Int
+        var waxFillRan: Bool
+        var waxHitCount: Int
     }
 
     private struct BaselineDelivery: Sendable {
         var packet: String
         var mode: PackMode
         var tokens: Int
+        var primaryCount: Int
+        var waxFillRan: Bool
+        var waxHitCount: Int
     }
 
     /// Auto must never deliver a packet larger than reading its primary files
@@ -309,10 +344,17 @@ public final class ContextPacker {
         sourceWhole: Int
     ) async -> BaselineDelivery {
         guard let best = candidates.min(by: { $0.2 < $1.2 }) else {
-            return BaselineDelivery(packet: "", mode: .raw, tokens: 0)
+            return BaselineDelivery(packet: "", mode: .raw, tokens: 0, primaryCount: 0, waxFillRan: false, waxHitCount: 0)
         }
         if best.2 <= sourceWhole || fallbackPaths.isEmpty {
-            return BaselineDelivery(packet: best.0.packet, mode: best.1, tokens: best.2)
+            return BaselineDelivery(
+                packet: best.0.packet,
+                mode: best.1,
+                tokens: best.2,
+                primaryCount: best.0.primaryCount,
+                waxFillRan: best.0.waxFillRan,
+                waxHitCount: best.0.waxHitCount
+            )
         }
 
         // First fallback: chrome-free raw over the same primaries.
@@ -328,7 +370,14 @@ public final class ContextPacker {
             if let raw {
                 let rawTokens = await wax.countTokens(raw.packet)
                 if rawTokens <= sourceWhole {
-                    return BaselineDelivery(packet: raw.packet, mode: .raw, tokens: rawTokens)
+                    return BaselineDelivery(
+                        packet: raw.packet,
+                        mode: .raw,
+                        tokens: rawTokens,
+                        primaryCount: raw.primaryCount,
+                        waxFillRan: raw.waxFillRan,
+                        waxHitCount: raw.waxHitCount
+                    )
                 }
             }
         }
@@ -337,9 +386,23 @@ public final class ContextPacker {
         let minimal = await rawMinimalPacket(paths: fallbackPaths, budget: budget)
         let minimalTokens = await wax.countTokens(minimal)
         if minimalTokens < best.2 {
-            return BaselineDelivery(packet: minimal, mode: .raw, tokens: minimalTokens)
+            return BaselineDelivery(
+                packet: minimal,
+                mode: .raw,
+                tokens: minimalTokens,
+                primaryCount: best.0.primaryCount,
+                waxFillRan: best.0.waxFillRan,
+                waxHitCount: best.0.waxHitCount
+            )
         }
-        return BaselineDelivery(packet: best.0.packet, mode: best.1, tokens: best.2)
+        return BaselineDelivery(
+            packet: best.0.packet,
+            mode: best.1,
+            tokens: best.2,
+            primaryCount: best.0.primaryCount,
+            waxFillRan: best.0.waxFillRan,
+            waxHitCount: best.0.waxHitCount
+        )
     }
 
     /// Last-resort delivery when even raw lost to the baseline: file contents
@@ -384,6 +447,8 @@ public final class ContextPacker {
         var primaries: [SymbolRecord] = []
         var seenQualifiedNames = Set<String>()
         var associatedFiles: [String: String] = [:] // Path -> Reason
+        var waxFillRan = false
+        var waxHitCount = 0
 
         func considerPrimary(_ sym: SymbolRecord) {
             guard primaries.count < maxPrimarySymbols else { return }
@@ -434,8 +499,10 @@ public final class ContextPacker {
 
         let remainingSlots = maxPrimarySymbols - primaries.count
         if remainingSlots > 0 && !skipFiller {
+            waxFillRan = true
             // Modest overfetch for unresolved Wax hits; never request more than 2× remaining slots.
             let searchResults = try await wax.search(task, limit: remainingSlots * 2)
+            waxHitCount = searchResults.count
             for res in searchResults {
                 guard primaries.count < maxPrimarySymbols else { break }
                 guard let sym = try db.getSymbols(qualifiedName: res.symbol).first else { continue }
@@ -664,7 +731,13 @@ public final class ContextPacker {
         var packet = makeBanner(tokens: currentTokens) + body
         let finalTokens = await wax.countTokens(packet)
         packet = makeBanner(tokens: finalTokens) + body
-        return PackAssembly(packet: packet, primaryFilePaths: primaryFilePaths)
+        return PackAssembly(
+            packet: packet,
+            primaryFilePaths: primaryFilePaths,
+            primaryCount: primarySymbolCount + primaryFullFileCount,
+            waxFillRan: waxFillRan,
+            waxHitCount: waxHitCount
+        )
     }
 
     // MARK: - Formatting

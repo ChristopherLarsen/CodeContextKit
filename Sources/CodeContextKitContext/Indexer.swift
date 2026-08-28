@@ -61,6 +61,7 @@ public final class Indexer: Sendable {
         includeGenerated: Bool = false,
         maxArenaBytes: Int? = nil,
         forceWaxRebuild: Bool = false,
+        cckitDir: String = ".cckit",
         delegate: IndexerProgressDelegate? = nil
     ) async throws -> WaxCompactResult {
         let absolutePath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
@@ -85,35 +86,51 @@ public final class Indexer: Sendable {
         })
         delegate?.indexerDidStart(totalFiles: files.count)
 
-        // Current Wax commits every single-frame delete and does not expose a
-        // batch-delete or frame-enumeration API. Detect semantic changes before
-        // mutation and replace the derived Wax arena once when anything changed.
-        // No-op runs retain the arena and the fast SQLite hash skip.
+        // Wax returns no frame IDs and exposes no batch-delete; cckit cannot
+        // retract arena documents. So a run either REPLACES the arena (only
+        // when the delta is large or the store is suspect) or APPENDS
+        // incrementally: changed files re-save their rows and append fresh
+        // documents, stale twins leak until the next rebuild, bounded by
+        // WaxDeltaPolicy's growth margin. No-op runs retain the arena and the
+        // fast SQLite hash skip either way.
         let existingFiles = try db.getAllFiles()
         let existingByPath = Dictionary(uniqueKeysWithValues: existingFiles.map { ($0.path, $0) })
         let previousWaxRecordCount = try db.waxFrameCount()
         var contentByPath: [String: String] = [:]
         contentByPath.reserveCapacity(files.count)
-        var semanticInputsChanged = forceWaxRebuild
+        var changedPaths = Set<String>()
+        var uncoveredPaths = Set<String>()
         for fileURL in files {
             let relativePath = relativePath(for: fileURL, rootPath: absolutePath)
             guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
             contentByPath[relativePath] = content
-            if existingByPath[relativePath]?.sha256 != hasher.hash(content: content) {
-                semanticInputsChanged = true
-            } else if existingByPath[relativePath] != nil,
-                      try !db.hasWaxCoverage(path: relativePath) {
+            guard let existing = existingByPath[relativePath] else { continue }
+            if existing.sha256 != hasher.hash(content: content) {
+                changedPaths.insert(relativePath)
+            } else if try !db.hasWaxCoverage(path: relativePath) {
                 // A prior rebuild did not finish this file, or this is the
                 // first run after coverage markers were introduced. Retry the
-                // derived arena instead of treating its SQLite hash as enough.
-                semanticInputsChanged = true
+                // file instead of treating its SQLite hash as enough.
+                uncoveredPaths.insert(relativePath)
             }
         }
-        if Set(existingByPath.keys) != scannedRelativePaths {
-            semanticInputsChanged = true
-        }
+        let newPathCount = scannedRelativePaths.subtracting(existingByPath.keys).count
+        let removedPathCount = Set(existingByPath.keys).subtracting(scannedRelativePaths).count
+        let deltaFileCount = changedPaths.count + uncoveredPaths.count + newPathCount + removedPathCount
 
-        if semanticInputsChanged {
+        let deltaEligible = WaxDeltaPolicy.isEligible(
+            forceRebuild: forceWaxRebuild,
+            deltaFileCount: deltaFileCount,
+            stampAllocatedBytes: WaxCompactStamp.readWatermark(cckitDir: cckitDir)?.waxBytes ?? 0,
+            arenaAllocatedBytes: await wax.allocatedBytes(),
+            arenaFrameCount: await wax.frameCount(),
+            keepSetMandateCount: (try? db.waxMandateCount()) ?? 0,
+            maxFiles: WaxDeltaPolicy.maxFilesFromEnvironment(),
+            maxGrowth: WaxDeltaPolicy.maxGrowthFromEnvironment(),
+            allowanceBytes: WaxDeltaPolicy.allowanceBytesFromEnvironment()
+        )
+        let arenaReplaced = !deltaEligible
+        if arenaReplaced {
             try db.clearWaxFrameRecords()
             try await wax.resetStore()
         }
@@ -140,17 +157,39 @@ public final class Indexer: Sendable {
             }
             
             do {
-                let content = try contentByPath[relativePath]
-                    ?? String(contentsOf: fileURL, encoding: .utf8)
+                let content: String
+                do {
+                    content = try contentByPath[relativePath]
+                        ?? String(contentsOf: fileURL, encoding: .utf8)
+                } catch {
+                    // An unreadable file can never be processed. Mark it
+                    // "considered" when it already has a relational row, or a
+                    // completed run would leave coverage residue forever —
+                    // wedging the read-path rebuild-incomplete gate and every
+                    // subsequent preflight rebuild.
+                    print("Failed to read \(relativePath): \(error) — marking considered")
+                    if let existing = try? db.getFile(path: relativePath), let fileId = existing.id {
+                        try? db.markWaxCoverage(fileId: fileId)
+                    }
+                    continue
+                }
                 let currentHash = hasher.hash(content: content)
                 
                 if let existingFile = try db.getFile(path: relativePath) {
-                    if !semanticInputsChanged && existingFile.sha256 == currentHash {
-                        skippedCount += 1
-                        continue
+                    if existingFile.sha256 == currentHash {
+                        if arenaReplaced {
+                            // Arena was reset: every file re-saves, no skips.
+                        } else if !uncoveredPaths.contains(relativePath) {
+                            skippedCount += 1
+                            continue
+                        }
+                        // Delta mode, unchanged but uncovered: fall through
+                        // to delete+resave so the arena regains a complete
+                        // document set and the coverage marker is restored.
                     }
-                    // The old Wax arena has already been replaced for this run.
-                    // Remove only the relational row and its cascaded children.
+                    // Append-only: the old arena documents stay (or were
+                    // already reset in full-rebuild mode). Remove only the
+                    // relational row and its cascaded children.
                     try db.deleteFile(path: relativePath)
                 }
                 
@@ -228,8 +267,9 @@ public final class Indexer: Sendable {
         for indexedFile in allIndexedFiles {
             let fullURL = URL(fileURLWithPath: absolutePath).appendingPathComponent(indexedFile.path)
             if !FileManager.default.fileExists(atPath: fullURL.path) || !scannedRelativePaths.contains(indexedFile.path) {
-                // File deletion participated in the preflight comparison, so
-                // Wax was rebuilt before this stale SQLite row is removed.
+                // The preflight comparison counted this removal; in delta mode
+                // its arena documents leak (bounded by the growth margin), in
+                // rebuild mode the arena was already replaced.
                 try db.deleteFile(path: indexedFile.path)
                 print("Removed stale file from index: \(indexedFile.path)")
             }
@@ -244,12 +284,13 @@ public final class Indexer: Sendable {
         // a no-op pass from a near-full re-embed.
         return WaxCompactResult(
             scanned: previousWaxRecordCount,
-            deleted: semanticInputsChanged ? previousWaxRecordCount : 0,
+            deleted: arenaReplaced ? previousWaxRecordCount : 0,
             kept: currentWaxRecordCount,
             updated: updatedCount,
             skipped: skippedCount,
             totalSymbols: totalSymbols,
-            rebuiltWax: semanticInputsChanged
+            rebuiltWax: arenaReplaced,
+            deltaApplied: deltaEligible
         )
     }
 

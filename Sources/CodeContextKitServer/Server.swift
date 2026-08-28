@@ -83,6 +83,29 @@ public struct CodeContextServer: Sendable {
         let indexer = Indexer(db: db, wax: wax)
         let actionOrchestrator = ActionOrchestrator(wax: wax)
 
+        // Serve-path integrity: same contract as pack/search — an openable
+        // arena is not proof it is serviceable. Attached to search responses
+        // so a degraded arena is visible instead of silently returning hits
+        // (or zero hits) from a broken store.
+        @Sendable func arenaHealthFields() async -> [String: String] {
+            var fields: [String: String] = [:]
+            if let marker = WaxStore.readBreachMarker(near: ".cckit/repo.wax") {
+                fields["breachWarning"] = WaxStore.breachWarningText(for: marker)
+            }
+            let uncovered = (try? db.uncoveredWaxFilePaths()) ?? []
+            let existing = uncovered.filter { FileManager.default.fileExists(atPath: $0) }
+            if let fault = WaxReadGate.hardFault(
+                allocatedBytes: await wax.allocatedBytes(),
+                expectedAllocatedBytes: WaxCompactStamp.readWatermark(cckitDir: ".cckit")?.waxBytes ?? 0,
+                uncoveredExistingPaths: existing,
+                arenaFrameCount: await wax.frameCount(),
+                keepSetMandateCount: (try? db.waxMandateCount()) ?? 0
+            ) {
+                fields["arenaFault"] = fault.localizedDescription
+            }
+            return fields
+        }
+
         let currentDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let projectName = currentDirectory.lastPathComponent
         let readmePath = currentDirectory.appendingPathComponent("README.md").path
@@ -322,9 +345,12 @@ public struct CodeContextServer: Sendable {
                                         reasons.append("Included symbol '\(sym.name)' (score: \(String(format: "%.2f", res.score))).")
                                     }
                                 }
-                                
+
                                 let reasoning = reasons.isEmpty ? "No semantic matches found for the task." : "Mapped task to the following symbols:\n" + reasons.joined(separator: "\n")
-                                let response = ["type": "pack_task_results", "data": items, "reasoning": reasoning]
+                                var response: [String: Any] = ["type": "pack_task_results", "data": items, "reasoning": reasoning]
+                                for (key, value) in await arenaHealthFields() {
+                                    response[key] = value
+                                }
                                 let responseData = try JSONSerialization.data(withJSONObject: response)
                                 try await outbound.write(.text(String(data: responseData, encoding: .utf8)!))
                             }
@@ -534,6 +560,9 @@ public struct CodeContextServer: Sendable {
                         case "search":
                             if let query = json["query"] as? String {
                                 var results: [String: Any] = [:]
+                                for (key, value) in await arenaHealthFields() {
+                                    results[key] = value
+                                }
                                 switch SearchRoute.resolveVisualizer(query) {
                                 case .lexical(let stripped, _, let allowVectorFallback):
                                     let files = try db.getFilesLike(pattern: stripped, strict: allowVectorFallback)

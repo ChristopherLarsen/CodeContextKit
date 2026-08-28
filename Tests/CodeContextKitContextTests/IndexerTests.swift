@@ -10,48 +10,66 @@ final class IndexerTests: XCTestCase {
     var wax: WaxStore!
     var indexer: Indexer!
     var tempDir: URL!
-    
+    var cckitDirPath: String!
+    var waxPath: String!
+
     override func setUp() async throws {
         try await super.setUp()
         let uuid = UUID().uuidString
-        let tempDbPath = NSTemporaryDirectory() + uuid + ".sqlite"
-        db = try CodeContextKitStorage.Database(path: tempDbPath)
-        wax = try await WaxStore(path: NSTemporaryDirectory() + uuid + ".wax")
-        indexer = Indexer(db: db, wax: wax)
-        
         tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(uuid)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        cckitDirPath = tempDir.appendingPathComponent(".cckit").path
+        waxPath = tempDir.appendingPathComponent(".cckit/repo.wax").path
+        // Isolated cckit dir: the host repo's compact stamp must never leak
+        // into the delta policy's arena-band decision.
+        try FileManager.default.createDirectory(atPath: cckitDirPath, withIntermediateDirectories: true)
+        db = try CodeContextKitStorage.Database(path: tempDir.appendingPathComponent(".cckit/index.sqlite").path)
+        wax = try await WaxStore(path: waxPath)
+        indexer = Indexer(db: db, wax: wax)
     }
-    
-    override func tearDown() {
+
+    override func tearDown() async throws {
+        try? await wax.close()
+        wax = nil
         try? FileManager.default.removeItem(at: tempDir)
-        super.tearDown()
+        try await super.tearDown()
     }
-    
+
+    /// Index, close, and baseline-stamp — the exact state a CLI index run
+    /// leaves behind, and the precondition for a delta-eligible next run.
+    func stampAfterIndex() async throws {
+        try await wax.close()
+        try WaxCompactStamp.writeBaseline(cckitDir: cckitDirPath)
+        wax = try await WaxStore(path: waxPath)
+        indexer = Indexer(db: db, wax: wax)
+    }
+
     func testIncrementalIndexing() async throws {
         let fileURL = tempDir.appendingPathComponent("Test.swift")
         try "struct A {}".write(to: fileURL, atomically: true, encoding: .utf8)
-        
+
         // First run
-        let first = try await indexer.index(at: tempDir.path)
+        let first = try await indexer.index(at: tempDir.path, cckitDir: cckitDirPath)
         XCTAssertTrue(first.rebuiltWax)
         let files1 = try db.getAllFiles()
         XCTAssertEqual(files1.count, 1)
-        
+        try await stampAfterIndex()
+
         // Second run (no changes)
-        let second = try await indexer.index(at: tempDir.path)
+        let second = try await indexer.index(at: tempDir.path, cckitDir: cckitDirPath)
         XCTAssertFalse(second.rebuiltWax)
         XCTAssertEqual(second.updated, 0)
         XCTAssertEqual(second.skipped, 1)
         let files2 = try db.getAllFiles()
         XCTAssertEqual(files2.count, 1)
         XCTAssertEqual(files2[0].sha256, files1[0].sha256)
-        
-        // Change file
+
+        // Change file: Wax has no delete API, so a one-file change takes the
+        // append path (delta) — rows replace, documents append, arena stays.
         try "struct B {}".write(to: fileURL, atomically: true, encoding: .utf8)
-        let changed = try await indexer.index(at: tempDir.path)
-        XCTAssertTrue(changed.rebuiltWax)
-        
+        let changed = try await indexer.index(at: tempDir.path, cckitDir: cckitDirPath)
+        XCTAssertTrue(changed.deltaApplied)
+        XCTAssertFalse(changed.rebuiltWax)
+
         let symbols = try db.getSymbols(path: "Test.swift")
         XCTAssertTrue(symbols.contains { $0.name == "B" })
     }
@@ -61,21 +79,21 @@ final class IndexerTests: XCTestCase {
         let jsonURL = tempDir.appendingPathComponent("config.json")
         try "{ \"key\": \"value\" }".write(to: jsonURL, atomically: true, encoding: .utf8)
         
-        let first = try await indexer.index(at: tempDir.path)
+        let first = try await indexer.index(at: tempDir.path, cckitDir: cckitDirPath)
         XCTAssertTrue(first.rebuiltWax)
-        
+
         let files = try db.getAllFiles()
         XCTAssertTrue(files.contains { $0.path == "config.json" })
         XCTAssertEqual(files.first { $0.path == "config.json" }?.language, "json")
-        
-        // Non-Swift files should be indexed as a single 'file' symbol for search
+
         let symbols = try db.getSymbols(path: "config.json")
         XCTAssertEqual(symbols.count, 1)
         XCTAssertEqual(symbols[0].kind, .file)
 
         // File fallbacks are intentionally excluded from Wax. Their coverage
         // marker must still make the next unchanged run a true no-op.
-        let second = try await indexer.index(at: tempDir.path)
+        try await stampAfterIndex()
+        let second = try await indexer.index(at: tempDir.path, cckitDir: cckitDirPath)
         XCTAssertFalse(second.rebuiltWax)
         XCTAssertEqual(second.updated, 0)
         XCTAssertEqual(second.skipped, 1)

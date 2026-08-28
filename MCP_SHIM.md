@@ -120,7 +120,7 @@ Ideal MCP v1 (keep small):
 |---|---|---|
 | `find_symbol` | `cckit find-symbol` | Name lookup after gather, or when you only need a qualified name, not a packet. Zero-hit queries retry normalized variants (snake_case ↔ CamelCase). A single exact hit ≤40 lines returns its body inline as `inlinedBody`. |
 | `find_references` | `cckit find-references` | Indexed call sites. Batch via `names=[...]` (single-name JSON shape unchanged). Resolution ladder: exact → variants → names-containing (labeled Approximate) → did-you-mean candidates. Rejects non-symbol strings. Returns `truncated` + `totalCount`. |
-| `gather_code_context` | `cckit pack` | Budgeted source packet for a symptom, change, multi-file task, or failure log. Names in `task` help matching. Identifier miss → short miss, not a filler packet. Prose-only tasks (no identifiers ⇒ all matches are Wax guesses) are tagged `semanticGuessOnly` with an attached candidate block. |
+| `gather_code_context` | `cckit pack` | Budgeted source packet for a symptom, change, multi-file task, or failure log. Names in `task` help matching. Identifier miss → short miss, not a filler packet. Prose-only tasks (no identifiers ⇒ all matches are Wax guesses) are tagged `semanticGuessOnly` with an attached candidate block. Zero primaries from a degraded semantic path are tagged `semanticUnavailable` (never mistake a fault for a true absence). |
 | `symbol` | `cckit symbol --json` | Exact qualified **body**. Batch names after `find_symbol`, or for a name a gather packet did not include. Bodies unchanged since earlier this session return as one-line stubs (`refresh=true` forces full). |
 | `outline` | `cckit outline` | Structural skeleton before full-file reads (metadata only). Identical re-deliveries stub like `symbol` (`refresh=true` bypasses). |
 | `map` | `cckit map` | Names-only repo map; prefer gather when you need source. Skip if the gather packet already included a repository map. |
@@ -128,6 +128,16 @@ Ideal MCP v1 (keep small):
 | `index` | `cckit index .` | Last. Usually unnecessary — MCP auto-refreshes on HEAD drift / dirty files, auto-compacts leaked Wax vectors, and retries once on locator miss (`CCKIT_REFRESH=auto`). |
 
 Responses omit freshness when the index is current; `stale: true` appears only when it is not. MCP flattens CLI JSON fields to the top level (not nested under `data`). Set `CCKIT_REFRESH=never` to disable auto-reindex. `CCKIT_CALLER=mcp` is set on subprocesses so `pack-stats` can separate agent traffic from shell runs.
+
+### Degraded-arena contract
+
+An arena that opens is not proof it is serviceable. Reads surface evidence instead of serving silent confident negatives:
+
+- `waxBreachMarker` — attached to every shim response when `wax-breach-marker.json` is armed (the CLI's bloat veto refused this arena). Carries `allocatedBytes` / `expectedLiveBytes` / `reclaimableBytes` and the `--clean` remediation.
+- `breachWarning` / `semanticUnavailable` (`gather_code_context`) — the CLI tags a zero-primary packet that DID consult Wax against a populated index as a likely retrieval fault; both ride the `PACK_STATS` line into the payload and a visible `Warning:` note in the packet text.
+- Hard faults (exit non-zero) — `pack` and vector `search` refuse a **truncated arena** (materialized bytes far below the last known-complete stamp), a **silent-empty arena** (0 frames against a populated keep-set), or an **interrupted rebuild** (indexed files with no Wax coverage row). Lexical `search` answers from SQLite but carries `arenaFault` / `breachWarning` in its JSON. Remediation for all three is `cckit index .`.
+
+Small semantic deltas (few changed files, arena inside its allocation band) now index incrementally: changed files append fresh documents, the arena is retained, and stale twins leak only until the next rebuild (`WaxDeltaPolicy`, `CCKIT_WAX_DELTA_MAX_FILES` / `CCKIT_WAX_DELTA_MAX_GROWTH`). This makes the partial-arena window rare — but every window is still gated as above.
 
 ### Miss behavior
 

@@ -46,17 +46,44 @@ struct SearchCommand: AsyncParsableCommand {
         let db = try Database(path: dbPath)
         let wax = try await WaxStore(path: waxPath)
 
+        // Read-path integrity gate. Vector reads must never answer from a
+        // truncated or unfinished arena — their `0 results` reads as a
+        // confident negative. Lexical reads answer from SQLite (still real),
+        // so they carry the fault as a warning instead of failing.
+        let gate = await WaxReadGate.evaluate(waxPath: waxPath, cckitDir: ".cckit", db: db, wax: wax)
+        let isVectorRoute: Bool
         if case .vector = route {
+            isVectorRoute = true
+        } else {
+            isVectorRoute = false
+        }
+        if isVectorRoute, let fault = gate.hardFault {
+            print("Error: \(fault.localizedDescription)")
+            throw ExitCode.failure
+        }
+        if let warning = gate.breachWarning {
+            InteractiveProgress.write("Warning: \(warning)\n", to: .standardError)
+        }
+        if !isVectorRoute, let fault = gate.hardFault {
+            InteractiveProgress.write("Warning: \(fault.localizedDescription)\n", to: .standardError)
+        }
+        if isVectorRoute {
             try await requireVectorReady(wax: wax)
         }
 
         let actionOrchestrator = ActionOrchestrator(wax: wax)
-        
+
         if json {
-            let results = try await performUnifiedSearch(db: db, wax: wax, route: route)
+            var results = try await performUnifiedSearch(db: db, wax: wax, route: route)
+            if let fault = gate.hardFault {
+                results["arenaFault"] = fault.localizedDescription
+            }
+            if let warning = gate.breachWarning {
+                results["breachWarning"] = warning
+            }
             let data = try JSONSerialization.data(withJSONObject: results, options: .prettyPrinted)
-            if let string = String(data: data, encoding: .utf8) { 
-                print(string) 
+            if let string = String(data: data, encoding: .utf8) {
+                print(string)
             }
         } else {
             try await runInteractiveSearch(db: db, wax: wax, route: route)

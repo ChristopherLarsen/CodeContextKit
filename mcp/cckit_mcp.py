@@ -1572,6 +1572,37 @@ def parse_compact_result(stdout: str) -> dict[str, Any] | None:
 _BREACH_MARKER = "wax-breach-marker.json"
 
 
+def wax_breach_payload(repo: Path) -> dict[str, Any] | None:
+    """The CLI's armed breach marker, for read-path responses.
+
+    A breached arena can still OPEN and answer — the CLI gates it, but every
+    read (find_symbol, outline, gather, ...) should carry the marker's numbers
+    and the --clean contract so degraded results are never mistaken for a
+    confident negative. Cheap: one stat + one file read per cckit call.
+    """
+    marker = repo / ".cckit" / _BREACH_MARKER
+    try:
+        if not marker.is_file():
+            return None
+        data = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        allocated = int(data.get("allocatedBytes") or 0)
+        if allocated <= 0:
+            return None
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return {
+        "allocatedBytes": allocated,
+        "expectedLiveBytes": int(data.get("expectedLiveBytes") or 0),
+        "reclaimableBytes": int(data.get("reclaimableBytes") or 0),
+        "hint": (
+            "repo.wax breached its live-set ceiling; run "
+            "'cckit index . --clean' to rebuild from scratch."
+        ),
+    }
+
+
 def wax_needs_compact(repo: Path) -> bool:
     """True when repo.wax exists and has never been compacted, or has grown since.
 
@@ -1915,6 +1946,9 @@ def run_cckit(
 
     def finish(payload: dict[str, Any]) -> dict[str, Any]:
         out = with_freshness(payload, cwd)
+        breach = wax_breach_payload(cwd)
+        if breach is not None:
+            out["waxBreachMarker"] = breach
         refreshed = bool(refresh_meta and refresh_meta.get("refreshed"))
         # Refresh triggers are fire-and-forget now: whenever one fired we know
         # the index WAS stale, so stale markers stay visible until the detached
@@ -2099,6 +2133,31 @@ def gather_code_context(
     except ValueError:
         pass
     out = attach_semantic_guess_hint(out, repo, task)
+
+    # Degraded-retrieval contract: the CLI tags a zero-primary packet that DID
+    # consult Wax against a populated index as a likely retrieval fault, and
+    # rides the armed breach marker on the stats line. Lift both into the
+    # payload AND the text — a text-only agent must see them too.
+    if stats is not None:
+        if stats.get("semanticUnavailable"):
+            out["semanticUnavailable"] = True
+        breach_warning = stats.get("breachWarning")
+        if breach_warning:
+            out["breachWarning"] = breach_warning
+    if out.get("semanticUnavailable") or out.get("breachWarning"):
+        notes = []
+        if out.get("semanticUnavailable"):
+            notes.append(
+                "Warning: semantic retrieval returned zero hits against a "
+                "populated index; this packet's zero primaries may be a "
+                "retrieval fault, not a true absence. Verify with "
+                "search_text or find_symbol before concluding something "
+                "does not exist."
+            )
+        if out.get("breachWarning"):
+            notes.append("Warning: " + str(out["breachWarning"]))
+        out["text"] = out.get("text", "").rstrip() + "\n\n" + "\n".join(notes) + "\n"
+
     if stats is not None:
         attach_savings(
             out,

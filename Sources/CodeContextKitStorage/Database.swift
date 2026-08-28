@@ -233,6 +233,32 @@ public final class Database: @unchecked Sendable {
         }
     }
 
+    /// Count of documents actually ingested into the current Wax arena
+    /// (mandate rows only; coverage markers carry the empty mandate).
+    /// A populated keep-set means semantic content SHOULD be retrievable —
+    /// zero semantic hits against it is a retrieval fault, not a true absence.
+    public func waxMandateCount() throws -> Int {
+        try writer.read { db in
+            try WaxFrameRecord.filter(Column("mandate") != "").fetchCount(db)
+        }
+    }
+
+    /// Paths in `fileRecord` with no Wax coverage row for the current arena.
+    /// After a completed index run every kept file is covered; any residue
+    /// means a rebuild was interrupted before it finished (or a file failed
+    /// mid-write). Callers must filter to paths that still exist on disk —
+    /// an interrupted run's cleanup phase never ran, so stale rows for
+    /// deleted files are expected here.
+    public func uncoveredWaxFilePaths() throws -> [String] {
+        try writer.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT f.path FROM fileRecord f
+                WHERE NOT EXISTS (SELECT 1 FROM waxFrameRecord w WHERE w.fileId = f.id)
+                ORDER BY f.path
+                """)
+        }
+    }
+
     /// Whether this file completed ingestion into the current Wax arena.
     ///
     /// A coverage row has neither a frame ID nor a mandate. It distinguishes a

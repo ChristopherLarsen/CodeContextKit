@@ -162,9 +162,16 @@ public actor WaxStore {
         let options = Memory.SearchOptions(topK: candidateK, mode: .vectorOnly)
         let results = try await memory.search(query, options: options)
 
-        return results.items.prefix(limit).map { res in
+        // Append-only delta runs leak stale twins: the previous document for
+        // a re-saved symbol stays in the arena alongside its fresh twin until
+        // the next rebuild. Dedupe by qualified name (best score wins) so a
+        // leaked twin cannot crowd a fresh hit out of the top-K, and resolve
+        // bodies through SQLite/disk as before.
+        var bestBySymbol: [String: SearchResult] = [:]
+        var order: [String] = []
+        for res in results.items {
             let preview = Self.stripMandate(res.text)
-            return SearchResult(
+            let result = SearchResult(
                 symbol: res.metadata["qualifiedName"] ?? "Unknown",
                 file: res.metadata["filePath"] ?? "Unknown",
                 kind: res.metadata["kind"] ?? "unknown",
@@ -172,7 +179,16 @@ public actor WaxStore {
                 preview: preview,
                 estimatedTokens: TokenEstimator.shared.estimate(preview)
             )
+            if bestBySymbol[result.symbol] != nil {
+                if result.score > bestBySymbol[result.symbol]!.score {
+                    bestBySymbol[result.symbol] = result
+                }
+            } else {
+                bestBySymbol[result.symbol] = result
+                order.append(result.symbol)
+            }
         }
+        return order.prefix(limit).compactMap { bestBySymbol[$0] }
     }
 
     public func getSemanticLinks(for items: [String: String], threshold: Float = 0.3) async -> SemanticResponse {
@@ -250,12 +266,7 @@ public actor WaxStore {
             parts.append(lastOpenError)
         }
         if let marker = Self.readBreachMarker(near: path) {
-            parts.append(
-                "repo.wax breached its live-set ceiling " +
-                    "(allocated \(marker.allocatedBytes)B vs ~\(marker.expectedLiveBytes)B live" +
-                    (marker.reclaimableBytes > 0 ? ", \(marker.reclaimableBytes)B reclaimable" : "") +
-                    "); run 'cckit index . --clean' to rebuild from scratch."
-            )
+            parts.append(Self.breachWarningText(for: marker))
         }
         if parts.isEmpty {
             parts.append("store opened without embeddings")
@@ -263,10 +274,28 @@ public actor WaxStore {
         return parts.joined(separator: " ")
     }
 
-    private struct BreachMarkerInfo {
-        let allocatedBytes: Int
-        let expectedLiveBytes: Int
-        let reclaimableBytes: Int
+    public struct WaxBreachMarker: Sendable, Equatable {
+        public let allocatedBytes: Int
+        public let expectedLiveBytes: Int
+        public let reclaimableBytes: Int
+
+        public init(allocatedBytes: Int, expectedLiveBytes: Int, reclaimableBytes: Int) {
+            self.allocatedBytes = allocatedBytes
+            self.expectedLiveBytes = expectedLiveBytes
+            self.reclaimableBytes = reclaimableBytes
+        }
+    }
+
+    /// Operator-facing text for an armed marker. Public so read paths that
+    /// still return results (pack, search, serve) can carry the marker's
+    /// numbers alongside them — during the 2026-08-27 incident the detail
+    /// existed only inside the open-failure throw, so an openable-but-breached
+    /// arena looked identical to a healthy one.
+    public static func breachWarningText(for marker: WaxBreachMarker) -> String {
+        "repo.wax breached its live-set ceiling " +
+            "(allocated \(marker.allocatedBytes)B vs ~\(marker.expectedLiveBytes)B live" +
+            (marker.reclaimableBytes > 0 ? ", \(marker.reclaimableBytes)B reclaimable" : "") +
+            "); run 'cckit index . --clean' to rebuild from scratch."
     }
 
     /// The CLI's bloat veto writes `wax-breach-marker.json` next to repo.wax
@@ -274,7 +303,7 @@ public actor WaxStore {
     /// search, serve) must surface it instead of blaming the MiniLM bundle —
     /// it sat unread for 5.5 hours during the 2026-08-27 186 GB incident
     /// while the tool diagnosed the one component that was working.
-    private static func readBreachMarker(near waxPath: String) -> BreachMarkerInfo? {
+    public static func readBreachMarker(near waxPath: String) -> WaxBreachMarker? {
         let dir = (waxPath as NSString).deletingLastPathComponent
         let markerPath = (dir as NSString).appendingPathComponent("wax-breach-marker.json")
         guard let data = FileManager.default.contents(atPath: markerPath),
@@ -287,7 +316,7 @@ public actor WaxStore {
         let allocated = intValue("allocatedBytes")
         let expected = intValue("expectedLiveBytes")
         guard allocated > 0 else { return nil }
-        return BreachMarkerInfo(
+        return WaxBreachMarker(
             allocatedBytes: allocated,
             expectedLiveBytes: expected,
             reclaimableBytes: intValue("reclaimableBytes")
@@ -425,6 +454,10 @@ public struct WaxCompactResult: Sendable, Equatable {
     /// True when cckit replaced the Wax arena instead of issuing incremental
     /// deletes. This is the safe compatibility path for Wax's public API.
     public let rebuiltWax: Bool
+    /// True when the run appended incrementally (arena retained, changed
+    /// files re-saved, stale twins leaking until the next rebuild). Mutually
+    /// exclusive with `rebuiltWax`; false for pure no-op runs.
+    public let deltaApplied: Bool
 
     /// True when the recorded sizes show an actual file shrink.
     public var shrank: Bool { bytesAfter < bytesBefore }
@@ -438,7 +471,8 @@ public struct WaxCompactResult: Sendable, Equatable {
         updated: Int = 0,
         skipped: Int = 0,
         totalSymbols: Int = 0,
-        rebuiltWax: Bool = false
+        rebuiltWax: Bool = false,
+        deltaApplied: Bool = false
     ) {
         self.scanned = scanned
         self.deleted = deleted
@@ -449,6 +483,7 @@ public struct WaxCompactResult: Sendable, Equatable {
         self.skipped = skipped
         self.totalSymbols = totalSymbols
         self.rebuiltWax = rebuiltWax
+        self.deltaApplied = deltaApplied
     }
 }
 
