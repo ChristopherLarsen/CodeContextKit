@@ -9,7 +9,22 @@ import Wax
 /// real vector retrieval. Without MiniLM, Wax silently disables vectors and
 /// natural-language queries return empty — we refuse that silent degradation.
 public actor WaxStore {
+    public enum StoreError: LocalizedError {
+        case inUse(lockPath: String)
+        case ambiguousPromotionRecovery(path: String, backups: [String])
+
+        public var errorDescription: String? {
+            switch self {
+            case .inUse(let lockPath):
+                return "Wax store is already in use (stable lease: \(lockPath)). Stop the other cckit process and retry."
+            case .ambiguousPromotionRecovery(let path, let backups):
+                return "Wax arena is missing at \(path), but multiple promotion backups exist: \(backups.joined(separator: ", ")). Refusing to guess which one is authoritative."
+            }
+        }
+    }
+
     private let path: String
+    private let lease: RefreshLock.Lease
     private var memory: Memory?
     /// True only when Memory was opened with MiniLM (vector search enabled).
     private var embeddingsEnabled: Bool = false
@@ -20,12 +35,67 @@ public actor WaxStore {
     public private(set) var lastOpenError: String?
 
     public init(path: String) async throws {
+        let lease = try Self.acquireLease(for: path)
         self.path = path
+        self.lease = lease
+        try Self.recoverSolePromotionBackupIfNeeded(at: path)
         await openMemory()
     }
 
-    /// Wipe the `.wax` file and reopen. Used when SQLite has files but no tracked
-    /// frame IDs — surgical delete is impossible, so the vector store must be rebuilt.
+    /// Open with a lease acquired before a caller mutates the arena path.
+    /// IndexCommand uses this to make clean/rebuild deletion race-free.
+    public init(path: String, lease: RefreshLock.Lease) async throws {
+        self.path = path
+        self.lease = lease
+        try Self.recoverSolePromotionBackupIfNeeded(at: path)
+        await openMemory()
+    }
+
+    /// Acquire the stable cckit ownership lock for an arena without waiting.
+    /// The sidecar inode is never replaced with the Wax arena, so it remains a
+    /// valid exclusion point across delete/recreate and upstream promotion.
+    public nonisolated static func acquireLease(for path: String) throws -> RefreshLock.Lease {
+        let lockPath = path + ".lock"
+        let parent = (lockPath as NSString).deletingLastPathComponent
+        if !parent.isEmpty {
+            try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
+        }
+        guard let lease = RefreshLock.tryAcquire(lockPath: lockPath) else {
+            throw StoreError.inUse(lockPath: lockPath)
+        }
+        return lease
+    }
+
+    /// If upstream promotion was interrupted after moving the source aside,
+    /// restore the only unambiguous backup before Wax can create an empty arena.
+    static func recoverSolePromotionBackupIfNeeded(at path: String) throws {
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: path) else { return }
+
+        let arenaURL = URL(fileURLWithPath: path)
+        let directory = arenaURL.deletingLastPathComponent()
+        let prefix = arenaURL.lastPathComponent + ".pre-liveset-"
+        let candidates = try fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ).filter { url in
+            guard url.lastPathComponent.hasPrefix(prefix) else { return false }
+            return (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+
+        guard !candidates.isEmpty else { return }
+        guard candidates.count == 1, let backup = candidates.first else {
+            throw StoreError.ambiguousPromotionRecovery(
+                path: path,
+                backups: candidates.map(\.lastPathComponent)
+            )
+        }
+        try fm.moveItem(at: backup, to: arenaURL)
+    }
+
+    /// Wipe the `.wax` file and reopen. Current Wax has no public batch-delete
+    /// transaction, so cckit replaces this derived store on semantic changes.
     public func resetStore() async throws {
         try await memory?.close()
         memory = nil
@@ -34,6 +104,7 @@ public actor WaxStore {
         if FileManager.default.fileExists(atPath: path) {
             try FileManager.default.removeItem(at: url)
         }
+        _ = WaxResidueSweeper.sweep(cckitDirectory: url.deletingLastPathComponent().path)
         await openMemory()
     }
     
@@ -41,8 +112,11 @@ public actor WaxStore {
         return TokenEstimator.shared.estimate(text)
     }
     
-    /// Ingest a symbol and return the Wax frame IDs (and mandate) so the indexer
-    /// can delete them on re-index. `Memory.save` returns the document and chunk IDs.
+    /// Ingest a symbol and return its cckit mandate for SQLite bookkeeping.
+    ///
+    /// Current Wax intentionally does not return frame IDs from `Memory.save`.
+    /// cckit therefore treats the Wax arena as a replaceable derived artifact and
+    /// rebuilds it when semantic inputs change instead of issuing per-frame deletes.
     @discardableResult
     public func saveSymbol(_ symbol: SymbolRecord, body: String) async throws -> WaxSymbolIngest {
         guard let memory = memory else { return .skipped }
@@ -61,125 +135,18 @@ public actor WaxStore {
             "contentHash": String(hash),
             "mandate": mandate
         ]
-        let savedIDs = try await memory.save(stored, metadata: metadata)
-        let frameIDs = savedIDs.isEmpty ? try await framesMatching(mandate: mandate) : savedIDs
-        return WaxSymbolIngest(mandate: mandate, frameIDs: frameIDs)
-    }
-
-    public func deleteFrames(_ frameIDs: [UInt64]) async throws {
-        guard let memory, !frameIDs.isEmpty else { return }
-        var seen = Set<UInt64>()
-        for id in frameIDs where seen.insert(id).inserted {
-            do {
-                try await memory.delete(frameID: id)
-            } catch {
-                // Already deleted / unknown id after a partial rebuild.
-            }
-        }
-    }
-
-    /// Retract frames whose mandate token is still searchable (covers chunk frames
-    /// whose IDs were never persisted on older indexes).
-    public func deleteByMandates(_ mandates: [String]) async throws {
-        guard memory != nil, !mandates.isEmpty else { return }
-        var ids: [UInt64] = []
-        for mandate in mandates where !mandate.isEmpty {
-            ids.append(contentsOf: try await framesMatching(mandate: mandate))
-        }
-        try await deleteFrames(ids)
+        try await memory.save(stored, metadata: metadata)
+        return WaxSymbolIngest(mandate: mandate, frameIDs: [])
     }
 
     public static func symbolKey(filePath: String, qualifiedName: String) -> String {
         "\(filePath)\u{1f}\(qualifiedName)"
     }
 
-    /// Drop vectors that are not in the current SQLite keep-set. Does not re-embed.
-    ///
-    /// Prefer recorded frame IDs from SQLite. For a live symbol with no recorded IDs
-    /// (legacy leak), keep the newest ingest and delete older duplicates.
-    public func compact(
-        recordedFrameIDs: Set<UInt64>,
-        liveSymbolKeys: Set<String>
-    ) async throws -> WaxCompactResult {
-        guard let memory else {
-            return WaxCompactResult(scanned: 0, deleted: 0, kept: 0)
-        }
-        try await memory.flush()
-        let bytesBefore = waxFileBytes()
-        let frames = await memory.activeFrames()
-        var keep = Set<UInt64>()
-
-        var byKey: [String: [Memory.FrameSummary]] = [:]
-        var untagged: [Memory.FrameSummary] = []
-        for frame in frames {
-            if let path = frame.metadata["filePath"], !path.isEmpty,
-               let name = frame.metadata["qualifiedName"], !name.isEmpty {
-                byKey[Self.symbolKey(filePath: path, qualifiedName: name), default: []].append(frame)
-            } else {
-                untagged.append(frame)
-            }
-        }
-
-        for (symbolKey, group) in byKey {
-            guard liveSymbolKeys.contains(symbolKey) else { continue }
-            let recordedInGroup = group.filter { recordedFrameIDs.contains($0.id) }
-            if !recordedInGroup.isEmpty {
-                keep.formUnion(recordedInGroup.map(\.id))
-                continue
-            }
-            guard let newest = group.max(by: { $0.timestampMs < $1.timestampMs }) else { continue }
-            let parent = newest.parentId ?? newest.id
-            keep.insert(parent)
-            for frame in group where frame.id == parent || frame.parentId == parent {
-                keep.insert(frame.id)
-            }
-        }
-
-        for frame in untagged {
-            if let parent = frame.parentId {
-                if keep.contains(parent) {
-                    keep.insert(frame.id)
-                }
-            } else {
-                keep.insert(frame.id)
-            }
-        }
-
-        var changed = true
-        while changed {
-            changed = false
-            for frame in frames where !keep.contains(frame.id) {
-                if let parent = frame.parentId, keep.contains(parent) {
-                    keep.insert(frame.id)
-                    changed = true
-                }
-            }
-        }
-
-        var deleted = 0
-        for frame in frames where !keep.contains(frame.id) {
-            do {
-                try await memory.delete(frameID: frame.id)
-                deleted += 1
-            } catch {
-                // Already deleted / unknown id after a partial rebuild.
-            }
-        }
-        try await memory.flush()
-
-        // Soft deletes never shrink repo.wax by themselves. The file bytes are
-        // reclaimed when this store is CLOSED: Wax's close-time live-set rewrite
-        // drops non-live payloads, preserves frame IDs, carries committed vector
-        // bytes over (no re-embed), and promotes the compacted candidate over the
-        // source file. Callers therefore measure the post-close size (and stamp
-        // compaction results) only after `close()` — see IndexCommand.
-
-        return WaxCompactResult(
-            scanned: frames.count,
-            deleted: deleted,
-            kept: frames.count - deleted,
-            bytesBefore: bytesBefore
-        )
+    /// Public Wax health counters that remain available across upstream releases.
+    public func frameCount() async -> Int {
+        guard let memory else { return 0 }
+        return Int((await memory.stats()).frameCount)
     }
     
     public func search(_ query: String, limit: Int = 10) async throws -> [SearchResult] {
@@ -192,10 +159,8 @@ public actor WaxStore {
         // only sees natural-language meaning queries (vector-only).
         let candidateK = max(limit, 64)
 
-        let results = try await memory.search(query) { options in
-            options.topK = candidateK
-            options.mode = .vectorOnly
-        }
+        let options = Memory.SearchOptions(topK: candidateK, mode: .vectorOnly)
+        let results = try await memory.search(query, options: options)
 
         return results.items.prefix(limit).map { res in
             let preview = Self.stripMandate(res.text)
@@ -256,7 +221,10 @@ public actor WaxStore {
     }
     
     public func flush() async throws { try await memory?.flush() }
-    public func close() async throws { try await memory?.close() }
+    public func close() async throws {
+        defer { lease.release() }
+        try await memory?.close()
+    }
 
     /// True when the underlying Wax Memory handle opened successfully.
     public func isAvailable() -> Bool { memory != nil }
@@ -329,16 +297,21 @@ public actor WaxStore {
     private func openMemory() async {
         let url = URL(fileURLWithPath: path)
         var config = Memory.Config.default
-        config.liveSetRewrite = Self.reclaimSettingsFromEnvironment()
+        config.embedding = .builtIn(.miniLM)
         do {
-            self.memory = try await Memory(at: url, config: config, builtInEmbedding: .miniLM)
-            self.embeddingsEnabled = true
+            let memory = try await Memory(at: url, config: config)
+            let stats = await memory.stats()
+            self.memory = memory
+            self.embeddingsEnabled = stats.vectorSearchEnabled && stats.queryEmbedderConfigured
+            self.lastOpenError = self.embeddingsEnabled ? nil : "Wax opened without a query embedder"
         } catch {
             let miniLMError = Self.describeOpenError(error)
             // Last-resort text-only open so non-semantic flows (token count) can
             // still work; semantic search will refuse via `requireEmbeddings()`.
             do {
-                self.memory = try await Memory(at: url, config: config)
+                var textConfig = Memory.Config.default
+                textConfig.enableVectorSearch = false
+                self.memory = try await Memory(at: url, config: textConfig)
                 self.embeddingsEnabled = false
                 self.lastOpenError = "\(miniLMError); text-only open succeeded"
             } catch {
@@ -359,53 +332,6 @@ public actor WaxStore {
         return text.isEmpty ? String(describing: type(of: error)) : text
     }
 
-    /// Live-set reclamation knobs, overridable per run:
-    /// - `CCKIT_WAX_RECLAIM=off` disables reclaim entirely
-    /// - `CCKIT_WAX_RECLAIM_FRACTION` dead-bytes fraction (default 0.25)
-    /// - `CCKIT_WAX_RECLAIM_MIN_BYTES` absolute floor (default 32 MiB)
-    /// - `CCKIT_WAX_RECLAIM_MIN_INTERVAL_MS` cooldown (default 60000)
-    ///
-    /// Defaults are aggressive (vs Wax's conservative preset) because code-index
-    /// stores accumulate stale index segments on every commit; conservative
-    /// thresholds only engaged around the ~500 GiB incident.
-    static func reclaimSettingsFromEnvironment() -> LiveSetRewriteSettings {
-        let env = ProcessInfo.processInfo.environment
-        if let mode = env["CCKIT_WAX_RECLAIM"], mode.trimmingCharacters(in: .whitespaces).lowercased() == "off" {
-            return LiveSetRewriteSettings(enabled: false)
-        }
-        func number(_ key: String) -> Double? {
-            env[key].flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }
-        }
-        var settings = LiveSetRewriteSettings.aggressive
-        if let fraction = number("CCKIT_WAX_RECLAIM_FRACTION"), fraction >= 0, fraction <= 1 {
-            settings.minDeadPayloadFraction = fraction
-        }
-        if let minBytes = number("CCKIT_WAX_RECLAIM_MIN_BYTES"), minBytes >= 0 {
-            settings.minDeadPayloadBytes = UInt64(minBytes)
-        }
-        if let intervalMs = number("CCKIT_WAX_RECLAIM_MIN_INTERVAL_MS"), intervalMs >= 0 {
-            settings.minIntervalMs = Int(intervalMs)
-        }
-        if let idleMs = number("CCKIT_WAX_RECLAIM_IDLE_MS"), idleMs >= 0 {
-            settings.minimumIdleMs = Int(idleMs)
-        }
-        return settings
-    }
-
-    /// Byte-level accounting of the underlying store (live/dead payloads,
-    /// stale index segments). Nil when no store is open.
-    public func storeDiagnostics() async throws -> StoreDiagnostics? {
-        guard let memory else { return nil }
-        return try await memory.storeDiagnostics()
-    }
-
-    /// Force one live-set reclamation now (dead payloads + stale index
-    /// segments). Nil when no store is open.
-    public func runLiveSetReclaimNow() async throws -> LiveSetMaintenanceSummary? {
-        guard let memory else { return nil }
-        return try await memory.runLiveSetMaintenanceNow()
-    }
-
     /// Bytes actually materialized on disk (st_blocks). Wax preallocates its
     /// arena sparsely, so apparent size overstates by ~2x and drifts further
     /// with use — growth detection and watermarks must use allocated bytes.
@@ -419,32 +345,11 @@ public actor WaxStore {
         return max(0, allocated)
     }
 
-    private func waxFileBytes() -> Int {
-        Self.waxFileAllocatedBytes(at: path)
-    }
-
     /// Bytes currently materialized on disk for this arena (st_blocks).
     /// Public so index runs can enforce a mid-run growth cap (ask F) instead
     /// of discovering 186 GB after close.
     public func allocatedBytes() -> Int {
         Self.waxFileAllocatedBytes(at: path)
-    }
-
-    private func framesMatching(mandate: String) async throws -> [UInt64] {
-        guard let memory, !mandate.isEmpty else { return [] }
-        let token = Self.mandateToken(mandate)
-        let results = try await memory.search(token) { options in
-            options.topK = 64
-            options.mode = .textOnly
-        }
-        var seen = Set<UInt64>()
-        var ids: [UInt64] = []
-        for item in results.items {
-            let matches = item.metadata["mandate"] == mandate || item.text.contains(token)
-            guard matches, seen.insert(item.frameId).inserted else { continue }
-            ids.append(item.frameId)
-        }
-        return ids
     }
 
     private static func mandateToken(_ mandate: String) -> String {
@@ -489,8 +394,8 @@ public actor WaxStore {
     }
 }
 
-/// Result of ingesting one symbol into Wax. `frameIDs` come from `Memory.save`;
-/// `mandate` still allows delete-by-mandate on older indexes.
+/// Result of ingesting one symbol into Wax. Current Wax returns no frame IDs;
+/// the mandate is retained as durable cckit bookkeeping and search metadata.
 public struct WaxSymbolIngest: Sendable, Equatable {
     public let mandate: String
     public let frameIDs: [UInt64]
@@ -504,13 +409,9 @@ public struct WaxCompactResult: Sendable, Equatable {
     public let scanned: Int
     public let deleted: Int
     public let kept: Int
-    /// repo.wax size in bytes measured before logical deletion. Compare against
-    /// the on-disk size measured AFTER `WaxStore.close()` to detect real byte
-    /// reclaim (the close-time live-set rewrite is what shrinks the file).
+    /// repo.wax allocation measured before the index operation.
     public let bytesBefore: Int
-    /// Size observed after compaction completed. `compact` itself does not
-    /// reclaim bytes (that happens on close), so this mirrors `bytesBefore`
-    /// unless the caller updates it with a post-close measurement.
+    /// Allocation observed after the store closes.
     public let bytesAfter: Int
     /// Files re-embedded by the index run that produced this result (0 for
     /// compact-only callers). Without these counts a ledger row cannot tell
@@ -521,6 +422,9 @@ public struct WaxCompactResult: Sendable, Equatable {
     public let skipped: Int
     /// Total symbols extracted by the index run.
     public let totalSymbols: Int
+    /// True when cckit replaced the Wax arena instead of issuing incremental
+    /// deletes. This is the safe compatibility path for Wax's public API.
+    public let rebuiltWax: Bool
 
     /// True when the recorded sizes show an actual file shrink.
     public var shrank: Bool { bytesAfter < bytesBefore }
@@ -533,7 +437,8 @@ public struct WaxCompactResult: Sendable, Equatable {
         bytesAfter: Int = 0,
         updated: Int = 0,
         skipped: Int = 0,
-        totalSymbols: Int = 0
+        totalSymbols: Int = 0,
+        rebuiltWax: Bool = false
     ) {
         self.scanned = scanned
         self.deleted = deleted
@@ -543,6 +448,7 @@ public struct WaxCompactResult: Sendable, Equatable {
         self.updated = updated
         self.skipped = skipped
         self.totalSymbols = totalSymbols
+        self.rebuiltWax = rebuiltWax
     }
 }
 

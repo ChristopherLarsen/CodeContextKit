@@ -159,7 +159,7 @@ final class IncrementalIndexingTests: XCTestCase {
         )
     }
 
-    func testIndexPersistsSaveReturnedFrameIDs() async throws {
+    func testIndexPersistsMandatesWhenWaxReturnsNoFrameIDs() async throws {
         let embeddingsReady = await wax.hasEmbeddings()
         try XCTSkipUnless(embeddingsReady, "MiniLM embeddings required")
 
@@ -173,10 +173,12 @@ final class IncrementalIndexingTests: XCTestCase {
         try await indexer.index(at: tempDir.path)
 
         let ids = try db.waxFrameIDs(path: "IDs.swift")
-        XCTAssertFalse(ids.isEmpty, "Memory.save must persist real frame IDs, not mandate-only rows")
+        let mandates = try db.waxMandates(path: "IDs.swift")
+        XCTAssertTrue(ids.isEmpty, "Current Wax Memory.save intentionally returns no frame IDs")
+        XCTAssertFalse(mandates.isEmpty, "cckit must retain a semantic-ingest bookkeeping row")
     }
 
-    func testCompactDropsOrphanWaxVectorsWithoutReembed() async throws {
+    func testForcedWaxRebuildDropsOrphanVectors() async throws {
         let embeddingsReady = await wax.hasEmbeddings()
         try XCTSkipUnless(embeddingsReady, "MiniLM embeddings required")
 
@@ -215,8 +217,9 @@ final class IncrementalIndexingTests: XCTestCase {
             "Expected planted orphan. Hits: \(beforeOrphan.map(\.symbol))"
         )
 
-        let result = try await indexer.compactWax()
+        let result = try await indexer.index(at: tempDir.path, forceWaxRebuild: true)
         XCTAssertGreaterThan(result.deleted, 0)
+        XCTAssertTrue(result.rebuiltWax)
 
         let afterOrphan = try await wax.search("unique phrase compact-orphan-vector", limit: 5)
         XCTAssertFalse(

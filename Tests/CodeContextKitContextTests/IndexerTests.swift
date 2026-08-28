@@ -33,19 +33,24 @@ final class IndexerTests: XCTestCase {
         try "struct A {}".write(to: fileURL, atomically: true, encoding: .utf8)
         
         // First run
-        try await indexer.index(at: tempDir.path)
+        let first = try await indexer.index(at: tempDir.path)
+        XCTAssertTrue(first.rebuiltWax)
         let files1 = try db.getAllFiles()
         XCTAssertEqual(files1.count, 1)
         
         // Second run (no changes)
-        try await indexer.index(at: tempDir.path)
+        let second = try await indexer.index(at: tempDir.path)
+        XCTAssertFalse(second.rebuiltWax)
+        XCTAssertEqual(second.updated, 0)
+        XCTAssertEqual(second.skipped, 1)
         let files2 = try db.getAllFiles()
         XCTAssertEqual(files2.count, 1)
         XCTAssertEqual(files2[0].sha256, files1[0].sha256)
         
         // Change file
         try "struct B {}".write(to: fileURL, atomically: true, encoding: .utf8)
-        try await indexer.index(at: tempDir.path)
+        let changed = try await indexer.index(at: tempDir.path)
+        XCTAssertTrue(changed.rebuiltWax)
         
         let symbols = try db.getSymbols(path: "Test.swift")
         XCTAssertTrue(symbols.contains { $0.name == "B" })
@@ -56,7 +61,8 @@ final class IndexerTests: XCTestCase {
         let jsonURL = tempDir.appendingPathComponent("config.json")
         try "{ \"key\": \"value\" }".write(to: jsonURL, atomically: true, encoding: .utf8)
         
-        try await indexer.index(at: tempDir.path)
+        let first = try await indexer.index(at: tempDir.path)
+        XCTAssertTrue(first.rebuiltWax)
         
         let files = try db.getAllFiles()
         XCTAssertTrue(files.contains { $0.path == "config.json" })
@@ -66,6 +72,13 @@ final class IndexerTests: XCTestCase {
         let symbols = try db.getSymbols(path: "config.json")
         XCTAssertEqual(symbols.count, 1)
         XCTAssertEqual(symbols[0].kind, .file)
+
+        // File fallbacks are intentionally excluded from Wax. Their coverage
+        // marker must still make the next unchanged run a true no-op.
+        let second = try await indexer.index(at: tempDir.path)
+        XCTAssertFalse(second.rebuiltWax)
+        XCTAssertEqual(second.updated, 0)
+        XCTAssertEqual(second.skipped, 1)
     }
 
     func testIndexingDefaultsToGitignore() async throws {

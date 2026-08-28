@@ -56,6 +56,25 @@ final class StorageTests: XCTestCase {
         XCTAssertEqual(try db.allWaxFrameIDs(), [])
     }
 
+    func testClearingWaxBindingsPreservesRelationalIndex() throws {
+        let fileId = try db.saveFile(
+            path: "A.swift",
+            language: "swift",
+            sha256: "abc",
+            sizeBytes: 1,
+            modifiedAt: Date()
+        )
+        try db.saveWaxFrames(fileId: fileId, mandate: "mandateA", frameIDs: [])
+        try db.markWaxCoverage(fileId: fileId)
+        XCTAssertTrue(try db.hasWaxCoverage(path: "A.swift"))
+
+        try db.clearWaxFrameRecords()
+
+        XCTAssertEqual(try db.waxFrameCount(), 0)
+        XCTAssertFalse(try db.hasWaxCoverage(path: "A.swift"))
+        XCTAssertNotNil(try db.getFile(path: "A.swift"))
+    }
+
     func testFavoritesWithViewMode() throws {
         try db.addFavorite(name: "MyFunc", filePath: "Source.swift", kind: "function", viewMode: "full")
         let favs = try db.getFavorites()

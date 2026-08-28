@@ -18,8 +18,9 @@ import Darwin
 ///    lock file so a later investigation can see who held (or last held) it.
 public enum RefreshLock {
     /// An acquired exclusive lock. Release closes the fd, dropping the lock.
-    public struct Lease: Sendable {
-        public let fd: Int32
+    public final class Lease: @unchecked Sendable {
+        private let stateLock = NSLock()
+        private var fd: Int32
         private let lockPath: String
 
         fileprivate init(fd: Int32, lockPath: String) {
@@ -28,7 +29,15 @@ public enum RefreshLock {
         }
 
         public func release() {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            guard fd >= 0 else { return }
             close(fd)
+            fd = -1
+        }
+
+        deinit {
+            release()
         }
     }
 

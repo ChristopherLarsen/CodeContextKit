@@ -60,6 +60,7 @@ public final class Indexer: Sendable {
         includeBuildScripts: Bool = false,
         includeGenerated: Bool = false,
         maxArenaBytes: Int? = nil,
+        forceWaxRebuild: Bool = false,
         delegate: IndexerProgressDelegate? = nil
     ) async throws -> WaxCompactResult {
         let absolutePath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
@@ -84,8 +85,36 @@ public final class Indexer: Sendable {
         })
         delegate?.indexerDidStart(totalFiles: files.count)
 
-        let needsWaxBackfill = try db.waxFrameCount() == 0 && !db.getAllFiles().isEmpty
-        if needsWaxBackfill {
+        // Current Wax commits every single-frame delete and does not expose a
+        // batch-delete or frame-enumeration API. Detect semantic changes before
+        // mutation and replace the derived Wax arena once when anything changed.
+        // No-op runs retain the arena and the fast SQLite hash skip.
+        let existingFiles = try db.getAllFiles()
+        let existingByPath = Dictionary(uniqueKeysWithValues: existingFiles.map { ($0.path, $0) })
+        let previousWaxRecordCount = try db.waxFrameCount()
+        var contentByPath: [String: String] = [:]
+        contentByPath.reserveCapacity(files.count)
+        var semanticInputsChanged = forceWaxRebuild
+        for fileURL in files {
+            let relativePath = relativePath(for: fileURL, rootPath: absolutePath)
+            guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
+            contentByPath[relativePath] = content
+            if existingByPath[relativePath]?.sha256 != hasher.hash(content: content) {
+                semanticInputsChanged = true
+            } else if existingByPath[relativePath] != nil,
+                      try !db.hasWaxCoverage(path: relativePath) {
+                // A prior rebuild did not finish this file, or this is the
+                // first run after coverage markers were introduced. Retry the
+                // derived arena instead of treating its SQLite hash as enough.
+                semanticInputsChanged = true
+            }
+        }
+        if Set(existingByPath.keys) != scannedRelativePaths {
+            semanticInputsChanged = true
+        }
+
+        if semanticInputsChanged {
+            try db.clearWaxFrameRecords()
             try await wax.resetStore()
         }
         
@@ -111,15 +140,18 @@ public final class Indexer: Sendable {
             }
             
             do {
-                let content = try String(contentsOf: fileURL, encoding: .utf8)
+                let content = try contentByPath[relativePath]
+                    ?? String(contentsOf: fileURL, encoding: .utf8)
                 let currentHash = hasher.hash(content: content)
                 
                 if let existingFile = try db.getFile(path: relativePath) {
-                    if !needsWaxBackfill && existingFile.sha256 == currentHash {
+                    if !semanticInputsChanged && existingFile.sha256 == currentHash {
                         skippedCount += 1
                         continue
                     }
-                    try await retractFromWaxAndSQLite(path: relativePath)
+                    // The old Wax arena has already been replaced for this run.
+                    // Remove only the relational row and its cascaded children.
+                    try db.deleteFile(path: relativePath)
                 }
                 
                 let lines = content.components(separatedBy: .newlines)
@@ -177,6 +209,12 @@ public final class Indexer: Sendable {
                         )
                     }
                 }
+
+                // Written last: an interrupted or partially failed file has
+                // no coverage marker, forcing the next run to rebuild/retry.
+                // Files with no eligible semantic symbols still get covered,
+                // so a true no-op does not rebuild forever.
+                try db.markWaxCoverage(fileId: fileId)
                 
                 updatedCount += 1
                 totalSymbols += symbols.count
@@ -185,60 +223,34 @@ public final class Indexer: Sendable {
             }
         }
         
-        try await wax.flush()
-        
         // Cleanup Phase: Remove files from DB that are no longer on disk
         let allIndexedFiles = try db.getAllFiles()
         for indexedFile in allIndexedFiles {
             let fullURL = URL(fileURLWithPath: absolutePath).appendingPathComponent(indexedFile.path)
             if !FileManager.default.fileExists(atPath: fullURL.path) || !scannedRelativePaths.contains(indexedFile.path) {
-                try await retractFromWaxAndSQLite(path: indexedFile.path)
+                // File deletion participated in the preflight comparison, so
+                // Wax was rebuilt before this stale SQLite row is removed.
+                try db.deleteFile(path: indexedFile.path)
                 print("Removed stale file from index: \(indexedFile.path)")
             }
         }
 
-        let compacted = try await compactWax()
-        if compacted.deleted > 0 {
-            print("Compacted Wax: deleted \(compacted.deleted) leaked vectors (\(compacted.kept) kept)")
-        }
+        try await wax.flush()
+        let currentWaxRecordCount = try db.waxFrameCount()
 
         delegate?.indexerDidFinish(updated: updatedCount, skipped: skippedCount, totalSymbols: totalSymbols)
         // Carry this run's counts on the result so the CLI can persist them on
         // the ledger row (ActionRecord) — durationMs alone cannot distinguish
         // a no-op pass from a near-full re-embed.
         return WaxCompactResult(
-            scanned: compacted.scanned,
-            deleted: compacted.deleted,
-            kept: compacted.kept,
-            bytesBefore: compacted.bytesBefore,
-            bytesAfter: compacted.bytesAfter,
+            scanned: previousWaxRecordCount,
+            deleted: semanticInputsChanged ? previousWaxRecordCount : 0,
+            kept: currentWaxRecordCount,
             updated: updatedCount,
             skipped: skippedCount,
-            totalSymbols: totalSymbols
+            totalSymbols: totalSymbols,
+            rebuiltWax: semanticInputsChanged
         )
-    }
-
-    /// Drop Wax vectors that are not in the current SQLite keep-set. No re-embed.
-    public func compactWax() async throws -> WaxCompactResult {
-        let recorded = Set(try db.allWaxFrameIDs())
-        let live = Set(try db.getSymbolsForRepoMap().map {
-            WaxStore.symbolKey(filePath: $0.filePath, qualifiedName: $0.qualifiedName)
-        })
-        return try await wax.compact(recordedFrameIDs: recorded, liveSymbolKeys: live)
-    }
-
-    private func retractFromWaxAndSQLite(path: String) async throws {
-        // No flush here. Every flush commits, and each commit re-appends the
-        // full-corpus text index to repo.wax — flushing per retracted file was
-        // the main driver of arena growth (one file edit => two full index
-        // blobs). Deletes target frames committed by earlier runs, so they are
-        // visible without a commit; the run's single end-of-index flush
-        // commits retractions and saves together.
-        let frameIDs = try db.waxFrameIDs(path: path)
-        let mandates = try db.waxMandates(path: path)
-        try await wax.deleteFrames(frameIDs)
-        try await wax.deleteByMandates(mandates)
-        try db.deleteFile(path: path)
     }
 
     private func relativePath(for fileURL: URL, rootPath: String) -> String {

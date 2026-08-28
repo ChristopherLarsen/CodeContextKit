@@ -233,6 +233,43 @@ public final class Database: @unchecked Sendable {
         }
     }
 
+    /// Whether this file completed ingestion into the current Wax arena.
+    ///
+    /// A coverage row has neither a frame ID nor a mandate. It distinguishes a
+    /// successfully processed file with no semantic documents from an
+    /// interrupted rebuild that must be retried.
+    public func hasWaxCoverage(path: String) throws -> Bool {
+        try writer.read { db in
+            guard let file = try FileRecord.filter(Column("path") == path).fetchOne(db),
+                  let fileId = file.id else {
+                return false
+            }
+            return try WaxFrameRecord
+                .filter(Column("fileId") == fileId)
+                .filter(Column("frameId") == nil)
+                .filter(Column("mandate") == "")
+                .fetchCount(db) > 0
+        }
+    }
+
+    /// Mark one file as completely considered for the current Wax arena.
+    /// This is written only after all of that file's eligible symbols save.
+    public func markWaxCoverage(fileId: Int64) throws {
+        try writer.write { db in
+            var record = WaxFrameRecord(id: nil, fileId: fileId, frameId: nil, mandate: "")
+            try record.save(db)
+        }
+    }
+
+    /// Remove all bookkeeping for a Wax arena that cckit is about to replace.
+    /// The relational symbol index remains intact until each source file is
+    /// successfully refreshed, but no row may claim a frame in the new arena.
+    public func clearWaxFrameRecords() throws {
+        _ = try writer.write { db in
+            try WaxFrameRecord.deleteAll(db)
+        }
+    }
+
     /// Every recorded Wax frame ID across the index (for `--compact`).
     public func allWaxFrameIDs() throws -> [UInt64] {
         try writer.read { db in

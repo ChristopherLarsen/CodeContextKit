@@ -6,7 +6,6 @@ import CodeContextKitSwiftIndex
 import CodeContextKitStorage
 import CodeContextKitRetrieval
 import CodeContextKitContext
-import Wax
 
 struct IndexCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -20,7 +19,7 @@ struct IndexCommand: AsyncParsableCommand {
     @Flag(help: "Clean the index before indexing.")
     var clean: Bool = false
 
-    @Flag(help: "Drop Wax vectors not in the current SQLite symbol set, without re-embedding.")
+    @Flag(help: "Rebuild the derived Wax semantic index from the current source tree.")
     var compact: Bool = false
 
     @Option(help: "Glob patterns to include.")
@@ -93,92 +92,31 @@ struct IndexCommand: AsyncParsableCommand {
         try? data.write(to: URL(fileURLWithPath: breachMarkerPath(cckitDir)), options: .atomic)
     }
 
-    /// Item 7 circuit breaker, phase 1 (pre-index): when the arena far exceeds
-    /// its expected live size, force the live-set rewrite — but never judge it
-    /// here. The rewrite only replaces the file at close, so any post-reclaim
-    /// read in this phase sees stale bytes (the bug that made every index fail
-    /// on the run that fixed the arena). Verdict happens post-close in
-    /// ``settleWaxBreakerVerdict(cckitDir:wax:)``. Comparison uses allocated
-    /// (materialized) bytes — Wax preallocates arenas sparsely, so logical
-    /// size false-positives on young stores.
-    private func enforceWaxBloatBreaker(_ wax: WaxStore, cckitDir: String) async throws {
-        let factor = WaxBloatGuard.factorFromEnvironment()
-        guard let diag = try? await wax.storeDiagnostics(),
-              WaxBloatGuard.isBreached(
-                  fileBytes: diag.allocatedBytes,
-                  expectedLiveBytes: diag.expectedLiveBytes,
-                  factor: factor
-              )
-        else {
-            // Healthy again (manual cleanup, prior close reclaimed): self-heal.
-            Self.clearBreachMarker(cckitDir: cckitDir)
-            return
-        }
-
-        if Self.hasBreachMarker(cckitDir: cckitDir) {
-            // A previous run already forced a reclaim and still closed over
-            // the ceiling. Refuse before doing more work.
+    /// Sweep Wax live-set rewrite residue (ask G, extended to every run).
+    ///
+    /// Wax's scheduled rewrite writes `repo-liveset-<UUID>.wax` candidates
+    /// beside the arena, prunes them only to `keepLatestCandidates: 2`, and
+    /// promotes ONLY the close-time candidate — so every normal incremental
+    /// run that triggers a mid-session rewrite leaves a full arena duplicate
+    /// behind. The 2026-08-27 incident orphaned a 398 MB candidate that even
+    /// survived a `--clean` rebuild. After close the handle is gone and any
+    /// remaining candidate was by definition not promoted: unpromoted
+    /// garbage. All arena writers hold the refresh lock while we sweep.
+    ///
+    /// `repo.wax.pre-liveset-*` backups are promotion byproducts. This helper is
+    /// called only after a successful close or during a deliberate rebuild, so
+    /// the authoritative arena is known and every remaining artifact is stale.
+    static func sweepLiveSetResidue(cckitDir: String) {
+        let result = WaxResidueSweeper.sweep(cckitDirectory: cckitDir)
+        if result.removedFiles > 0 {
             print(
-                "Error: repo.wax remains over \(Int(factor))x its live set after a prior forced reclaim " +
-                    "(currently \(diag.allocatedBytes)B materialized vs ~\(diag.expectedLiveBytes)B live, " +
-                    "\(diag.reclaimableBytes)B reclaimable). Run 'cckit index . --clean' to rebuild from scratch."
-            )
-            throw ExitCode.failure
-        }
-
-        print(
-            "WaxBreaker repo.wax=\(diag.allocatedBytes)B materialized vs expected live ~\(diag.expectedLiveBytes)B " +
-                "(staleSegments=\(diag.staleSegmentBytes)B, deadPayload=\(diag.deadFramePayloadBytes)B); forcing live-set reclaim."
-        )
-        if let summary = try? await wax.runLiveSetReclaimNow() {
-            print(
-                "WaxMaintenance outcome=\(summary.outcome.rawValue) reclaimed=\(summary.reclaimedBytes)B " +
-                    "deadFraction=\(String(format: "%.2f", summary.deadPayloadFraction))"
+                "WaxResidue swept \(result.removedFiles) file(s), " +
+                    "\(result.reclaimedAllocatedBytes)B allocated reclaimed."
             )
         }
-        // Deliberately no verdict here: reclaimed bytes only appear at close.
-    }
-
-    /// Item 7 circuit breaker, phase 2 (post-close): the store is closed, so
-    /// the on-disk file now reflects any promoted rewrite. Judges this run's
-    /// reclaim against the pre-close diagnostics snapshot and real materialized
-    /// size; arms (or clears) the fail-fast marker for the NEXT invocation.
-    /// This run's work is persisted either way — never fails this run.
-    static func settleWaxBreakerVerdict(
-        cckitDir: String,
-        snapshot: StoreDiagnostics,
-        materializedAfterClose: Int
-    ) {
-        let factor = WaxBloatGuard.factorFromEnvironment()
-        guard WaxBloatGuard.isBreached(
-            fileBytes: UInt64(max(0, materializedAfterClose)),
-            expectedLiveBytes: snapshot.expectedLiveBytes,
-            factor: factor
-        ) else {
-            Self.clearBreachMarker(cckitDir: cckitDir)
-            return
+        if !result.failures.isEmpty {
+            print("Warning: Wax residue sweep could not remove: \(result.failures.joined(separator: "; "))")
         }
-
-        if snapshot.reclaimableBytes == 0 {
-            // Nothing left to drop: the remaining gap is fixed store overhead
-            // (header/WAL/TOC pages), not garbage.
-            print("WaxBreaker: no reclaimable bytes remain; residual size is store overhead.")
-            Self.clearBreachMarker(cckitDir: cckitDir)
-            return
-        }
-
-        Self.writeBreachMarker(
-            cckitDir: cckitDir,
-            allocatedBytes: UInt64(max(0, materializedAfterClose)),
-            expectedLiveBytes: snapshot.expectedLiveBytes,
-            reclaimableBytes: snapshot.reclaimableBytes,
-            factor: factor
-        )
-        print(
-            "Warning: repo.wax still exceeds \(Int(factor))x its live set at close " +
-                "(\(materializedAfterClose)B materialized vs ~\(snapshot.expectedLiveBytes)B, \(snapshot.reclaimableBytes)B reclaimable). " +
-                "This index persisted; the NEXT 'cckit index' will abort until 'cckit index . --clean' rebuilds."
-        )
     }
 
     /// Single-line JSON summary for tooling; MCP keys off this instead of
@@ -191,7 +129,8 @@ struct IndexCommand: AsyncParsableCommand {
             "bytesBefore": result.bytesBefore,
             "bytesAfter": result.bytesAfter,
             "shrank": result.shrank,
-            "stamped": stamped
+            "stamped": stamped,
+            "rebuiltWax": result.rebuiltWax
         ]
         // Present only when the run actually indexed (compact-only passes
         // leave these out); a ledger row with durationMs but no counts cannot
@@ -314,14 +253,14 @@ struct IndexCommand: AsyncParsableCommand {
 
     /// Mid-run arena cap (ask F): abort indexing while bytes are still being
     /// written, instead of the strictly post-hoc bloat veto. Cap is a factor
-    /// over the larger of expected-live bytes and the pre-run arena, with an
-    /// absolute floor so legitimately large repos are never clipped.
+    /// over the pre-run arena, with an absolute floor so legitimately large
+    /// repos are never clipped. Current Wax no longer exposes live-byte
+    /// diagnostics publicly, so cckit relies on fresh filesystem allocation.
     /// Env-tunable: CCKIT_WAX_MIDRUN_FACTOR (default 8), CCKIT_WAX_MIN_BYTES
     /// (default 8 GiB), CCKIT_WAX_MIDRUN_CAP=off disables entirely.
     static func midRunArenaCap(
         mustRebuild: Bool,
-        bytesBefore: Int,
-        expectedLiveBytes: Int?
+        bytesBefore: Int
     ) -> Int? {
         let env = ProcessInfo.processInfo.environment
         if let mode = env["CCKIT_WAX_MIDRUN_CAP"],
@@ -336,10 +275,9 @@ struct IndexCommand: AsyncParsableCommand {
         if let raw = env["CCKIT_WAX_MIDRUN_MIN_BYTES"], let parsed = Int(raw), parsed > 0 {
             floorBytes = parsed
         }
-        // On a rebuild the arena starts empty, so bytesBefore and the old
-        // diagnostics say nothing about what this run SHOULD produce; the
-        // floor alone bounds it.
-        let base = mustRebuild ? 0 : max(bytesBefore, max(0, expectedLiveBytes ?? 0))
+        // On a rebuild the arena starts empty, so the old arena says nothing
+        // about what this run should produce; the floor alone bounds it.
+        let base = mustRebuild ? 0 : max(0, bytesBefore)
         return max(Int(Double(base) * factor), floorBytes)
     }
 
@@ -375,24 +313,44 @@ struct IndexCommand: AsyncParsableCommand {
         }
         defer { lock.release() }
 
+        // Hold a stable sidecar lease before inspecting or deleting repo.wax.
+        // Wax locks the replaceable arena inode itself; that does not protect
+        // against a long-lived server writing an unlinked old inode.
+        let waxLease: RefreshLock.Lease
+        do {
+            waxLease = try WaxStore.acquireLease(for: waxPath)
+        } catch {
+            print("Error: \(error.localizedDescription)")
+            throw ExitCode.failure
+        }
+
         let storedEmbedderId = WaxEmbedderIdentity.storedId(cckitDir: cckitDir)
         let embedderMismatch = storedEmbedderId != WaxEmbedderIdentity.current
-        let compactOnly = compact && !clean
-        // Incremental indexing skips unchanged files and would leave a text-only
-        // `.wax` without vectors after an embedder upgrade. Rebuild both stores.
-        // `--compact` must not wipe the store it is reclaiming.
-        let mustRebuild = !compactOnly && (clean || (embedderMismatch && (fm.fileExists(atPath: waxPath) || fm.fileExists(atPath: dbPath))))
+        let compactRequested = compact && !clean
 
-        if compactOnly {
+        if compactRequested {
             guard fm.fileExists(atPath: dbPath), fm.fileExists(atPath: waxPath) else {
                 print("Error: Index not found. Run 'cckit index .' first.")
                 throw ExitCode.failure
             }
         }
 
+        // Current Wax exposes neither in-place maintenance nor batch deletion.
+        // A clean replacement is the only bounded cckit-owned compaction path.
+        let hasExistingIndex = fm.fileExists(atPath: waxPath) || fm.fileExists(atPath: dbPath)
+        let mustRebuild = clean
+            || compactRequested
+            || Self.hasBreachMarker(cckitDir: cckitDir)
+            || (embedderMismatch && hasExistingIndex)
+
         if mustRebuild {
             if embedderMismatch && !clean {
                 print("Semantic embedder changed (\(storedEmbedderId ?? "none") → \(WaxEmbedderIdentity.current)); rebuilding index for vector search...")
+            }
+            if compactRequested {
+                print("Wax no longer exposes in-place compaction; rebuilding the derived index safely...")
+            } else if Self.hasBreachMarker(cckitDir: cckitDir) {
+                print("Wax breach marker found; rebuilding the derived index before opening it...")
             }
             if fm.fileExists(atPath: dbPath) {
                 try fm.removeItem(atPath: dbPath)
@@ -400,19 +358,17 @@ struct IndexCommand: AsyncParsableCommand {
             if fm.fileExists(atPath: waxPath) {
                 try fm.removeItem(atPath: waxPath)
             }
-            // Ask G: --clean must remove Wax's orphaned live-set rewrite
-            // candidates too; the 2026-08-27 rebuild left a 398 MB
-            // repo-liveset-<UUID>.wax behind that had to be deleted by hand.
-            if let entries = try? fm.contentsOfDirectory(atPath: cckitDir) {
-                for entry in entries where entry.hasPrefix("repo-liveset-") && entry.hasSuffix(".wax") {
-                    try? fm.removeItem(atPath: (cckitDir as NSString).appendingPathComponent(entry))
-                }
-            }
+            // Ask G: --clean must remove Wax's live-set rewrite residue —
+            // unpromoted candidates AND promotion backups; the arena they
+            // reference is being deleted, and the 2026-08-27 rebuild left a
+            // 398 MB repo-liveset-<UUID>.wax behind that had to be deleted
+            // by hand.
+            Self.sweepLiveSetResidue(cckitDir: cckitDir)
         }
         
         let db = try Database(path: dbPath)
         let bytesBeforeIndexing = Self.waxFileAllocatedBytes(at: waxPath)
-        let wax = try await WaxStore(path: waxPath)
+        let wax = try await WaxStore(path: waxPath, lease: waxLease)
         guard await wax.isAvailable(), await wax.hasEmbeddings() else {
             // Ask B: name the real cause instead of pointing operators at
             // resource bundles that were fine during the 186 GB incident.
@@ -427,87 +383,6 @@ struct IndexCommand: AsyncParsableCommand {
         let indexer = Indexer(db: db, wax: wax)
         let absolutePath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
 
-        if compactOnly {
-            print("Compacting Wax against SQLite symbols (no re-embed)...")
-            if Self.hasBreachMarker(cckitDir: cckitDir) {
-                // Armed by a prior bloat-vetoed compact: refusing keeps the
-                // loop from respawning itself into the same veto forever.
-                print(
-                    "Error: repo.wax remains over its live-set ceiling after a withheld compact " +
-                        "(breach marker present). Run 'cckit index . --clean' to rebuild from scratch."
-                )
-                throw ExitCode.failure
-            }
-            // Frame-level truth first: what compaction CAN see.
-            if let diag = try? await wax.storeDiagnostics() {
-                let bloatRatio = diag.expectedLiveBytes > 0
-                    ? Double(diag.allocatedBytes) / Double(diag.expectedLiveBytes)
-                    : 0
-                print(
-                    "WaxStorage file=\(diag.fileBytes)B materialized=\(diag.allocatedBytes)B " +
-                    "frames active=\(diag.activeFrameCount) deleted=\(diag.deletedFrameCount) superseded=\(diag.supersededFrameCount); " +
-                    "livePayload=\(diag.liveFramePayloadBytes)B deadPayload=\(diag.deadFramePayloadBytes)B " +
-                    "staleSegments=\(diag.staleSegmentBytes)B lex=\(diag.currentLexIndexBytes)B vec=\(diag.currentVecIndexBytes)B"
-                )
-                if bloatRatio >= 2.0 {
-                    // scanned == kept with a bloated file means the dead weight
-                    // is stale index segments, invisible to frame diffing.
-                    print(
-                        "Warning: repo.wax is \(String(format: "%.1f", bloatRatio))x its expected live size " +
-                        "(\(diag.allocatedBytes)B materialized vs ~\(diag.expectedLiveBytes)B); close-time live-set rewrite below is what actually reclaims."
-                    )
-                }
-            }
-            let result = try await indexer.compactWax()
-            print("Compact complete. Scanned: \(result.scanned), kept: \(result.kept), deleted: \(result.deleted)")
-            // Closing the store is what triggers Wax's close-time live-set
-            // rewrite (payload-level reclaim, frame-ID preserving). Snapshot
-            // expectations BEFORE close — diagnostics die with the handle —
-            // and stamp only afterwards so decisions use post-reclaim bytes.
-            let preCloseDiagnostics = try? await wax.storeDiagnostics()
-            try await wax.close()
-            let bytesAfter = Self.waxFileAllocatedBytes(at: waxPath)
-            // Stamp only real reclamations; a no-shrink stamp would latch bloat
-            // as the healthy watermark and hide future growth from MCP.
-            var stamped = try WaxCompactStamp.writeIfReclaimed(
-                cckitDir: cckitDir,
-                deleted: result.deleted,
-                bytesBefore: result.bytesBefore,
-                bytesAfter: bytesAfter
-            )
-            if !stamped {
-                if result.deleted > 0 {
-                    print(
-                        "Compaction stamp withheld: file did not shrink " +
-                        "(\(result.bytesBefore) → \(bytesAfter) bytes); growth stays visible to MCP."
-                    )
-                } else {
-                    print("Nothing to reclaim (deleted 0 frames); stamp withheld.")
-                }
-                // Self-heal a pre-cc164a8 latched watermark, converge a
-                // healthy-ratio grown store, or veto-and-arm when the arena
-                // still breaches its expected live size.
-                let restamped = try Self.settleWithheldCompactStamp(
-                    cckitDir: cckitDir,
-                    waxBytesAfter: bytesAfter,
-                    expectedLiveBytes: preCloseDiagnostics.map { Int(max(0, $0.expectedLiveBytes)) },
-                    reclaimableBytes: preCloseDiagnostics.map { Int(max(0, $0.reclaimableBytes)) }
-                )
-                if restamped { stamped = true }
-            }
-            let measured = WaxCompactResult(
-                scanned: result.scanned,
-                deleted: result.deleted,
-                kept: result.kept,
-                bytesBefore: result.bytesBefore,
-                bytesAfter: bytesAfter
-            )
-            print(Self.machineReadableLine(for: measured, stamped: stamped))
-            let duration = Int(Date().timeIntervalSince(startTime) * 1000)
-            try await actionOrchestrator.recordCLIAction(command: fullCommand, toolName: "index", durationMs: duration)
-            return
-        }
-
         if !excludeFolder.isEmpty || !includeFolder.isEmpty {
             var settings = ProjectSettings.load(projectRoot: absolutePath)
             settings.excludedFolders = Array(Set(settings.excludedFolders + excludeFolder)).sorted()
@@ -518,24 +393,15 @@ struct IndexCommand: AsyncParsableCommand {
         print("Indexing \(path)...")
         let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
 
-        // Circuit breaker, phase 1: force a live-set reclaim when the arena is
-        // far past its expected live size. Never verdicts here — reclaimed
-        // bytes only appear at close. Comparison uses allocated (materialized)
-        // bytes; Wax preallocates arenas sparsely.
-        if !mustRebuild {
-            try await enforceWaxBloatBreaker(wax, cckitDir: cckitDir)
-        } else {
+        if mustRebuild {
             Self.clearBreachMarker(cckitDir: cckitDir)
         }
 
-        // Ask F: mid-run growth cap. expectedLiveBytes comes from the
-        // pre-run snapshot (diagnostics die with the handle only at close —
-        // here the store is still open).
-        let preRunDiagnostics = try? await wax.storeDiagnostics()
+        // Keep a fresh-filesystem mid-run cap. Wax no longer exposes public
+        // live-byte diagnostics, and cckit no longer uses per-frame deletion.
         let arenaCap = Self.midRunArenaCap(
             mustRebuild: mustRebuild,
-            bytesBefore: bytesBeforeIndexing,
-            expectedLiveBytes: preRunDiagnostics.map { Int(max(0, $0.expectedLiveBytes)) }
+            bytesBefore: bytesBeforeIndexing
         )
 
         let compacted: WaxCompactResult
@@ -547,6 +413,7 @@ struct IndexCommand: AsyncParsableCommand {
                 includeBuildScripts: includeBuildScripts,
                 includeGenerated: includeGenerated,
                 maxArenaBytes: arenaCap,
+                forceWaxRebuild: mustRebuild,
                 delegate: CommandLineProgressDelegate(
                     emitProgress: InteractiveProgress.shouldEmitTTYProgress(stdoutIsTTY: stdoutIsTTY)
                 )
@@ -556,7 +423,7 @@ struct IndexCommand: AsyncParsableCommand {
             // refuses and points at --clean, using the same numbers the cap
             // just measured.
             if case .arenaGrowthCapExceeded(let allocated, _) = error {
-                let expected = max(1, max(bytesBeforeIndexing, preRunDiagnostics.map { Int(max(0, $0.expectedLiveBytes)) } ?? 0))
+                let expected = max(1, bytesBeforeIndexing)
                 Self.writeBreachMarker(
                     cckitDir: cckitDir,
                     allocatedBytes: UInt64(max(0, allocated)),
@@ -592,34 +459,18 @@ struct IndexCommand: AsyncParsableCommand {
             symbols: compacted.totalSymbols
         )
 
-        // Snapshot the breaker's inputs BEFORE close: close() releases the
-        // file handle, so post-close diagnostics are impossible. The live set
-        // is final at this point; only promotion changes materialized bytes.
-        let breakerSnapshot: StoreDiagnostics? = !mustRebuild
-            ? try? await wax.storeDiagnostics()
-            : nil
-
-        // Closing may trigger Wax's close-time live-set rewrite; measure and
-        // stamp against post-close bytes so decisions reflect reality.
+        // Close before final allocation accounting and residue cleanup.
         try await wax.close()
+        // Collect unpromoted rewrite candidates and stale promotion backups
+        // while we still hold the refresh lock (ask G: the rewrite leaves
+        // full arena duplicates behind on normal incremental runs too).
+        Self.sweepLiveSetResidue(cckitDir: cckitDir)
         let bytesAfterIndexing = Self.waxFileAllocatedBytes(at: waxPath)
 
-        // Circuit breaker, phase 2: judge this run's forced reclaim against
-        // the promoted file and arm (or clear) the fail-fast marker for the
-        // NEXT invocation.
-        if let snapshot = breakerSnapshot {
-            Self.settleWaxBreakerVerdict(
-                cckitDir: cckitDir,
-                snapshot: snapshot,
-                materializedAfterClose: Self.waxFileAllocatedBytes(at: waxPath)
-            )
-        }
-
         // Baseline stamps are only valid for stores built by construction
-        // (--clean / embedder rebuild), where every byte is live. On the
-        // incremental path a no-shrink stamp would latch bloat as healthy.
+        // (explicit or change-triggered rebuild), where every byte is live.
         let stamped: Bool
-        if mustRebuild {
+        if mustRebuild || compacted.rebuiltWax {
             try WaxCompactStamp.writeBaseline(cckitDir: cckitDir)
             stamped = true
         } else {
@@ -648,7 +499,8 @@ struct IndexCommand: AsyncParsableCommand {
                 bytesAfter: bytesAfterIndexing,
                 updated: compacted.updated,
                 skipped: compacted.skipped,
-                totalSymbols: compacted.totalSymbols
+                totalSymbols: compacted.totalSymbols,
+                rebuiltWax: compacted.rebuiltWax
             ),
             stamped: stamped
         ))

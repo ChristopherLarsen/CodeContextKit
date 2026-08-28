@@ -8,6 +8,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "cckit", targets: ["CodeContextKitCLI"]),
+        .executable(name: "wax-amplification-harness", targets: ["WaxAmplificationHarness"]),
         .library(name: "CodeContextKitCore", targets: ["CodeContextKitCore"]),
         .library(name: "CodeContextKitSwiftIndex", targets: ["CodeContextKitSwiftIndex"]),
         .library(name: "CodeContextKitKotlinIndex", targets: ["CodeContextKitKotlinIndex"]),
@@ -24,10 +25,17 @@ let package = Package(
         .package(url: "https://github.com/unum-cloud/usearch.git", from: "2.16.0"),
         .package(url: "https://github.com/tree-sitter/tree-sitter.git", from: "0.22.6"),
         .package(url: "https://github.com/tree-sitter-grammars/tree-sitter-kotlin.git", from: "1.1.0"),
-        .package(url: "https://github.com/ChristopherLarsen/Wax.git", revision: "d4de9d6a8af73b55b0fefe3a5786bab27f6d8cf1"),
+        .package(url: "https://github.com/ChristopherLarsen/Wax.git", revision: "3405b8c6ecf1dd0b6322936f1681ec8b480a3b08"),
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.3.0")
     ],
     targets: [
+        .executableTarget(
+            name: "WaxAmplificationHarness",
+            dependencies: [
+                .product(name: "Wax", package: "Wax")
+            ],
+            path: "Tools/WaxAmplificationHarness"
+        ),
         .executableTarget(
             name: "CodeContextKitCLI",
             dependencies: [
@@ -85,8 +93,7 @@ let package = Package(
                 "CodeContextKitCore",
                 "CodeContextKitStorage",
                 .product(name: "USearch", package: "usearch"),
-                .product(name: "Wax", package: "Wax"),
-                .product(name: "WaxVectorSearchMiniLM", package: "Wax")
+                .product(name: "Wax", package: "Wax")
             ]
         ),
         .target(
@@ -114,6 +121,10 @@ let package = Package(
         .testTarget(
             name: "CodeContextKitStorageTests",
             dependencies: ["CodeContextKitStorage"]
+        ),
+        .testTarget(
+            name: "CodeContextKitRetrievalTests",
+            dependencies: ["CodeContextKitRetrieval"]
         ),
         .testTarget(
             name: "CodeContextKitServerTests",
