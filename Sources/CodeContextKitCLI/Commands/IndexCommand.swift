@@ -48,20 +48,14 @@ struct IndexCommand: AsyncParsableCommand {
         help: """
             Index SQLite locators only — skip the Wax semantic arena entirely \
             (no embeddings, no ~18-minute rebuild, no repo.wax). Locators, map, \
-            and outline are unaffected; pack and vector search are unavailable \
-            while this is the exclusive mode. Also honors CCKIT_NO_SEMANTIC=1.
+            outline, and pack (locators-only) are unaffected; vector search is \
+            unavailable while this is the exclusive mode. Also honors \
+            CCKIT_NO_SEMANTIC=1. The mode persists via .cckit/lexical-only \
+            across later `cckit index` runs; set CCKIT_NO_SEMANTIC=0 to build \
+            the semantic arena again.
             """
     )
     var noSemantic: Bool = false
-
-    /// Lexical-only mode: explicit flag or the environment switch (so the MCP
-    /// shim and scripted setups can opt a repo out of arena builds).
-    static func lexicalOnlyRequested(flag: Bool) -> Bool {
-        if flag { return true }
-        guard let raw = getenv("CCKIT_NO_SEMANTIC") else { return false }
-        let value = String(cString: raw).trimmingCharacters(in: .whitespaces).lowercased()
-        return value == "1" || value == "true" || value == "yes"
-    }
 
     /// Bytes actually materialized on disk (st_blocks). Wax preallocates
     /// arenas sparsely, so growth detection must use this, not st_size.
@@ -379,7 +373,7 @@ struct IndexCommand: AsyncParsableCommand {
         let dbPath = "\(cckitDir)/index.sqlite"
         let waxPath = "\(cckitDir)/repo.wax"
         let fm = FileManager.default
-        let lexicalOnly = Self.lexicalOnlyRequested(flag: noSemantic)
+        let lexicalOnly = SemanticIndexPolicy.lexicalOnlyRequested(flag: noSemantic, cckitDir: cckitDir)
 
         // Hold a stable sidecar lease before inspecting or deleting repo.wax.
         // Wax locks the replaceable arena inode itself; that does not protect
@@ -569,11 +563,13 @@ struct IndexCommand: AsyncParsableCommand {
             }
         }
 
-        // The lexical-only marker persists the mode across processes so the
-        // MCP shim's auto-refresh spawns `index --no-semantic` instead of
-        // silently upgrading the repo to a full semantic build. Written only
-        // after the successful build (post-swap): last successful run wins.
-        let lexicalMarkerPath = (cckitDir as NSString).appendingPathComponent("lexical-only")
+        // The lexical-only marker persists the mode across processes (see
+        // SemanticIndexPolicy.lexicalOnlyRequested): the MCP shim's auto-refresh
+        // spawns `index --no-semantic` from it instead of silently upgrading the
+        // repo to a full semantic build, and every read (pack, search) honors it.
+        // Written only after the successful build (post-swap): last successful
+        // run wins.
+        let lexicalMarkerPath = SemanticIndexPolicy.lexicalOnlyMarkerPath(cckitDir: cckitDir)
         if lexicalOnly {
             try? Data("1\n".utf8).write(to: URL(fileURLWithPath: lexicalMarkerPath), options: .atomic)
         } else {

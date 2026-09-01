@@ -48,6 +48,31 @@ public enum SemanticIndexPolicy: Sendable {
         return parts.joined(separator: "\n")
     }
 
+    /// Path of the marker written after a successful lexical-only index run
+    /// (`.cckit/lexical-only`). The marker persists the mode across processes:
+    /// auto-refresh, pack, and search consult it so a deliberately lexical
+    /// repo is never silently upgraded back to an arena build.
+    public static func lexicalOnlyMarkerPath(cckitDir: String) -> String {
+        (cckitDir as NSString).appendingPathComponent("lexical-only")
+    }
+
+    /// Whether lexical-only mode applies to this invocation.
+    ///
+    /// Precedence: the explicit `--no-semantic` flag wins; then CCKIT_NO_SEMANTIC
+    /// (a recognized value in either direction — "1"/"true"/"yes" opts in, and an
+    /// explicit "0"/"false"/"no"/"off" overrides the persisted marker, which is
+    /// how a repo is upgraded back to a semantic build); then the marker written
+    /// by the last successful lexical index run ("last successful run wins").
+    public static func lexicalOnlyRequested(flag: Bool, cckitDir: String) -> Bool {
+        if flag { return true }
+        if let raw = getenv("CCKIT_NO_SEMANTIC") {
+            let value = String(cString: raw).trimmingCharacters(in: .whitespaces).lowercased()
+            if value == "1" || value == "true" || value == "yes" { return true }
+            if value == "0" || value == "false" || value == "no" || value == "off" { return false }
+        }
+        return FileManager.default.fileExists(atPath: lexicalOnlyMarkerPath(cckitDir: cckitDir))
+    }
+
     /// Identifier-shaped tokens embedded in prose or queries (CamelCase, snake_case).
     ///
     /// Used by pack for lexical SQLite hits. Vector fill is gated separately by

@@ -165,6 +165,75 @@ final class SemanticIndexPolicyTests: XCTestCase {
     }
 }
 
+/// Lexical-only mode precedence: explicit flag > CCKIT_NO_SEMANTIC (either
+/// direction) > the persisted `.cckit/lexical-only` marker.
+final class LexicalOnlyRequestedTests: XCTestCase {
+    private func withCckitDir(_ body: (String) throws -> Void) throws {
+        let dir = NSTemporaryDirectory() + "cckit-lexical-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(atPath: dir)
+            unsetenv("CCKIT_NO_SEMANTIC")
+        }
+        try body(dir)
+    }
+
+    private func writeMarker(_ cckitDir: String) throws {
+        try Data("1\n".utf8).write(
+            to: URL(fileURLWithPath: SemanticIndexPolicy.lexicalOnlyMarkerPath(cckitDir: cckitDir)),
+            options: .atomic
+        )
+    }
+
+    func testExplicitFlagWinsOverEverything() throws {
+        try withCckitDir { dir in
+            setenv("CCKIT_NO_SEMANTIC", "0", 1)
+            XCTAssertTrue(SemanticIndexPolicy.lexicalOnlyRequested(flag: true, cckitDir: dir))
+        }
+    }
+
+    func testEnvTrueOptsInWithoutMarker() throws {
+        try withCckitDir { dir in
+            setenv("CCKIT_NO_SEMANTIC", "1", 1)
+            XCTAssertTrue(SemanticIndexPolicy.lexicalOnlyRequested(flag: false, cckitDir: dir))
+        }
+    }
+
+    func testMarkerPersistsModeWithoutFlagOrEnv() throws {
+        try withCckitDir { dir in
+            try writeMarker(dir)
+            XCTAssertTrue(SemanticIndexPolicy.lexicalOnlyRequested(flag: false, cckitDir: dir))
+        }
+    }
+
+    func testNoMarkerNoFlagNoEnvIsSemantic() throws {
+        try withCckitDir { dir in
+            XCTAssertFalse(SemanticIndexPolicy.lexicalOnlyRequested(flag: false, cckitDir: dir))
+        }
+    }
+
+    func testExplicitEnvFalseOverridesMarkerForUpgradePath() throws {
+        try withCckitDir { dir in
+            try writeMarker(dir)
+            for value in ["0", "false", "no", "off"] {
+                setenv("CCKIT_NO_SEMANTIC", value, 1)
+                XCTAssertFalse(
+                    SemanticIndexPolicy.lexicalOnlyRequested(flag: false, cckitDir: dir),
+                    "CCKIT_NO_SEMANTIC=\(value) must override the marker"
+                )
+            }
+        }
+    }
+
+    func testUnrecognizedEnvValueDoesNotOverrideMarker() throws {
+        try withCckitDir { dir in
+            try writeMarker(dir)
+            setenv("CCKIT_NO_SEMANTIC", "maybe", 1)
+            XCTAssertTrue(SemanticIndexPolicy.lexicalOnlyRequested(flag: false, cckitDir: dir))
+        }
+    }
+}
+
 /// Verifies natural-language semantic search returns meaning matches, not only BM25 keyword hits.
 final class SemanticSearchTests: XCTestCase {
     func testNaturalLanguageQueryFindsAuthRefreshWithoutKeywordOverlap() async throws {

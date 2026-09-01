@@ -34,51 +34,71 @@ struct SearchCommand: AsyncParsableCommand {
         let startTime = Date()
         let dbPath = ".cckit/index.sqlite"
         let waxPath = ".cckit/repo.wax"
-        
+
         guard FileManager.default.fileExists(atPath: dbPath) else {
             print("Error: Index not found. Run 'cckit index' first.")
             throw ExitCode.failure
         }
 
+        // A lexical-only repo has no arena by design: reads answer from
+        // SQLite locators, and the Wax gate must not tell operators to
+        // "finish the rebuild" of an arena that was deliberately never built.
+        let lexicalOnly = SemanticIndexPolicy.lexicalOnlyRequested(flag: false, cckitDir: ".cckit")
+
         let route: SearchRoute = vector
             ? .vector(SearchRoute.strippedQuery(query))
             : SearchRoute.resolveCLI(query)
-        let db = try Database(path: dbPath)
-        let wax = try await WaxStore(path: waxPath)
-
-        // Read-path integrity gate. Vector reads must never answer from a
-        // truncated or unfinished arena — their `0 results` reads as a
-        // confident negative. Lexical reads answer from SQLite (still real),
-        // so they carry the fault as a warning instead of failing.
-        let gate = await WaxReadGate.evaluate(waxPath: waxPath, cckitDir: ".cckit", db: db, wax: wax)
         let isVectorRoute: Bool
         if case .vector = route {
             isVectorRoute = true
         } else {
             isVectorRoute = false
         }
-        if isVectorRoute, let fault = gate.hardFault {
+        if lexicalOnly && isVectorRoute {
+            print("Error: This repo is indexed lexical-only (no semantic arena); vector search is unavailable. Run 'CCKIT_NO_SEMANTIC=0 cckit index .' to build one.")
+            throw ExitCode.failure
+        }
+
+        let db = try Database(path: dbPath)
+        // Skip opening the arena entirely in lexical-only mode: opening Wax
+        // on a missing repo.wax creates an empty arena as a side effect.
+        let wax: WaxStore? = lexicalOnly ? nil : try await WaxStore(path: waxPath)
+
+        // Read-path integrity gate. Vector reads must never answer from a
+        // truncated or unfinished arena — their `0 results` reads as a
+        // confident negative. Lexical reads answer from SQLite (still real),
+        // so they carry the fault as a warning instead of failing. Evaluated
+        // only when an arena exists (see lexical-only above).
+        var hardFault: WaxReadGate.Fault?
+        var breachWarning: String?
+        if let wax {
+            let gate = await WaxReadGate.evaluate(waxPath: waxPath, cckitDir: ".cckit", db: db, wax: wax)
+            hardFault = gate.hardFault
+            breachWarning = gate.breachWarning
+        }
+        if isVectorRoute, let fault = hardFault {
             print("Error: \(fault.localizedDescription)")
             throw ExitCode.failure
         }
-        if let warning = gate.breachWarning {
+        if let warning = breachWarning {
             InteractiveProgress.write("Warning: \(warning)\n", to: .standardError)
         }
-        if !isVectorRoute, let fault = gate.hardFault {
+        if !isVectorRoute, let fault = hardFault {
             InteractiveProgress.write("Warning: \(fault.localizedDescription)\n", to: .standardError)
         }
         if isVectorRoute {
+            guard let wax else { throw ExitCode.failure }
             try await requireVectorReady(wax: wax)
         }
 
-        let actionOrchestrator = ActionOrchestrator(wax: wax)
+        let actionOrchestrator = wax.map { ActionOrchestrator(wax: $0) } ?? ActionOrchestrator(repoRoot: ".")
 
         if json {
             var results = try await performUnifiedSearch(db: db, wax: wax, route: route)
-            if let fault = gate.hardFault {
+            if let fault = hardFault {
                 results["arenaFault"] = fault.localizedDescription
             }
-            if let warning = gate.breachWarning {
+            if let warning = breachWarning {
                 results["breachWarning"] = warning
             }
             let data = try JSONSerialization.data(withJSONObject: results, options: .prettyPrinted)
@@ -88,17 +108,20 @@ struct SearchCommand: AsyncParsableCommand {
         } else {
             try await runInteractiveSearch(db: db, wax: wax, route: route)
         }
-        
+
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
         let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
         try await actionOrchestrator.recordCLIAction(command: fullCommand, toolName: "search", durationMs: duration)
-        
-        try await wax.close()
+
+        try? await wax?.close()
     }
 
-    private func performUnifiedSearch(db: Database, wax: WaxStore, route: SearchRoute) async throws -> [String: Any] {
+    private func performUnifiedSearch(db: Database, wax: WaxStore?, route: SearchRoute) async throws -> [String: Any] {
         switch route {
         case .vector(let semanticQuery):
+            guard let wax else {
+                return ["error": "No semantic arena (lexical-only index); vector search unavailable."]
+            }
             var payload = try await vectorPayload(db: db, wax: wax, query: semanticQuery)
             if strict {
                 payload["warning"] = "strict_ignored"
@@ -115,7 +138,7 @@ struct SearchCommand: AsyncParsableCommand {
                 : []
 
             let useful = !files.isEmpty || !symbols.isEmpty || !textMatches.isEmpty
-            if !useful && allowVectorFallback {
+            if !useful && allowVectorFallback, let wax {
                 try await requireVectorReady(wax: wax)
                 var payload = try await vectorPayload(db: db, wax: wax, query: pattern)
                 payload["fallback"] = "vector"
@@ -131,16 +154,20 @@ struct SearchCommand: AsyncParsableCommand {
             if includeGrep {
                 results["textMatches"] = textMatches
             }
+            if !useful && allowVectorFallback {
+                results["message"] = "No AND lexical matches; vector fallback is unavailable on a lexical-only index."
+            }
             return results
         }
     }
 
-    private func runInteractiveSearch(db: Database, wax: WaxStore, route: SearchRoute) async throws {
+    private func runInteractiveSearch(db: Database, wax: WaxStore?, route: SearchRoute) async throws {
         switch route {
         case .vector(let semanticQuery):
             if strict {
                 print("Warning: --strict is ignored for vector meaning search (applies to lexical match only).")
             }
+            guard let wax else { throw ExitCode.failure }
             try await printVectorResults(db: db, wax: wax, query: semanticQuery)
 
         case .lexical(let pattern, let includeGrep, let allowVectorFallback):
@@ -177,9 +204,13 @@ struct SearchCommand: AsyncParsableCommand {
 
             let useful = !files.isEmpty || !symbols.isEmpty || (includeGrep && !textEmpty)
             if !useful && allowVectorFallback {
-                print("No AND lexical matches; falling back to semantic search...")
-                try await requireVectorReady(wax: wax)
-                try await printVectorResults(db: db, wax: wax, query: pattern)
+                if let wax {
+                    print("No AND lexical matches; falling back to semantic search...")
+                    try await requireVectorReady(wax: wax)
+                    try await printVectorResults(db: db, wax: wax, query: pattern)
+                } else {
+                    print("No AND lexical matches; vector fallback is unavailable on a lexical-only index.")
+                }
             } else if !useful {
                 print("No file or symbol matches for '\(pattern)'.")
             }

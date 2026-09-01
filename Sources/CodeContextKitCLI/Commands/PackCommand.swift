@@ -62,19 +62,48 @@ struct PackCommand: AsyncParsableCommand {
     )
     var noSemantic: Bool = false
 
+    /// A failure that carries its operator-facing reason into the ledger row
+    /// (ExitCode alone records only `ExitCode(rawValue: 1)`).
+    struct PackFailure: LocalizedError {
+        let reason: String
+        public var errorDescription: String? { reason }
+    }
+
     func run() async throws {
         let startTime = Date()
+        let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
+        // Every terminal state leaves exactly one ledger row (mirrors index):
+        // failed packs used to vanish, silently lowing every call count,
+        // failure rate, and savings number derived from action_history.jsonl.
+        let ledger = ActionOrchestrator(repoRoot: ".")
+        do {
+            try await runPack(startTime: startTime, fullCommand: fullCommand, ledger: ledger)
+        } catch {
+            let duration = Int(Date().timeIntervalSince(startTime) * 1000)
+            let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            try? await ledger.recordCLIAction(
+                command: fullCommand,
+                toolName: "pack",
+                durationMs: duration,
+                status: "failed",
+                response: String(reason.prefix(2000))
+            )
+            throw error
+        }
+    }
+
+    private func runPack(startTime: Date, fullCommand: String, ledger: ActionOrchestrator) async throws {
         let dbPath = ".cckit/index.sqlite"
         let waxPath = ".cckit/repo.wax"
-        let lexicalOnly = noSemantic
+        let lexicalOnly = SemanticIndexPolicy.lexicalOnlyRequested(flag: noSemantic, cckitDir: ".cckit")
         guard lexicalOnly || FileManager.default.fileExists(atPath: waxPath) else {
             print("Error: Index not found. Run 'cckit index' first (or pass --no-semantic for a lexical-only index).")
-            throw ExitCode.failure
+            throw PackFailure(reason: "Index not found. Run 'cckit index' first (or pass --no-semantic for a lexical-only index).")
         }
 
         guard FileManager.default.fileExists(atPath: dbPath) else {
             print("Error: Index not found. Run 'cckit index' first.")
-            throw ExitCode.failure
+            throw PackFailure(reason: "Index not found. Run 'cckit index' first.")
         }
 
         if !lexicalOnly {
@@ -82,7 +111,7 @@ struct PackCommand: AsyncParsableCommand {
                 try WaxEmbedderIdentity.requireCurrent()
             } catch {
                 print("Error: \(error.localizedDescription)")
-                throw ExitCode.failure
+                throw PackFailure(reason: error.localizedDescription)
             }
         }
 
@@ -94,7 +123,7 @@ struct PackCommand: AsyncParsableCommand {
                 try await wax.requireEmbeddings()
             } catch {
                 print("Error: \(error.localizedDescription)")
-                throw ExitCode.failure
+                throw PackFailure(reason: error.localizedDescription)
             }
 
             // Read-path integrity gate: the store opening is not proof it is
@@ -104,7 +133,7 @@ struct PackCommand: AsyncParsableCommand {
             let gate = await WaxReadGate.evaluate(waxPath: waxPath, cckitDir: ".cckit", db: db, wax: wax)
             if let fault = gate.hardFault {
                 print("Error: \(fault.localizedDescription)")
-                throw ExitCode.failure
+                throw PackFailure(reason: fault.localizedDescription)
             }
             if let warning = gate.breachWarning {
                 InteractiveProgress.write("Warning: \(warning)\n", to: .standardError)
@@ -112,15 +141,17 @@ struct PackCommand: AsyncParsableCommand {
             breachWarning = gate.breachWarning
         }
 
-        let actionOrchestrator = ActionOrchestrator(repoRoot: ".")
+        let actionOrchestrator = ledger
         let packer = ContextPacker(db: db, wax: wax, rootPath: ".")
         if full && surgical {
-            print("Error: use either --full or --surgical, not both.")
-            throw ExitCode.failure
+            let reason = "use either --full or --surgical, not both."
+            print("Error: \(reason)")
+            throw PackFailure(reason: reason)
         }
         if preview && (full || surgical) {
-            print("Error: --preview cannot be combined with --full or --surgical.")
-            throw ExitCode.failure
+            let reason = "--preview cannot be combined with --full or --surgical."
+            print("Error: \(reason)")
+            throw PackFailure(reason: reason)
         }
         let mode: PackMode = preview ? .preview : (full ? .full : (surgical ? .surgical : .auto))
 
@@ -152,13 +183,6 @@ struct PackCommand: AsyncParsableCommand {
         }
 
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
-        let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
-        try await actionOrchestrator.recordCLIAction(
-            command: fullCommand,
-            toolName: "pack",
-            durationMs: duration,
-            tokensUsed: result.deliveredTokens
-        )
 
         // Preview is a routing aid (map + names), not a compressed delivery —
         // comparing it against whole-file baselines produces fake negatives.
@@ -245,6 +269,15 @@ struct PackCommand: AsyncParsableCommand {
                 }
             }
         }
+        // Success-path ledger row, recorded only after the packet has been
+        // delivered — every throw before this point lands in run()'s catch
+        // as a `failed` row, so each call leaves exactly one row.
+        try? await actionOrchestrator.recordCLIAction(
+            command: fullCommand,
+            toolName: "pack",
+            durationMs: duration,
+            tokensUsed: result.deliveredTokens
+        )
         if let wax {
             try? await wax.close()
         }

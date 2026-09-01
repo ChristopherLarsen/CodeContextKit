@@ -93,7 +93,12 @@ public struct CodeContextServer: Sendable {
                 fields["breachWarning"] = WaxStore.breachWarningText(for: marker)
             }
             let uncovered = (try? db.uncoveredWaxFilePaths()) ?? []
-            let existing = uncovered.filter { FileManager.default.fileExists(atPath: $0) }
+            // A lexical-only repo has no arena by design; uncovered keep-set
+            // paths there would falsely diagnose "rebuild incomplete" on a
+            // healthy index.
+            let existing = SemanticIndexPolicy.lexicalOnlyRequested(flag: false, cckitDir: ".cckit")
+                ? []
+                : uncovered.filter { FileManager.default.fileExists(atPath: $0) }
             if let fault = WaxReadGate.hardFault(
                 allocatedBytes: await wax.allocatedBytes(),
                 expectedAllocatedBytes: WaxCompactStamp.readWatermark(cckitDir: ".cckit")?.waxBytes ?? 0,
