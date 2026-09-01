@@ -144,9 +144,12 @@ public struct IndexFreshness: Sendable, Equatable {
         process.standardError = Pipe()
         do {
             try process.run()
+            // Drain to EOF before waiting; the reverse order deadlocks once
+            // output exceeds the ~64 KB pipe buffer.
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             guard process.terminationStatus == 0 else { return nil }
-            return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+            return String(data: data, encoding: .utf8)
         } catch {
             return nil
         }

@@ -156,6 +156,48 @@ final class PackSavingsLedgerTests: XCTestCase {
         let record = try decoder.decode(ActionRecord.self, from: Data(json.utf8))
         XCTAssertEqual(record.tokensUsed, 10)
         XCTAssertEqual(record.sourceWholeFileTokens, 0)
+        XCTAssertEqual(record.baselineTokens, 99, "the legacy field must decode, not vanish")
+
+        // Rows without the field decode as nil; new rows round-trip it.
+        let legacy = """
+        {"id":2,"prompt":"cckit find-symbol Y","toolName":"find-symbol","type":"cli","tokensUsed":5,"durationMs":1,"status":"completed","timestamp":"2026-08-12T12:00:00Z"}
+        """
+        let unmeasured = try decoder.decode(ActionRecord.self, from: Data(legacy.utf8))
+        XCTAssertNil(unmeasured.baselineTokens)
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(unmeasured)
+        let roundTripped = try decoder.decode(ActionRecord.self, from: data)
+        XCTAssertNil(roundTripped.baselineTokens)
+    }
+
+    /// Failed index runs must leave a trace: the embeddings guard used to
+    /// throw before the recorder existed, so 11 of 12 runs vanished from the
+    /// ledger and biased every effectiveness measurement taken from it.
+    func testFailedIndexAttemptIsRecorded() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cckit-ledger-fail-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let history = ActionHistoryStore(
+            fileURL: dir.appendingPathComponent(".cckit").appendingPathComponent(ActionHistoryStore.fileName))
+        let orchestrator = ActionOrchestrator(repoRoot: dir.path)
+
+        try await orchestrator.recordCLIAction(
+            command: "cckit index .",
+            toolName: "index",
+            durationMs: 4210,
+            status: "failed",
+            response: "Error: Failed to open MiniLM semantic store"
+        )
+
+        let entries = try history.loadEntries()
+        let row = try XCTUnwrap(entries.first, "a failed attempt must not vanish")
+        XCTAssertEqual(row.status, "failed")
+        XCTAssertEqual(row.toolName, "index")
+        XCTAssertTrue(row.response?.contains("MiniLM") == true)
+        XCTAssertEqual(row.durationMs, 4210)
     }
 
     func testTokensAvoidedVersusSourceFileIsSigned() {

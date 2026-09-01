@@ -131,11 +131,15 @@ public struct ActionRecord: Codable, Hashable, Sendable {
     public var updated: Int?
     public var skipped: Int?
     public var symbols: Int?
+    /// Ripgrep-equivalent lexical baseline for locator calls (find-symbol,
+    /// find-references). `-1` = unmeasured (rg unavailable); `0` = measured
+    /// zero — the sentinel keeps "no baseline" from masquerading as savings.
+    public var baselineTokens: Int?
 
     enum CodingKeys: String, CodingKey {
         case id, prompt, toolName, type, tokensUsed, sourceWholeFileTokens
         case durationMs, status, timestamp, response
-        case updated, skipped, symbols
+        case updated, skipped, symbols, baselineTokens
     }
 
     public init(
@@ -151,7 +155,8 @@ public struct ActionRecord: Codable, Hashable, Sendable {
         response: String? = nil,
         updated: Int? = nil,
         skipped: Int? = nil,
-        symbols: Int? = nil
+        symbols: Int? = nil,
+        baselineTokens: Int? = nil
     ) {
         self.id = id
         self.prompt = prompt
@@ -166,6 +171,7 @@ public struct ActionRecord: Codable, Hashable, Sendable {
         self.updated = updated
         self.skipped = skipped
         self.symbols = symbols
+        self.baselineTokens = baselineTokens
     }
 
     public init(from decoder: Decoder) throws {
@@ -183,6 +189,25 @@ public struct ActionRecord: Codable, Hashable, Sendable {
         updated = try c.decodeIfPresent(Int.self, forKey: .updated)
         skipped = try c.decodeIfPresent(Int.self, forKey: .skipped)
         symbols = try c.decodeIfPresent(Int.self, forKey: .symbols)
+        baselineTokens = try c.decodeIfPresent(Int.self, forKey: .baselineTokens)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(id, forKey: .id)
+        try c.encode(prompt, forKey: .prompt)
+        try c.encodeIfPresent(toolName, forKey: .toolName)
+        try c.encode(type, forKey: .type)
+        try c.encode(tokensUsed, forKey: .tokensUsed)
+        try c.encode(sourceWholeFileTokens, forKey: .sourceWholeFileTokens)
+        try c.encode(durationMs, forKey: .durationMs)
+        try c.encode(status, forKey: .status)
+        try c.encode(timestamp, forKey: .timestamp)
+        try c.encodeIfPresent(response, forKey: .response)
+        try c.encodeIfPresent(updated, forKey: .updated)
+        try c.encodeIfPresent(skipped, forKey: .skipped)
+        try c.encodeIfPresent(symbols, forKey: .symbols)
+        try c.encodeIfPresent(baselineTokens, forKey: .baselineTokens)
     }
 
     /// Tokens avoided versus whole files already loaded for this call.

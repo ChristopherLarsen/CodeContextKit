@@ -43,6 +43,26 @@ struct IndexCommand: AsyncParsableCommand {
     @Flag(help: "Include generated Gradle/Kotlin source directories.")
     var includeGenerated: Bool = false
 
+    @Flag(
+        name: .long,
+        help: """
+            Index SQLite locators only — skip the Wax semantic arena entirely \
+            (no embeddings, no ~18-minute rebuild, no repo.wax). Locators, map, \
+            and outline are unaffected; pack and vector search are unavailable \
+            while this is the exclusive mode. Also honors CCKIT_NO_SEMANTIC=1.
+            """
+    )
+    var noSemantic: Bool = false
+
+    /// Lexical-only mode: explicit flag or the environment switch (so the MCP
+    /// shim and scripted setups can opt a repo out of arena builds).
+    static func lexicalOnlyRequested(flag: Bool) -> Bool {
+        if flag { return true }
+        guard let raw = getenv("CCKIT_NO_SEMANTIC") else { return false }
+        let value = String(cString: raw).trimmingCharacters(in: .whitespaces).lowercased()
+        return value == "1" || value == "true" || value == "yes"
+    }
+
     /// Bytes actually materialized on disk (st_blocks). Wax preallocates
     /// arenas sparsely, so growth detection must use this, not st_size.
     /// Supersedes the apparent-size reader; one measurement for all callers.
@@ -287,8 +307,6 @@ struct IndexCommand: AsyncParsableCommand {
     func run() async throws {
         let startTime = Date()
         let cckitDir = ".cckit"
-        let dbPath = "\(cckitDir)/index.sqlite"
-        let waxPath = "\(cckitDir)/repo.wax"
         let fm = FileManager.default
 
         try fm.createDirectory(atPath: cckitDir, withIntermediateDirectories: true)
@@ -316,19 +334,72 @@ struct IndexCommand: AsyncParsableCommand {
         }
         defer { lock.release() }
 
+        // Every terminal state leaves exactly one ledger row. Failed index
+        // runs used to vanish (the embeddings guard threw before the recorder
+        // existed), silently biasing every effectiveness measurement taken
+        // from action_history.jsonl — including "11 failures, 1 success".
+        let ledger = ActionOrchestrator(repoRoot: ".")
+        do {
+            try await runIndex(
+                cckitDir: cckitDir,
+                fullCommand: fullCommand,
+                startTime: startTime,
+                ledger: ledger
+            )
+        } catch {
+            let duration = Int(Date().timeIntervalSince(startTime) * 1000)
+            let reason = String(describing: error)
+            try? await ledger.recordCLIAction(
+                command: fullCommand,
+                toolName: "index",
+                durationMs: duration,
+                status: "failed",
+                response: String(reason.prefix(2000))
+            )
+            throw error
+        }
+    }
+
+
+    /// A failure that carries its operator-facing reason into the ledger row
+    /// (ExitCode alone records only `ExitCode(rawValue: 1)`).
+    struct IndexFailure: LocalizedError {
+        let reason: String
+        public var errorDescription: String? { reason }
+    }
+
+    /// Snapshot-swap support lives in `IndexSwap` (CodeContextKitContext) so
+    /// it is testable and shared.
+    private func runIndex(
+        cckitDir: String,
+        fullCommand: String,
+        startTime: Date,
+        ledger: ActionOrchestrator
+    ) async throws {
+        let dbPath = "\(cckitDir)/index.sqlite"
+        let waxPath = "\(cckitDir)/repo.wax"
+        let fm = FileManager.default
+        let lexicalOnly = Self.lexicalOnlyRequested(flag: noSemantic)
+
         // Hold a stable sidecar lease before inspecting or deleting repo.wax.
         // Wax locks the replaceable arena inode itself; that does not protect
-        // against a long-lived server writing an unlinked old inode.
-        let waxLease: RefreshLock.Lease
-        do {
-            waxLease = try WaxStore.acquireLease(for: waxPath)
-        } catch {
-            print("Error: \(error.localizedDescription)")
-            throw ExitCode.failure
+        // against a long-lived server writing an unlinked old inode. Lexical
+        // runs never touch the arena, so they need no arena lease.
+        let waxLease: RefreshLock.Lease?
+        if lexicalOnly {
+            waxLease = nil
+        } else {
+            do {
+                waxLease = try WaxStore.acquireLease(for: waxPath)
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                throw IndexFailure(reason: "arena lease unavailable: \(error.localizedDescription)")
+            }
         }
+        defer { waxLease?.release() }
 
-        let storedEmbedderId = WaxEmbedderIdentity.storedId(cckitDir: cckitDir)
-        let embedderMismatch = storedEmbedderId != WaxEmbedderIdentity.current
+        let storedEmbedderId = lexicalOnly ? nil : WaxEmbedderIdentity.storedId(cckitDir: cckitDir)
+        let embedderMismatch = !lexicalOnly && storedEmbedderId != WaxEmbedderIdentity.current
         let compactRequested = compact && !clean
 
         if compactRequested {
@@ -337,16 +408,24 @@ struct IndexCommand: AsyncParsableCommand {
                 throw ExitCode.failure
             }
         }
+        if lexicalOnly && compact {
+            print("Error: --compact rebuilds the semantic arena; incompatible with --no-semantic.")
+            throw IndexFailure(reason: "--compact is incompatible with --no-semantic")
+        }
 
         // Current Wax exposes neither in-place maintenance nor batch deletion.
         // A clean replacement is the only bounded cckit-owned compaction path.
         let hasExistingIndex = fm.fileExists(atPath: waxPath) || fm.fileExists(atPath: dbPath)
-        let mustRebuild = clean
-            || compactRequested
-            || Self.hasBreachMarker(cckitDir: cckitDir)
-            || (embedderMismatch && hasExistingIndex)
+        // Breach markers and embedder mismatches are semantic concerns; a
+        // lexical-only run must not nuke SQLite over them.
+        let mustRebuild = lexicalOnly
+            ? clean
+            : clean
+                || compactRequested
+                || Self.hasBreachMarker(cckitDir: cckitDir)
+                || (embedderMismatch && hasExistingIndex)
 
-        if mustRebuild {
+        if mustRebuild && !lexicalOnly {
             if embedderMismatch && !clean {
                 print("Semantic embedder changed (\(storedEmbedderId ?? "none") → \(WaxEmbedderIdentity.current)); rebuilding index for vector search...")
             }
@@ -355,34 +434,58 @@ struct IndexCommand: AsyncParsableCommand {
             } else if Self.hasBreachMarker(cckitDir: cckitDir) {
                 print("Wax breach marker found; rebuilding the derived index before opening it...")
             }
-            if fm.fileExists(atPath: dbPath) {
-                try fm.removeItem(atPath: dbPath)
-            }
-            if fm.fileExists(atPath: waxPath) {
-                try fm.removeItem(atPath: waxPath)
-            }
-            // Ask G: --clean must remove Wax's live-set rewrite residue —
-            // unpromoted candidates AND promotion backups; the arena they
-            // reference is being deleted, and the 2026-08-27 rebuild left a
-            // 398 MB repo-liveset-<UUID>.wax behind that had to be deleted
-            // by hand.
-            Self.sweepLiveSetResidue(cckitDir: cckitDir)
         }
-        
-        let db = try Database(path: dbPath)
+
+        // Snapshot rebuild: build db (+ arena) in a staging directory while
+        // the live index keeps serving complete, consistent reads. Band- and
+        // breach-driven rebuilds used to mutate index.sqlite in place for the
+        // full ~18-minute build; --clean deleted both stores up front, taking
+        // every tool down. Now nothing live is touched until the atomic swap.
+        let stagingDir = "\(cckitDir)/staging"
+        if mustRebuild {
+            try? fm.removeItem(atPath: stagingDir)
+            try fm.createDirectory(atPath: stagingDir, withIntermediateDirectories: true)
+        }
+        let buildDbPath = mustRebuild ? "\(stagingDir)/index.sqlite" : dbPath
+        let buildWaxPath = mustRebuild ? "\(stagingDir)/repo.wax" : waxPath
+
+        let db = try Database(path: buildDbPath)
         let bytesBeforeIndexing = Self.waxFileAllocatedBytes(at: waxPath)
-        let wax = try await WaxStore(path: waxPath, lease: waxLease)
-        guard await wax.isAvailable(), await wax.hasEmbeddings() else {
-            // Ask B: name the real cause instead of pointing operators at
-            // resource bundles that were fine during the 186 GB incident.
-            var message = "Error: Failed to open MiniLM semantic store at \(waxPath)."
-            if let openError = await wax.lastOpenError {
-                message += " Cause: \(openError)"
+
+        var stagingWaxLease: RefreshLock.Lease?
+        var wax: WaxStore?
+        // Backstop for the throw paths below; the success path releases this
+        // explicitly before the swap. release() is idempotent.
+        defer { stagingWaxLease?.release() }
+        if !lexicalOnly {
+            do {
+                if mustRebuild {
+                    // Staged build: the staging arena needs its own lease; the
+                    // live lease stays held so concurrent writers stay out.
+                    stagingWaxLease = try WaxStore.acquireLease(for: buildWaxPath)
+                    wax = try await WaxStore(path: buildWaxPath, lease: stagingWaxLease!)
+                } else {
+                    // Same path as the live arena — reuse the live lease; a
+                    // second flock on the same file deadlocks even in-process.
+                    wax = try await WaxStore(path: buildWaxPath, lease: waxLease!)
+                }
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                throw IndexFailure(reason: "semantic store failed to open: \(error.localizedDescription)")
             }
-            print(message)
-            throw ExitCode.failure
         }
-        let actionOrchestrator = ActionOrchestrator(wax: wax)
+        if let wax {
+            guard await wax.isAvailable(), await wax.hasEmbeddings() else {
+                // Ask B: name the real cause instead of pointing operators at
+                // resource bundles that were fine during the 186 GB incident.
+                var message = "Error: Failed to open MiniLM semantic store at \(buildWaxPath)."
+                if let openError = await wax.lastOpenError {
+                    message += " Cause: \(openError)"
+                }
+                print(message)
+                throw IndexFailure(reason: message)
+            }
+        }
         let indexer = Indexer(db: db, wax: wax)
         let absolutePath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
 
@@ -392,13 +495,9 @@ struct IndexCommand: AsyncParsableCommand {
             settings.includedFolders = Array(Set(settings.includedFolders + includeFolder)).sorted()
             try settings.save(projectRoot: absolutePath)
         }
-        
-        print("Indexing \(path)...")
-        let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
 
-        if mustRebuild {
-            Self.clearBreachMarker(cckitDir: cckitDir)
-        }
+        print("Indexing \(path)\(lexicalOnly ? " (lexical-only)" : "")...")
+        let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
 
         // Keep a fresh-filesystem mid-run cap. Wax no longer exposes public
         // live-byte diagnostics, and cckit no longer uses per-frame deletion.
@@ -425,7 +524,7 @@ struct IndexCommand: AsyncParsableCommand {
             // The cap tripped mid-run: arm the breach marker so the next run
             // refuses and points at --clean, using the same numbers the cap
             // just measured.
-            if case .arenaGrowthCapExceeded(let allocated, _) = error {
+            if case .arenaGrowthCapExceeded(let allocated, _) = error, !lexicalOnly {
                 let expected = max(1, bytesBeforeIndexing)
                 Self.writeBreachMarker(
                     cckitDir: cckitDir,
@@ -441,19 +540,57 @@ struct IndexCommand: AsyncParsableCommand {
             throw error
         }
 
-        try WaxEmbedderIdentity.writeSidecar(cckitDir: cckitDir)
-        if let stamp = IndexFreshness.captureStamp(repoRoot: absolutePath) {
-            try stamp.write(cckitDir: cckitDir)
-        } else if let stamp = IndexFreshness.captureStamp(repoRoot: path) {
-            // Fall back when absolutePath isn't a git root but `path` is cwd.
-            try stamp.write(cckitDir: cckitDir)
+        // Close staging stores before the swap so no handle outlives the
+        // inode it built.
+        if let wax {
+            try await wax.close()
         }
+        stagingWaxLease?.release()
+        stagingWaxLease = nil
+        try db.close()
+
+        if mustRebuild {
+            try IndexSwap.swapBuildIntoPlace(
+                cckitDir: cckitDir,
+                stagingDir: stagingDir,
+                dbPath: dbPath,
+                waxPath: waxPath,
+                includeWax: !lexicalOnly
+            )
+            // The live store was breaching until this moment; only a
+            // completed swap retires the marker.
+            if !lexicalOnly {
+                Self.clearBreachMarker(cckitDir: cckitDir)
+            }
+            if clean && lexicalOnly {
+                // Lexical --clean drops the arena outright; it is never
+                // rebuilt until a semantic run is requested.
+                try? fm.removeItem(atPath: waxPath)
+            }
+        }
+
+        // The lexical-only marker persists the mode across processes so the
+        // MCP shim's auto-refresh spawns `index --no-semantic` instead of
+        // silently upgrading the repo to a full semantic build. Written only
+        // after the successful build (post-swap): last successful run wins.
+        let lexicalMarkerPath = (cckitDir as NSString).appendingPathComponent("lexical-only")
+        if lexicalOnly {
+            try? Data("1\n".utf8).write(to: URL(fileURLWithPath: lexicalMarkerPath), options: .atomic)
+        } else {
+            try? fm.removeItem(atPath: lexicalMarkerPath)
+        }
+
+        // Collect unpromoted rewrite candidates and stale promotion backups
+        // while we still hold the refresh lock (ask G: the rewrite leaves
+        // full arena duplicates behind on normal incremental runs too).
+        Self.sweepLiveSetResidue(cckitDir: cckitDir)
+        let bytesAfterIndexing = Self.waxFileAllocatedBytes(at: waxPath)
 
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
         // Ask H: persist the run's counts. The 21-minute 186 GB run recorded
         // only durationMs — there was no way to tell whether it re-embedded
         // the corpus or skipped it.
-        try await actionOrchestrator.recordCLIAction(
+        try? await ledger.recordCLIAction(
             command: fullCommand,
             toolName: "index",
             durationMs: duration,
@@ -462,18 +599,23 @@ struct IndexCommand: AsyncParsableCommand {
             symbols: compacted.totalSymbols
         )
 
-        // Close before final allocation accounting and residue cleanup.
-        try await wax.close()
-        // Collect unpromoted rewrite candidates and stale promotion backups
-        // while we still hold the refresh lock (ask G: the rewrite leaves
-        // full arena duplicates behind on normal incremental runs too).
-        Self.sweepLiveSetResidue(cckitDir: cckitDir)
-        let bytesAfterIndexing = Self.waxFileAllocatedBytes(at: waxPath)
+        // Freshness stamp applies to every completed run (lexical included):
+        // it is the shim's "index is current vs HEAD" signal, and a rebuild
+        // that forgets it would be re-refreshed on every MCP call.
+        if let stamp = IndexFreshness.captureStamp(repoRoot: absolutePath)
+            ?? IndexFreshness.captureStamp(repoRoot: path) {
+            try stamp.write(cckitDir: cckitDir)
+        }
 
         // Baseline stamps are only valid for stores built by construction
         // (explicit or change-triggered rebuild), where every byte is live.
         let stamped: Bool
-        if mustRebuild || compacted.rebuiltWax {
+        if lexicalOnly {
+            // A lexical run claims nothing about the arena's allocation
+            // baseline; leave semantic stamps and sidecars untouched.
+            stamped = false
+        } else if mustRebuild || compacted.rebuiltWax {
+            try WaxEmbedderIdentity.writeSidecar(cckitDir: cckitDir)
             try WaxCompactStamp.writeBaseline(cckitDir: cckitDir)
             stamped = true
         } else {
@@ -486,15 +628,48 @@ struct IndexCommand: AsyncParsableCommand {
             if !stamped, compacted.deleted > 0 {
                 print(
                     "Compaction stamp withheld: file did not shrink " +
-                    "(\(bytesBeforeIndexing) → \(bytesAfterIndexing) bytes); growth stays visible to MCP."
+                        "(\(bytesBeforeIndexing) → \(bytesAfterIndexing) bytes); growth stays visible to MCP."
                 )
             }
         }
+        if !lexicalOnly && !mustRebuild {
+            try WaxEmbedderIdentity.writeSidecar(cckitDir: cckitDir)
+        }
 
         // Same telemetry on every index — growth on the plain path used to be
-        // completely silent.
-        print(Self.machineReadableLine(
-            for: WaxCompactResult(
+        // completely silent. appendedBytes makes the per-commit append cost a
+        // measurement instead of an inference (a delta commit appends the
+        // entire staged FTS+vector blobs upstream — ~0.5 arena-equivalents).
+        var payload: [String: Any] = [
+            "scanned": compacted.scanned,
+            "deleted": compacted.deleted,
+            "kept": compacted.kept,
+            "bytesBefore": bytesBeforeIndexing,
+            "bytesAfter": bytesAfterIndexing,
+            "shrank": bytesAfterIndexing < bytesBeforeIndexing,
+            "stamped": stamped,
+            "rebuiltWax": compacted.rebuiltWax
+        ]
+        if compacted.deltaApplied {
+            payload["delta"] = true
+            payload["appendedBytes"] = max(0, bytesAfterIndexing - bytesBeforeIndexing)
+        }
+        if lexicalOnly {
+            payload["lexicalOnly"] = true
+        }
+        // Present only when the run actually indexed (compact-only passes
+        // leave these out); a ledger row with durationMs but no counts cannot
+        // distinguish a no-op from a near-full re-embed.
+        if compacted.updated > 0 || compacted.skipped > 0 || compacted.totalSymbols > 0 {
+            payload["updated"] = compacted.updated
+            payload["skipped"] = compacted.skipped
+            payload["symbols"] = compacted.totalSymbols
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+           let json = String(data: data, encoding: .utf8) {
+            print("WaxCompact \(json)")
+        } else {
+            print(Self.machineReadableLine(for: WaxCompactResult(
                 scanned: compacted.scanned,
                 deleted: compacted.deleted,
                 kept: compacted.kept,
@@ -505,10 +680,10 @@ struct IndexCommand: AsyncParsableCommand {
                 totalSymbols: compacted.totalSymbols,
                 rebuiltWax: compacted.rebuiltWax,
                 deltaApplied: compacted.deltaApplied
-            ),
-            stamped: stamped
-        ))
+            ), stamped: stamped))
+        }
     }
+
 }
 
 struct CommandLineProgressDelegate: IndexerProgressDelegate {

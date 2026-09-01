@@ -148,7 +148,7 @@ Swift and Kotlin are indexed into the same local database. Kotlin symbols use pa
 
 | Command | Purpose |
 | :--- | :--- |
-| `cckit index` | Build the SQLite & Semantic knowledge base. `--compact` reclaims leaked Wax vectors without re-embedding. |
+| `cckit index` | Build the SQLite & Semantic knowledge base. `--compact` reclaims leaked Wax vectors without re-embedding. `--no-semantic` (or `CCKIT_NO_SEMANTIC=1`) indexes SQLite locators only — no arena, no embedding pass, seconds instead of ~18 minutes. Rebuilds are staged and swapped in atomically, so the live index keeps serving consistent reads during the build, and failed runs are recorded in the ledger. Lexical repos write a `.cckit/lexical-only` marker that MCP auto-refresh honors (it re-spawns `index --no-semantic` instead of upgrading the repo). |
 | `cckit pack` | Generate a surgical context packet for an AI task. |
 | `cckit find-symbol` | Name fragment → qualified names + paths (no bodies). |
 | `cckit find-references` | Symbol name → indexed call sites (paths + lines, no bodies). |
@@ -181,6 +181,9 @@ cckit pack --task "Fix the crash in the CoreData migration" --output migration_c
 
 # Combined example
 cckit pack --task "Update the sync service to handle workout reminders" --budget 15000 --output my_context.md
+
+# Lexical-only repo (indexed with --no-semantic): pack without an arena
+cckit pack --task "findMe in LexA" --no-semantic --budget 2000
 ```
 
 Default **`auto`** delivers the smallest of surgical, full, and raw — and never
@@ -195,10 +198,18 @@ agents to call `gather_code_context` again with `mode=full` (CLI: `cckit pack --
 for whole-file context, or `symbol` / `outline` for individual neighbors.
 Untruncated related lists omit that footer.
 
+If a budget is too small to fit even one primary, the packet says so: a stderr
+warning plus an in-packet `## Warning` section reports the unconstrained pack
+size (measured with one probe at a generous budget) instead of silently
+returning a header-only packet.
+
 Auto packs append savings to `.cckit/pack_savings.jsonl`. Tool calls append to
 `.cckit/action_history.jsonl` (survives `cckit index --clean`). Both JSONL
 ledgers keep **at most 7 days** of rows (override with `CCKIT_LEDGER_KEEP_DAYS`);
 prune runs **at most once per day** (stamp: `.cckit/jsonl_retention_stamp`).
+`find-symbol` / `find-references` rows carry `baselineTokens`: what `rg -F` for
+the same name costs repo-wide (`-1` = unmeasured), so locator savings are
+auditable — and visibly bimodal (large wins on common names, ~1× on rare ones).
 Evicted rows are folded into monthly rollups (`pack_savings_monthly.jsonl`,
 `tool_usage_monthly.jsonl`) so lifetime numbers survive pruning. Metrics compare
 **delivered tokens** to the **whole-file size of files already loaded for that

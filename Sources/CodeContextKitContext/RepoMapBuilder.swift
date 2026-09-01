@@ -219,16 +219,25 @@ public enum MapBaseline {
         proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
         let out = Pipe()
         proc.standardOutput = out
-        proc.standardError = Pipe()
+        let err = Pipe()
+        proc.standardError = err
         do {
             try proc.run()
-            proc.waitUntilExit()
         } catch {
             return nil
         }
+        // Drain both pipes to EOF *before* waiting: readDataToEndOfFile blocks
+        // until the child exits (closing the write end), so this order can
+        // never deadlock. Waiting first deadlocks forever once git's output
+        // exceeds the ~64 KB pipe buffer (measured 148 KB on this repo) — the
+        // shipped `map`/`--changed` hang. git never writes more than an error
+        // line to stderr, but the same rule applies to any pipe we own.
+        let outData = out.fileHandleForReading.readDataToEndOfFile()
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        _ = errData
         guard proc.terminationStatus == 0 else { return nil }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        guard let text = String(data: outData, encoding: .utf8) else { return nil }
         return text
             .split(whereSeparator: \.isNewline)
             .map(String.init)

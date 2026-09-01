@@ -1532,7 +1532,13 @@ def spawn_detached_index(
             log_path.write_bytes(b"")
     except OSError:
         pass
-    cmd = [CCKIT, "index", ".", *(extra_args or [])]
+    # A repo indexed with `cckit index . --no-semantic` carries the marker;
+    # auto-refresh must not silently upgrade it to a full semantic build
+    # (MiniLM re-embed of ~18 minutes) behind the operator's back.
+    extra = list(extra_args or [])
+    if "--no-semantic" not in extra and (repo / ".cckit" / "lexical-only").is_file():
+        extra.append("--no-semantic")
+    cmd = [CCKIT, "index", ".", *extra]
     try:
         with open(log_path, "ab") as log_handle:
             proc = subprocess.Popen(

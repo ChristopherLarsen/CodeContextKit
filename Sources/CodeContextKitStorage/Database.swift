@@ -20,9 +20,15 @@ public final class Database: @unchecked Sendable {
         let url = URL(fileURLWithPath: path)
         let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        
+
         self.writer = try DatabaseQueue(path: path)
         try migrator.migrate(writer)
+    }
+
+    /// Close the underlying connection. Checkpoints and removes WAL sidecars
+    /// so the file can be swapped or moved safely (snapshot rebuilds).
+    public func close() throws {
+        try writer.close()
     }
     
     private var migrator: DatabaseMigrator {

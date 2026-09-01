@@ -93,7 +93,7 @@ public struct PackResult: Sendable {
 /// Verified by: `WebContextTests.testWebContextPacking`, `ContextPackerSliceTests`
 public final class ContextPacker {
     private let db: Database
-    private let wax: WaxStore
+    private let wax: WaxStore?
     private let rootPath: String
     private let repoMapBuilder: RepoMapBuilder
     private let maxPrimarySymbols: Int
@@ -114,7 +114,7 @@ public final class ContextPacker {
 
     public init(
         db: Database,
-        wax: WaxStore,
+        wax: WaxStore?,
         rootPath: String = ".",
         maxPrimarySymbols: Int = 5,
         maxAssociatedSkeletons: Int = 3
@@ -124,7 +124,39 @@ public final class ContextPacker {
         self.rootPath = rootPath
         self.maxPrimarySymbols = maxPrimarySymbols
         self.maxAssociatedSkeletons = maxAssociatedSkeletons
-        self.repoMapBuilder = RepoMapBuilder(db: db, counter: { text in await wax.countTokens(text) })
+        self.repoMapBuilder = RepoMapBuilder(db: db, counter: { text in await wax?.countTokens(text) ?? TokenEstimator.shared.estimate(text) })
+    }
+
+    /// True when a semantic arena backs this packer. Lexical-only packers
+    /// skip the MiniLM fill pass; retrieval relies on lexical identifier hits.
+    public var hasSemantic: Bool { wax != nil }
+
+    /// Token counting works identically without an arena (WaxStore.countTokens
+    /// delegates to the shared estimator).
+    private func countTokens(_ text: String) async -> Int {
+        await wax?.countTokens(text) ?? TokenEstimator.shared.estimate(text)
+    }
+
+    /// Public token estimate for callers measuring packets outside the pack
+    /// path (e.g. the CLI's budget-truncation probe).
+    public func estimateTokens(_ text: String) async -> Int {
+        await countTokens(text)
+    }
+
+    /// Append a budget-truncation notice to a packet body. A low budget used
+    /// to silently deliver a header-only packet at exit 0; this makes the
+    /// truncation visible inside the packet the caller actually reads.
+    public static func appendBudgetNotice(
+        to packet: String,
+        budget: Int,
+        unconstrainedTokens: Int,
+        primaries: Int
+    ) -> String {
+        let notice =
+            "Budget \(budget) truncated this packet to zero primaries. An unconstrained pack for this "
+                + "task is ~\(unconstrainedTokens) tokens across \(primaries) primaries; the delivered "
+                + "packet is header chrome only. Re-run with a larger --budget."
+        return packet.trimmingCharacters(in: .newlines) + "\n\n## Warning\n\n" + notice + "\n"
     }
 
     public func pack(
@@ -146,7 +178,7 @@ public final class ContextPacker {
                     mapBudget: mapBudget,
                     relatedHintCap: relatedHintCap
                 )
-                let surgicalTokens = await wax.countTokens(surgical.packet)
+                let surgicalTokens = await countTokens(surgical.packet)
                 let sourceWhole = await countWholeFileTokens(paths: surgical.primaryFilePaths)
                 // Auto must never deliver more than reading the files outright.
                 // If surgical lost to the baseline, fall back to raw (and then to
@@ -181,7 +213,7 @@ public final class ContextPacker {
                 mapBudget: mapBudget,
                 relatedHintCap: relatedHintCap
             )
-            let surgicalTokens = await wax.countTokens(surgical.packet)
+            let surgicalTokens = await countTokens(surgical.packet)
             let raw = try await packOnce(
                 task: task,
                 budget: budget,
@@ -190,7 +222,7 @@ public final class ContextPacker {
                 mapBudget: 0,
                 relatedHintCap: relatedHintCap
             )
-            let rawTokens = await wax.countTokens(raw.packet)
+            let rawTokens = await countTokens(raw.packet)
             // Full is chrome on top of the same primaries as raw. If surgical
             // already beats raw, full cannot win — skip the third assembly.
             if surgicalTokens <= rawTokens {
@@ -225,7 +257,7 @@ public final class ContextPacker {
                 mapBudget: mapBudget,
                 relatedHintCap: relatedHintCap
             )
-            let fullTokens = await wax.countTokens(full.packet)
+            let fullTokens = await countTokens(full.packet)
             let candidates: [(PackAssembly, PackMode, Int)] = [
                 (surgical, .surgical, surgicalTokens),
                 (full, .full, fullTokens),
@@ -268,7 +300,7 @@ public final class ContextPacker {
                 mapBudget: min(mapBudget ?? 400, 400),
                 relatedHintCap: relatedHintCap
             )
-            let tokens = await wax.countTokens(assembled.packet)
+            let tokens = await countTokens(assembled.packet)
             let sourceWhole = await countWholeFileTokens(paths: assembled.primaryFilePaths)
             return PackResult(
                 packet: assembled.packet,
@@ -294,7 +326,7 @@ public final class ContextPacker {
             mapBudget: mapBudget,
             relatedHintCap: relatedHintCap
         )
-        let tokens = await wax.countTokens(assembled.packet)
+        let tokens = await countTokens(assembled.packet)
         let sourceWhole = await countWholeFileTokens(paths: assembled.primaryFilePaths)
         return PackResult(
             packet: assembled.packet,
@@ -368,7 +400,7 @@ public final class ContextPacker {
                 relatedHintCap: relatedHintCap
             )
             if let raw {
-                let rawTokens = await wax.countTokens(raw.packet)
+                let rawTokens = await countTokens(raw.packet)
                 if rawTokens <= sourceWhole {
                     return BaselineDelivery(
                         packet: raw.packet,
@@ -384,7 +416,7 @@ public final class ContextPacker {
 
         // Last resort: raw-minimal strips every header but one line per file.
         let minimal = await rawMinimalPacket(paths: fallbackPaths, budget: budget)
-        let minimalTokens = await wax.countTokens(minimal)
+        let minimalTokens = await countTokens(minimal)
         if minimalTokens < best.2 {
             return BaselineDelivery(
                 packet: minimal,
@@ -416,7 +448,7 @@ public final class ContextPacker {
             guard let content = readFile(path: path, rootURL: rootURL) else { continue }
             body += content + "\n"
         }
-        let tokens = await wax.countTokens(body)
+        let tokens = await countTokens(body)
         return "# Context Packet (Tokens: \(tokens)/\(budget) · mode: raw)\n\n" + body
     }
 
@@ -425,7 +457,7 @@ public final class ContextPacker {
         var total = 0
         for path in paths.sorted() {
             guard let content = readFile(path: path, rootURL: rootURL) else { continue }
-            total += await wax.countTokens(content)
+            total += await countTokens(content)
         }
         return total
     }
@@ -498,7 +530,7 @@ public final class ContextPacker {
         let skipFiller = SemanticIndexPolicy.shouldSkipPackFiller(task: task)
 
         let remainingSlots = maxPrimarySymbols - primaries.count
-        if remainingSlots > 0 && !skipFiller {
+        if remainingSlots > 0 && !skipFiller, let wax {
             waxFillRan = true
             // Modest overfetch for unresolved Wax hits; never request more than 2× remaining slots.
             let searchResults = try await wax.search(task, limit: remainingSlots * 2)
@@ -551,7 +583,7 @@ public final class ContextPacker {
         // Preview assembly: names and spans only — no bodies. Everything else
         // (map, skeletons) still applies so the agent can decide what to expand.
         let rootURL = URL(fileURLWithPath: rootPath)
-        var currentTokens = await wax.countTokens(output)
+        var currentTokens = await countTokens(output)
         var primarySymbolCount = 0
         var primaryFullFileCount = 0
         var associatedSkeletonCount = 0
@@ -568,7 +600,7 @@ public final class ContextPacker {
                 let bodyTokens: Int
                 if let content = readFile(path: sym.filePath, rootURL: rootURL) {
                     let body = LineRangeBodyExtractor.body(for: sym, content: content)
-                    bodyTokens = await wax.countTokens(body)
+                    bodyTokens = await countTokens(body)
                 } else {
                     bodyTokens = 0
                 }
@@ -582,7 +614,7 @@ public final class ContextPacker {
                 primaryFilePaths.insert(sym.filePath)
             }
             output += "\n"
-            currentTokens = await wax.countTokens(output)
+            currentTokens = await countTokens(output)
         } else {
             if mode != .raw {
                 output += "## Surgical Context\n\n"
@@ -600,7 +632,7 @@ public final class ContextPacker {
                 if currentTokens >= budget { break }
                 guard let content = readFile(path: path, rootURL: rootURL) else { continue }
                 let section = formatFullFileSection(path: path, content: content)
-                let sectionTokens = await wax.countTokens(section)
+                let sectionTokens = await countTokens(section)
                 if currentTokens + sectionTokens < budget {
                     output += section
                     currentTokens += sectionTokens
@@ -643,8 +675,8 @@ public final class ContextPacker {
                     // whole file, emit the file instead — no point paying for "surgical".
                     if !emittedFullPaths.contains(sym.filePath) {
                         let fullSection = formatFullFileSection(path: sym.filePath, content: content)
-                        let symbolTokens = await wax.countTokens(symbolSection)
-                        let fullTokens = await wax.countTokens(fullSection)
+                        let symbolTokens = await countTokens(symbolSection)
+                        let fullTokens = await countTokens(fullSection)
                         if fullTokens <= symbolTokens {
                             section = fullSection
                             emittedAsFull = true
@@ -658,7 +690,7 @@ public final class ContextPacker {
                     }
                 }
 
-                let sectionTokens = await wax.countTokens(section)
+                let sectionTokens = await countTokens(section)
                 if currentTokens + sectionTokens < budget {
                     output += section
                     currentTokens += sectionTokens
@@ -683,7 +715,7 @@ public final class ContextPacker {
 
             let symbols = try db.getSymbols(path: path)
             let section = formatSkeletonSection(path: path, reason: reason, symbols: symbols)
-            let sectionTokens = await wax.countTokens(section)
+            let sectionTokens = await countTokens(section)
             if currentTokens + sectionTokens < budget {
                 output += section
                 currentTokens += sectionTokens
@@ -697,7 +729,7 @@ public final class ContextPacker {
                 relatedHintCap: relatedHintCap,
                 anyTruncated: true
             )
-            let guidanceTokens = await wax.countTokens(guidance)
+            let guidanceTokens = await countTokens(guidance)
             if currentTokens + guidanceTokens < budget {
                 output += guidance
                 currentTokens += guidanceTokens
@@ -729,7 +761,7 @@ public final class ContextPacker {
         // Stamp once with a provisional count, then recount the assembled packet so
         // the banner matches what callers actually receive.
         var packet = makeBanner(tokens: currentTokens) + body
-        let finalTokens = await wax.countTokens(packet)
+        let finalTokens = await countTokens(packet)
         packet = makeBanner(tokens: finalTokens) + body
         return PackAssembly(
             packet: packet,

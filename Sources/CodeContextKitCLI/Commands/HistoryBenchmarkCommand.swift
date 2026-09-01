@@ -128,8 +128,10 @@ struct HistoryBenchmarkCommand: AsyncParsableCommand {
         task.executableURL = URL(fileURLWithPath: "/bin/bash")
         task.currentDirectoryURL = URL(fileURLWithPath: path)
         try task.run()
-        task.waitUntilExit()
+        // Drain to EOF before waiting; the reverse order deadlocks once the
+        // child fills the ~64 KB pipe buffer (e.g. a large `git log -p`).
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 }

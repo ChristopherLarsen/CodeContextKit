@@ -34,6 +34,8 @@ final class WaxDeltaTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempDir)
         unsetenv("CCKIT_WAX_DELTA_MAX_FILES")
         unsetenv("CCKIT_WAX_DELTA_MAX_GROWTH")
+        unsetenv("CCKIT_WAX_DELTA_ALLOWANCE_BYTES")
+        unsetenv("CCKIT_WAX_DELTA_ALLOWANCE_SCALE")
         try await super.tearDown()
     }
 
@@ -95,10 +97,76 @@ final class WaxDeltaTests: XCTestCase {
             forceRebuild: false, deltaFileCount: 1, stampAllocatedBytes: 1_000_000,
             arenaAllocatedBytes: 800_000, arenaFrameCount: 10, keepSetMandateCount: 10))
         // Growth past margin + allowance: leaks must be reclaimed by a rebuild.
-        XCTAssertFalse(WaxDeltaPolicy.isEligible(
+        // (allowanceScale 0 isolates the absolute-allowance semantics; the
+        // default 1.5x baseline scale is covered separately below.)
+        let decision = WaxDeltaPolicy.evaluate(
             forceRebuild: false, deltaFileCount: 1, stampAllocatedBytes: 1_000_000,
             arenaAllocatedBytes: 1_200_000, arenaFrameCount: 10, keepSetMandateCount: 10,
-            maxGrowth: 0.10, allowanceBytes: 0))
+            maxGrowth: 0.10, allowanceBytes: 0, allowanceScale: 0)
+        XCTAssertFalse(decision.eligible)
+        XCTAssertEqual(decision.refusedBy, "growthCeiling")
+    }
+
+    /// Wax's per-commit append is ~0.5 arena-equivalents REGARDLESS of payload
+    /// (measured: one 8-file delta grew a 128 MB arena by ~61 MB). The
+    /// allowance must therefore scale with the baseline, or a single commit
+    /// can never survive the band and every delta triggers a full rebuild.
+    func testAllowanceScalesWithBaseline() {
+        // One measured-scale append (0.5x stamp) must fit under the default
+        // band: ceiling = 128M * 1.1 + max(16M, 128M * 1.5) = 333.6M.
+        let decision = WaxDeltaPolicy.evaluate(
+            forceRebuild: false, deltaFileCount: 1, stampAllocatedBytes: 128_000_000,
+            arenaAllocatedBytes: 128_000_000 + 61_000_000, arenaFrameCount: 100,
+            keepSetMandateCount: 100)
+        XCTAssertTrue(decision.eligible, "A single per-commit append must survive the band")
+        XCTAssertEqual(decision.effectiveAllowanceBytes, 192_000_000)
+        XCTAssertEqual(
+            decision.growthCeilingBytes,
+            Int(Double(128_000_000) * 1.1) + 192_000_000)
+        // The absolute floor still wins on small arenas.
+        XCTAssertEqual(
+            WaxDeltaPolicy.effectiveAllowance(stampAllocatedBytes: 442_368, allowanceBytes: 16_000_000, allowanceScale: 1.5),
+            16_000_000)
+        // Scale 0 restores the pure-absolute behavior.
+        XCTAssertEqual(
+            WaxDeltaPolicy.effectiveAllowance(stampAllocatedBytes: 128_000_000, allowanceBytes: 16_000_000, allowanceScale: 0),
+            16_000_000)
+    }
+
+    /// The eligibility decision must carry its arithmetic: ceiling, measured
+    /// bytes, and which predicate refused — operators used to have to infer
+    /// why a rebuild happened.
+    func testDecisionIsObservable() {
+        let refused = WaxDeltaPolicy.evaluate(
+            forceRebuild: false, deltaFileCount: 1, stampAllocatedBytes: 1_000_000,
+            arenaAllocatedBytes: 800_000, arenaFrameCount: 10, keepSetMandateCount: 10)
+        XCTAssertFalse(refused.eligible)
+        XCTAssertEqual(refused.refusedBy, "truncatedArena")
+        XCTAssertTrue(refused.summary.contains("\"refusedBy\":\"truncatedArena\""))
+        XCTAssertTrue(refused.summary.contains("\"arenaBytes\":800000"))
+
+        let eligible = WaxDeltaPolicy.evaluate(
+            forceRebuild: false, deltaFileCount: 2, stampAllocatedBytes: 1_000_000,
+            arenaAllocatedBytes: 1_000_000, arenaFrameCount: 10, keepSetMandateCount: 10)
+        XCTAssertTrue(eligible.eligible)
+        XCTAssertNil(eligible.refusedBy)
+        XCTAssertFalse(eligible.summary.contains("refusedBy"))
+        for predicate in ["forceRebuild", "maxFiles", "noStamp", "silentEmpty", "growthCeiling"] {
+            let d: WaxDeltaPolicy.Decision
+            switch predicate {
+            case "forceRebuild":
+                d = WaxDeltaPolicy.evaluate(forceRebuild: true, deltaFileCount: 0, stampAllocatedBytes: 1, arenaAllocatedBytes: 1, arenaFrameCount: 1, keepSetMandateCount: 1)
+            case "maxFiles":
+                d = WaxDeltaPolicy.evaluate(forceRebuild: false, deltaFileCount: 2, stampAllocatedBytes: 1, arenaAllocatedBytes: 1, arenaFrameCount: 1, keepSetMandateCount: 1, maxFiles: 1)
+            case "noStamp":
+                d = WaxDeltaPolicy.evaluate(forceRebuild: false, deltaFileCount: 1, stampAllocatedBytes: 0, arenaAllocatedBytes: 1, arenaFrameCount: 1, keepSetMandateCount: 1)
+            case "silentEmpty":
+                d = WaxDeltaPolicy.evaluate(forceRebuild: false, deltaFileCount: 1, stampAllocatedBytes: 1, arenaAllocatedBytes: 1, arenaFrameCount: 0, keepSetMandateCount: 1)
+            default:
+                d = WaxDeltaPolicy.evaluate(forceRebuild: false, deltaFileCount: 1, stampAllocatedBytes: 1, arenaAllocatedBytes: 1_000_000, arenaFrameCount: 1, keepSetMandateCount: 1, allowanceBytes: 0)
+            }
+            XCTAssertEqual(d.refusedBy, predicate, "predicate \(predicate) must name itself")
+        }
     }
 
     func testPolicyAllowanceToleratesFixedSegmentChurnOnSmallArenas() {
@@ -165,9 +233,11 @@ final class WaxDeltaTests: XCTestCase {
         try await primeIndexAndStamp()
         setenv("CCKIT_WAX_DELTA_MAX_GROWTH", "0", 1)
         setenv("CCKIT_WAX_DELTA_ALLOWANCE_BYTES", "0", 1)
+        setenv("CCKIT_WAX_DELTA_ALLOWANCE_SCALE", "0", 1)
         defer {
             unsetenv("CCKIT_WAX_DELTA_MAX_GROWTH")
             unsetenv("CCKIT_WAX_DELTA_ALLOWANCE_BYTES")
+            unsetenv("CCKIT_WAX_DELTA_ALLOWANCE_SCALE")
         }
 
         // Run 2 appends (margin applies to the NEXT run's start allocation).
@@ -223,4 +293,42 @@ final class WaxDeltaTests: XCTestCase {
         XCTAssertNotNil(try db.getFile(path: "Gamma.swift"))
         XCTAssertEqual(try db.uncoveredWaxFilePaths(), [])
     }
+
+    // MARK: - Lexical-only indexing (--no-semantic)
+
+    /// Lexical-only runs populate SQLite locators without ever touching an
+    /// arena: no wax open, no coverage claims, no sidecars — and no arena file
+    /// for the caller to pay for.
+    func testLexicalOnlyIndexSkipsArena() async throws {
+        // Populate the live semantic index first so the test can prove the
+        // lexical run leaves it untouched.
+        try await primeIndexAndStamp()
+        let lexDb = try CodeContextKitStorage.Database(path: cckitDir.appendingPathComponent("lex.sqlite").path)
+        let lexicalIndexer = Indexer(db: lexDb, wax: nil)
+        let result = try await lexicalIndexer.index(
+            at: tempDir.path, cckitDir: cckitDir.path, delegate: NilProgressDelegate())
+
+        XCTAssertEqual(result.updated, 2)
+        XCTAssertFalse(result.rebuiltWax)
+        XCTAssertFalse(result.deltaApplied)
+        XCTAssertEqual(try lexDb.getSymbols(path: "Alpha.swift").first?.name, "Alpha",
+                       "locators must be fully populated")
+        // Coverage markers are semantic claims: a lexical run must not make
+        // them, so every file stays honestly uncovered against any future
+        // semantic run (which will then repopulate the arena).
+        XCTAssertEqual(try lexDb.uncoveredWaxFilePaths().count, 2)
+
+        // The live semantic index is untouched by the lexical run.
+        let frames = await wax.frameCount()
+        XCTAssertGreaterThan(frames, 0, "lexical run must not reset the live arena")
+        try lexDb.close()
+    }
+}
+
+/// Minimal delegate so decision-line printing is exercised (IndexCommand path).
+struct NilProgressDelegate: IndexerProgressDelegate, Sendable {
+    func indexerDidStart(totalFiles: Int) {}
+    func indexerDidProgress(completedFiles: Int, totalFiles: Int, currentFile: String) {}
+    func indexerDidFinish(updated: Int, skipped: Int, totalSymbols: Int) {}
+    func indexerDidFail(error: Error) {}
 }

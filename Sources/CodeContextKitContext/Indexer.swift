@@ -35,7 +35,7 @@ public enum IndexerError: LocalizedError {
 }
 
 /// The core engine responsible for scanning the filesystem, extracting symbols, and persisting them to the database and vector store.
-/// 
+///
 /// `Indexer` coordinates the entire indexing pipeline:
 /// 1. Scans the filesystem for relevant files using `FileScanner`.
 /// 2. Hashes file content to support incremental updates.
@@ -43,12 +43,16 @@ public enum IndexerError: LocalizedError {
 /// 4. Persists extracted symbols and references to the `Database`.
 /// 5. Populates the `WaxStore` with symbol bodies for semantic search.
 ///
+/// `wax` may be nil for lexical-only indexing (`--no-semantic`): locators are
+/// all SQLite-backed and need no arena, so a team can skip the ~18-minute
+/// embedding pass and the arena's disk cost entirely.
+///
 /// Verified by: `IndexerTests`, `WebContextTests.testWebProjectIndexing`
 public final class Indexer: Sendable {
     private let db: Database
-    private let wax: WaxStore
-    
-    public init(db: Database, wax: WaxStore) {
+    private let wax: WaxStore?
+
+    public init(db: Database, wax: WaxStore?) {
         self.db = db
         self.wax = wax
     }
@@ -92,7 +96,8 @@ public final class Indexer: Sendable {
         // incrementally: changed files re-save their rows and append fresh
         // documents, stale twins leak until the next rebuild, bounded by
         // WaxDeltaPolicy's growth margin. No-op runs retain the arena and the
-        // fast SQLite hash skip either way.
+        // fast SQLite hash skip either way. Lexical-only runs have no arena
+        // and no delta concept at all.
         let existingFiles = try db.getAllFiles()
         let existingByPath = Dictionary(uniqueKeysWithValues: existingFiles.map { ($0.path, $0) })
         let previousWaxRecordCount = try db.waxFrameCount()
@@ -107,7 +112,7 @@ public final class Indexer: Sendable {
             guard let existing = existingByPath[relativePath] else { continue }
             if existing.sha256 != hasher.hash(content: content) {
                 changedPaths.insert(relativePath)
-            } else if try !db.hasWaxCoverage(path: relativePath) {
+            } else if wax != nil, try !db.hasWaxCoverage(path: relativePath) {
                 // A prior rebuild did not finish this file, or this is the
                 // first run after coverage markers were introduced. Retry the
                 // file instead of treating its SQLite hash as enough.
@@ -118,21 +123,34 @@ public final class Indexer: Sendable {
         let removedPathCount = Set(existingByPath.keys).subtracting(scannedRelativePaths).count
         let deltaFileCount = changedPaths.count + uncoveredPaths.count + newPathCount + removedPathCount
 
-        let deltaEligible = WaxDeltaPolicy.isEligible(
-            forceRebuild: forceWaxRebuild,
-            deltaFileCount: deltaFileCount,
-            stampAllocatedBytes: WaxCompactStamp.readWatermark(cckitDir: cckitDir)?.waxBytes ?? 0,
-            arenaAllocatedBytes: await wax.allocatedBytes(),
-            arenaFrameCount: await wax.frameCount(),
-            keepSetMandateCount: (try? db.waxMandateCount()) ?? 0,
-            maxFiles: WaxDeltaPolicy.maxFilesFromEnvironment(),
-            maxGrowth: WaxDeltaPolicy.maxGrowthFromEnvironment(),
-            allowanceBytes: WaxDeltaPolicy.allowanceBytesFromEnvironment()
-        )
-        let arenaReplaced = !deltaEligible
+        let deltaDecision: WaxDeltaPolicy.Decision?
+        if let wax {
+            deltaDecision = WaxDeltaPolicy.evaluate(
+                forceRebuild: forceWaxRebuild,
+                deltaFileCount: deltaFileCount,
+                stampAllocatedBytes: WaxCompactStamp.readWatermark(cckitDir: cckitDir)?.waxBytes ?? 0,
+                arenaAllocatedBytes: await wax.allocatedBytes(),
+                arenaFrameCount: await wax.frameCount(),
+                keepSetMandateCount: (try? db.waxMandateCount()) ?? 0,
+                maxFiles: WaxDeltaPolicy.maxFilesFromEnvironment(),
+                maxGrowth: WaxDeltaPolicy.maxGrowthFromEnvironment(),
+                allowanceBytes: WaxDeltaPolicy.allowanceBytesFromEnvironment(),
+                allowanceScale: WaxDeltaPolicy.allowanceScaleFromEnvironment()
+            )
+            // Make the eligibility decision observable: ceiling, measured
+            // bytes, and which predicate refused — a rebuild used to be
+            // inferable only after the fact.
+            if delegate != nil {
+                print(deltaDecision!.summary)
+            }
+        } else {
+            deltaDecision = nil
+        }
+        let deltaEligible = deltaDecision?.eligible ?? false
+        let arenaReplaced = wax != nil && !deltaEligible
         if arenaReplaced {
             try db.clearWaxFrameRecords()
-            try await wax.resetStore()
+            try await wax!.resetStore()
         }
         
         var updatedCount = 0
@@ -147,7 +165,7 @@ public final class Indexer: Sendable {
             // Mid-run growth cap: a single stat per file. When the arena
             // crosses the cap, stop before more bytes land on disk instead of
             // arming a marker after a 929x blowup has fully materialized.
-            if let cap = maxArenaBytes, cap > 0 {
+            if let cap = maxArenaBytes, cap > 0, let wax {
                 let allocated = await wax.allocatedBytes()
                 if allocated > cap {
                     let error = IndexerError.arenaGrowthCapExceeded(allocatedBytes: allocated, capBytes: cap)
@@ -236,24 +254,27 @@ public final class Indexer: Sendable {
                 )
                 
                 try db.saveSymbols(symbols, references: references, fileId: fileId)
-                
-                for symbol in symbols {
-                    let body = symbol.kind == .file ? content : LineRangeBodyExtractor.body(for: symbol, content: content)
-                    let ingest = try await wax.saveSymbol(symbol, body: body)
-                    if ingest.didWrite {
-                        try db.saveWaxFrames(
-                            fileId: fileId,
-                            mandate: ingest.mandate,
-                            frameIDs: ingest.frameIDs
-                        )
-                    }
-                }
 
-                // Written last: an interrupted or partially failed file has
-                // no coverage marker, forcing the next run to rebuild/retry.
-                // Files with no eligible semantic symbols still get covered,
-                // so a true no-op does not rebuild forever.
-                try db.markWaxCoverage(fileId: fileId)
+                if let wax {
+                    for symbol in symbols {
+                        let body = symbol.kind == .file ? content : LineRangeBodyExtractor.body(for: symbol, content: content)
+                        let ingest = try await wax.saveSymbol(symbol, body: body)
+                        if ingest.didWrite {
+                            try db.saveWaxFrames(
+                                fileId: fileId,
+                                mandate: ingest.mandate,
+                                frameIDs: ingest.frameIDs
+                            )
+                        }
+                    }
+
+                    // Written last: an interrupted or partially failed file has
+                    // no coverage marker, forcing the next run to rebuild/retry.
+                    // Files with no eligible semantic symbols still get covered,
+                    // so a true no-op does not rebuild forever. Lexical-only
+                    // runs claim no semantic coverage.
+                    try db.markWaxCoverage(fileId: fileId)
+                }
                 
                 updatedCount += 1
                 totalSymbols += symbols.count
@@ -275,7 +296,9 @@ public final class Indexer: Sendable {
             }
         }
 
-        try await wax.flush()
+        if let wax {
+            try await wax.flush()
+        }
         let currentWaxRecordCount = try db.waxFrameCount()
 
         delegate?.indexerDidFinish(updated: updatedCount, skipped: skippedCount, totalSymbols: totalSymbols)

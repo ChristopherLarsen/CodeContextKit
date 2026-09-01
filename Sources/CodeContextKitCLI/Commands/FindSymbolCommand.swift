@@ -91,12 +91,17 @@ struct FindSymbolCommand: AsyncParsableCommand {
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
         let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
         let tokens = TokenEstimator.shared.estimate(responseText)
+        // Auditable savings baseline (rg whole-repo, -1 unmeasured). Bimodal
+        // by design: ~17-147x win on common names, ~1x on rare ones — worth
+        // seeing in the ledger instead of logging 0 forever.
+        let baseline = LexicalBaseline.tokens(for: name, repoRoot: ".")
         let actionOrchestrator = ActionOrchestrator(repoRoot: ".")
         try await actionOrchestrator.recordCLIAction(
             command: fullCommand,
             toolName: "find-symbol",
             durationMs: duration,
-            tokensUsed: tokens
+            tokensUsed: tokens,
+            baselineTokens: baseline
         )
     }
 }

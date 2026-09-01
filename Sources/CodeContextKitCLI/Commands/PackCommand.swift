@@ -52,47 +52,67 @@ struct PackCommand: AsyncParsableCommand {
     @Flag(help: "Skip appending this pack to .cckit/pack_savings.jsonl.")
     var noLedger: Bool = false
 
+    @Flag(
+        name: .long,
+        help: """
+            Pack from the SQLite locators only — no Wax arena, no MiniLM fill. \
+            Required on lexical-only indexes (indexed with --no-semantic); \
+            otherwise optional.
+            """
+    )
+    var noSemantic: Bool = false
+
     func run() async throws {
         let startTime = Date()
         let dbPath = ".cckit/index.sqlite"
         let waxPath = ".cckit/repo.wax"
+        let lexicalOnly = noSemantic
+        guard lexicalOnly || FileManager.default.fileExists(atPath: waxPath) else {
+            print("Error: Index not found. Run 'cckit index' first (or pass --no-semantic for a lexical-only index).")
+            throw ExitCode.failure
+        }
 
-        guard FileManager.default.fileExists(atPath: dbPath),
-              FileManager.default.fileExists(atPath: waxPath) else {
+        guard FileManager.default.fileExists(atPath: dbPath) else {
             print("Error: Index not found. Run 'cckit index' first.")
             throw ExitCode.failure
         }
 
-        do {
-            try WaxEmbedderIdentity.requireCurrent()
-        } catch {
-            print("Error: \(error.localizedDescription)")
-            throw ExitCode.failure
+        if !lexicalOnly {
+            do {
+                try WaxEmbedderIdentity.requireCurrent()
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                throw ExitCode.failure
+            }
         }
 
         let db = try Database(path: dbPath)
-        let wax = try await WaxStore(path: waxPath)
-        do {
-            try await wax.requireEmbeddings()
-        } catch {
-            print("Error: \(error.localizedDescription)")
-            throw ExitCode.failure
+        var breachWarning: String?
+        let wax: WaxStore? = lexicalOnly ? nil : try await WaxStore(path: waxPath)
+        if let wax {
+            do {
+                try await wax.requireEmbeddings()
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                throw ExitCode.failure
+            }
+
+            // Read-path integrity gate: the store opening is not proof it is
+            // serviceable. A truncated arena (interrupted rebuild) or an armed
+            // breach marker must be visible here — a silent `0 symbols` packet
+            // reads as a confident negative to any agent consuming it.
+            let gate = await WaxReadGate.evaluate(waxPath: waxPath, cckitDir: ".cckit", db: db, wax: wax)
+            if let fault = gate.hardFault {
+                print("Error: \(fault.localizedDescription)")
+                throw ExitCode.failure
+            }
+            if let warning = gate.breachWarning {
+                InteractiveProgress.write("Warning: \(warning)\n", to: .standardError)
+            }
+            breachWarning = gate.breachWarning
         }
 
-        // Read-path integrity gate: the store opening is not proof it is
-        // serviceable. A truncated arena (interrupted rebuild) or an armed
-        // breach marker must be visible here — a silent `0 symbols` packet
-        // reads as a confident negative to any agent consuming it.
-        let gate = await WaxReadGate.evaluate(waxPath: waxPath, cckitDir: ".cckit", db: db, wax: wax)
-        if let fault = gate.hardFault {
-            print("Error: \(fault.localizedDescription)")
-            throw ExitCode.failure
-        }
-        if let warning = gate.breachWarning {
-            InteractiveProgress.write("Warning: \(warning)\n", to: .standardError)
-        }
-
-        let actionOrchestrator = ActionOrchestrator(wax: wax)
+        let actionOrchestrator = ActionOrchestrator(repoRoot: ".")
         let packer = ContextPacker(db: db, wax: wax, rootPath: ".")
         if full && surgical {
             print("Error: use either --full or --surgical, not both.")
@@ -110,6 +130,26 @@ struct PackCommand: AsyncParsableCommand {
             failureLog: failure,
             mode: mode
         )
+
+        // Budget truncation used to be silent: a low ceiling trimmed every
+        // primary out of the packet and still exited 0 with negative savings.
+        // Distinguish a true absence (probe finds nothing either) from
+        // truncation (probe at a generous budget finds content).
+        var truncation: (unconstrainedTokens: Int, primaries: Int)?
+        if !preview, result.primaryCount == 0 {
+            // Probing is budget-shaped, not arena-shaped: lexical packs need
+            // it too. One extra assembly only on the failure path.
+            let probeBudget = max(budget * 4, 12000)
+            if let probe = try? await packer.pack(
+                task: task,
+                budget: probeBudget,
+                failureLog: nil,
+                mode: mode
+            ), probe.primaryCount > 0 {
+                let probeTokens = await packer.estimateTokens(probe.packet)
+                truncation = (probeTokens, probe.primaryCount)
+            }
+        }
 
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
         let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
@@ -144,15 +184,29 @@ struct PackCommand: AsyncParsableCommand {
         // the machine-readable stats so callers can tell a real negative from
         // a broken one.
         var semanticUnavailable = false
-        if result.primaryCount == 0, result.waxFillRan, result.waxHitCount == 0 {
+        if result.primaryCount == 0, result.waxFillRan, result.waxHitCount == 0, let wax {
             semanticUnavailable = ((try? db.waxMandateCount()) ?? 0) > 0
         }
         var packet = result.packet
-        if semanticUnavailable || gate.breachWarning != nil {
+        if let truncation {
+            packet = ContextPacker.appendBudgetNotice(
+                to: packet,
+                budget: budget,
+                unconstrainedTokens: truncation.unconstrainedTokens,
+                primaries: truncation.primaries
+            )
+            InteractiveProgress.write(
+                "Warning: budget \(budget) delivered 0 primaries for this task; an unconstrained pack is "
+                    + "~\(truncation.unconstrainedTokens) tokens (\(truncation.primaries) primaries). "
+                    + "Raise --budget to retrieve real context.\n",
+                to: .standardError
+            )
+        }
+        if semanticUnavailable || breachWarning != nil {
             packet = Self.appendDegradedNotice(
                 to: packet,
                 semanticUnavailable: semanticUnavailable,
-                breachWarning: gate.breachWarning
+                breachWarning: breachWarning
             )
         }
 
@@ -161,8 +215,8 @@ struct PackCommand: AsyncParsableCommand {
             print("Context packet written to \(outputPath)")
             print(
                 "Pack metrics: delivered \(result.deliveredTokens) (\(result.deliveredMode.rawValue)) · "
-                + "source whole files \(result.sourceWholeFileTokens) · "
-                + "saved \(PackSavingsLedger.formatTokenCount(result.tokensSavedVersusSourceFiles))"
+                    + "source whole files \(result.sourceWholeFileTokens) · "
+                    + "saved \(PackSavingsLedger.formatTokenCount(result.tokensSavedVersusSourceFiles))"
             )
         } else {
             print(packet)
@@ -179,16 +233,23 @@ struct PackCommand: AsyncParsableCommand {
                 if semanticUnavailable {
                     enriched["semanticUnavailable"] = true
                 }
-                if let warning = gate.breachWarning {
+                if let warning = breachWarning {
                     enriched["breachWarning"] = warning
+                }
+                if let truncation {
+                    enriched["budgetTruncated"] = true
+                    enriched["unconstrainedTokens"] = truncation.unconstrainedTokens
                 }
                 if let data = try? JSONSerialization.data(withJSONObject: enriched, options: [.sortedKeys]) {
                     print("PACK_STATS \(String(decoding: data, as: UTF8.self))")
                 }
             }
         }
-        try await wax.close()
+        if let wax {
+            try? await wax.close()
+        }
     }
+
 
     /// Append a degraded-retrieval notice to a packet body. Kept as a trailing
     /// section so packet consumers see it without disturbing the banner.

@@ -205,12 +205,17 @@ struct FindReferencesCommand: AsyncParsableCommand {
         let duration = Int(Date().timeIntervalSince(startTime) * 1000)
         let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
         let tokens = TokenEstimator.shared.estimate(responseText)
+        // Auditable savings: what `rg -F` would have cost for the same name,
+        // -1 when unmeasurable. Without this the two most-used tools could
+        // never be scored from the ledger.
+        let baseline = LexicalBaseline.tokens(for: names.joined(separator: " "), repoRoot: ".")
         let actionOrchestrator = ActionOrchestrator(repoRoot: ".")
         try await actionOrchestrator.recordCLIAction(
             command: fullCommand,
             toolName: "find-references",
             durationMs: duration,
-            tokensUsed: tokens
+            tokensUsed: tokens,
+            baselineTokens: baseline
         )
     }
 }
