@@ -1,5 +1,6 @@
 import Foundation
 import CodeContextKitCore
+import CodeContextKitRetrieval
 
 /// Shared 7-day cap and JSONL I/O for `.cckit` ledgers so they cannot grow unbounded.
 ///
@@ -43,11 +44,24 @@ public enum JSONLRetention: Sendable {
         let text = try String(contentsOf: fileURL, encoding: .utf8)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try text
-            .split(whereSeparator: \.isNewline)
-            .map(String.init)
-            .filter { !$0.isEmpty }
-            .map { try decoder.decode(T.self, from: Data($0.utf8)) }
+        var entries: [T] = []
+        var malformed = 0
+        for line in text.split(whereSeparator: \.isNewline) where !line.isEmpty {
+            do {
+                entries.append(try decoder.decode(T.self, from: Data(line.utf8)))
+            } catch {
+                malformed += 1
+            }
+        }
+        // A torn line (crash mid-append) must degrade the ledger, not brick
+        // every tool that touches it — search/pack append to these files on
+        // every call and used to exit 1 the moment one line was unreadable.
+        if malformed > 0 {
+            FileHandle.standardError.write(Data(
+                "[cckit] skipped \(malformed) malformed ledger line(s) in \(fileURL.lastPathComponent)\n".utf8
+            ))
+        }
+        return entries
     }
 
     public static func rewrite<T: Encodable>(_ entries: [T], to fileURL: URL) throws {
@@ -112,6 +126,17 @@ public enum JSONLRetention: Sendable {
     @discardableResult
     public static func ensurePrunedIfDue(cckitDir: URL, now: Date = Date()) throws -> Bool {
         guard isPruneDue(cckitDir: cckitDir, now: now) else { return false }
+
+        // The prune is read-modify-REWRITE: a concurrent process appending
+        // between the read and the rewrite loses its row. Every cckit process
+        // already honors the repo refresh lock, so hold it for the rewrite;
+        // when a long index run holds it, pruning waits for a later call.
+        guard let lock = RefreshLock.tryAcquire(
+            lockPath: cckitDir.appendingPathComponent("refresh.lock").path
+        ) else {
+            return false
+        }
+        defer { lock.release() }
 
         let packURL = cckitDir.appendingPathComponent(PackSavingsLedger.fileName)
         let historyURL = cckitDir.appendingPathComponent(ActionHistoryStore.fileName)

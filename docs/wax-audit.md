@@ -1,8 +1,31 @@
 # Wax storage audit for CodeContextKit
 
-Audit date: 2026-08-27  
+Audit date: 2026-08-27 (addendum 2026-09-01, commit of the same day)  
 Incident baseline: cckit `46155d396979f132402517906f8250091f048714`, Wax `d4de9d6a8af73b55b0fefe3a5786bab27f6d8cf1`  
 Current Wax pin: `3405b8c6ecf1dd0b6322936f1681ec8b480a3b08` (`Package.swift:28`, `Package.resolved:340-343`)
+
+## 2026-09-01 audit addendum
+
+Full re-audit of the Wax arena lifecycle and the token-savings accounting against the
+post-97733a8 code. Findings and dispositions (all fixed in the same-day commit unless noted):
+
+| ID | Finding | Disposition |
+|---|---|---|
+| WAX-14 | Delta runs had no atomicity: SQLite coverage/mandate rows committed per file while Wax saves stayed uncommitted until the end-of-run flush. An interrupted run (SIGKILL, mid-run cap abort) left coverage rows claiming arena documents that died with the process — silently partial arena, invisible to WaxReadGate (frameCount > 0, no uncovered paths). | Fixed: mandate + coverage rows are now written only AFTER the flush commits (Indexer durability contract). An interrupted run leaves files uncovered and the existing delta preflight retries them. |
+| WAX-15 | One torn/malformed line in `pack_savings.jsonl` / `action_history.jsonl` made every search/pack fail permanently (`JSONLRetention.load` threw on decode). Cross-process prune-rewrite vs append could also drop rows. | Fixed: load skips malformed lines with a stderr warning; prune is serialized under the repo refresh lock. |
+| WAX-16 | Server opened `repo.wax` unconditionally at startup: created an empty arena on lexical-only repos and held the arena lease for the process lifetime, so any CLI read failed fast while the dashboard ran. | Partially fixed: lexical-only servers never open the arena (no creation, no lease; semantic endpoints degrade; dashboard reindex stays lexical; semantic-graph links are pure local math and still work). A semantic repo's server still holds the handle for its lifetime — concurrent CLI reads fail fast by contract. The residual fix (read-only or bounded-wait open) is upstream-bound; see WAX-08. |
+| WAX-17 | Every MiniLM document embedded a trailing random `cckitwax_<mandate>` token: wasted model context and injected per-document noise; nothing ever searched by it (mandate bookkeeping is SQLite-side). | Fixed: mandate rides in metadata only; previews of legacy arenas still strip the token. Embedder identity bumped `v2-selective` → `v3-selective` so the next index re-embeds everything for consistent scoring. |
+| SAV-1 | Partial budget truncation was silent: a packet delivering 2-of-5 primaries read as a confident small answer (only the 0-primary case was noticed). | Fixed: packer counts dropped primaries; pack warns on stderr, stamps the packet warning section, and adds `droppedPrimaries` to PACK_STATS. |
+| SAV-2 | Surgical assembly could re-emit a symbol slice of a file already fully delivered by an earlier primary (asymmetric guard vs the preferFullFast branch). | Fixed: the already-emitted branch skips. |
+| SAV-3 | Chrome-only packets (empty lexical results, budget-truncated headers) recorded negative "savings" (the cost of the warning text) into `pack_savings.jsonl`. | Fixed: savings records require `primaryCount > 0`; `action_history` still carries every call. |
+| SAV-4 | Lexical-only pack with zero primaries delivered a silent empty packet (the "Note" from the 97733a8 probing round). | Fixed: packet carries an explicit lexicalEmpty warning, stderr warning, and PACK_STATS `lexicalEmpty`. The underlying narrowness of lexical primary selection (Titlecase single words are not identifier-like, so prose tasks find nothing) is a deliberate `SemanticIndexPolicy` trade-off, unchanged. |
+| SAV-5 | Breach-marker operator message ("NEXT index aborts") and doc comment contradicted the actual behavior (staged rebuild + swap, marker cleared post-swap). Mid-run cap doc named a nonexistent `CCKIT_WAX_MIN_BYTES` env var. | Fixed (text). |
+
+Residual, upstream-bound: WAX-08 read-only/bounded-wait arena open (server lifetime lease),
+WAX-01/02 batch delete (twin leak bounded by the delta band), W7's >64x shrink blind spot
+(treated as impossible watermark by design).
+
+# Original 2026-08-27 audit
 
 ## Current integration status
 

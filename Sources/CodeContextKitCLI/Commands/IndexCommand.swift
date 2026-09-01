@@ -68,9 +68,11 @@ struct IndexCommand: AsyncParsableCommand {
         return max(0, allocated)
     }
 
-    /// Marker written when a closed arena is still over the ceiling after a
-    /// forced reclaim. The NEXT index run refuses on sight of it (the current
-    /// run has already done its work by then); `--clean` or genuine recovery
+    /// Marker written when an index run aborts with the arena over its
+    /// mid-run cap, or when a compact lands past the settle bloat ratio with
+    /// reclaimable bytes. The NEXT index run routes into a full staged
+    /// rebuild on sight of it and clears the marker only after a successful
+    /// swap; reads carry the warning until then. `--clean` or genuine recovery
     /// clears it.
     static let breachMarkerName = "wax-breach-marker.json"
 
@@ -249,7 +251,7 @@ struct IndexCommand: AsyncParsableCommand {
                     factor: settleBloatRatioThreshold()
                 )
                 print(
-                    "Breach marker armed: NEXT 'cckit index' aborts until 'cckit index . --clean' rebuilds from scratch."
+                    "Breach marker armed: the next 'cckit index' rebuilds the arena from scratch (staged swap); reads carry the breach warning until it completes."
                 )
                 return false
             }
@@ -273,8 +275,9 @@ struct IndexCommand: AsyncParsableCommand {
     /// over the pre-run arena, with an absolute floor so legitimately large
     /// repos are never clipped. Current Wax no longer exposes live-byte
     /// diagnostics publicly, so cckit relies on fresh filesystem allocation.
-    /// Env-tunable: CCKIT_WAX_MIDRUN_FACTOR (default 8), CCKIT_WAX_MIN_BYTES
-    /// (default 8 GiB), CCKIT_WAX_MIDRUN_CAP=off disables entirely.
+    /// Env-tunable: CCKIT_WAX_MIDRUN_FACTOR (default 8),
+    /// CCKIT_WAX_MIDRUN_MIN_BYTES (default 8 GiB), CCKIT_WAX_MIDRUN_CAP=off
+    /// disables entirely.
     static func midRunArenaCap(
         mustRebuild: Bool,
         bytesBefore: Int
@@ -528,7 +531,7 @@ struct IndexCommand: AsyncParsableCommand {
                     factor: 8.0
                 )
                 print(
-                    "Breach marker armed: NEXT 'cckit index' aborts until 'cckit index . --clean' rebuilds from scratch."
+                    "Breach marker armed: the next 'cckit index' rebuilds the arena from scratch (staged swap); reads carry the breach warning until it completes."
                 )
             }
             throw error

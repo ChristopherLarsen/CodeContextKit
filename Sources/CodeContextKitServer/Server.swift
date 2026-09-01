@@ -79,9 +79,14 @@ public struct CodeContextServer: Sendable {
         let router = Router(context: ServerContext.self)
         router.addMiddleware { FileMiddleware(webPath, searchForIndexHtml: true) }
         let db = try Database(path: dbPath)
-        let wax = try await WaxStore(path: ".cckit/repo.wax")
+        // A lexical-only repo has no arena by design: opening Wax here would
+        // create an empty repo.wax as a side effect and hold the arena lease
+        // for the server's lifetime. Semantic endpoints degrade gracefully;
+        // the dashboard reindex stays lexical, matching the marker.
+        let lexicalOnly = SemanticIndexPolicy.lexicalOnlyRequested(flag: false, cckitDir: ".cckit")
+        let wax: WaxStore? = lexicalOnly ? nil : try await WaxStore(path: ".cckit/repo.wax")
         let indexer = Indexer(db: db, wax: wax)
-        let actionOrchestrator = ActionOrchestrator(wax: wax)
+        let actionOrchestrator = wax.map { ActionOrchestrator(wax: $0) } ?? ActionOrchestrator(repoRoot: ".")
 
         // Serve-path integrity: same contract as pack/search — an openable
         // arena is not proof it is serviceable. Attached to search responses
@@ -99,7 +104,9 @@ public struct CodeContextServer: Sendable {
             let existing = SemanticIndexPolicy.lexicalOnlyRequested(flag: false, cckitDir: ".cckit")
                 ? []
                 : uncovered.filter { FileManager.default.fileExists(atPath: $0) }
-            if let fault = WaxReadGate.hardFault(
+            // With no arena handle (lexical-only) the allocation/frame checks
+            // cannot run; the fault gate stays db-side only.
+            if let wax, let fault = WaxReadGate.hardFault(
                 allocatedBytes: await wax.allocatedBytes(),
                 expectedAllocatedBytes: WaxCompactStamp.readWatermark(cckitDir: ".cckit")?.waxBytes ?? 0,
                 uncoveredExistingPaths: existing,
@@ -109,6 +116,13 @@ public struct CodeContextServer: Sendable {
                 fields["arenaFault"] = fault.localizedDescription
             }
             return fields
+        }
+
+        // Arena-backed search that tolerates a nil handle (lexical-only
+        // server): empty results, never a crash or a silent arena creation.
+        @Sendable func arenaSearch(_ query: String, limit: Int) async -> [SearchResult] {
+            guard let wax else { return [] }
+            return (try? await wax.search(query, limit: limit)) ?? []
         }
 
         let currentDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -205,7 +219,7 @@ public struct CodeContextServer: Sendable {
                                     items[file.path] = String(content.prefix(2000))
                                 }
                             }
-                            let result = await wax.getSemanticLinks(for: items, threshold: 0.3)
+                            let result = await WaxStore.getSemanticLinks(for: items, threshold: 0.3)
                             let response = ["type": "semantic_graph_links", "data": [
                                 "links": result.links.map { ["source": $0.source, "target": $0.target, "strength": $0.strength] },
                                 "topics": result.topics
@@ -234,7 +248,7 @@ public struct CodeContextServer: Sendable {
                                         }
                                     }
                                 }
-                                let result = await wax.getSemanticLinks(for: items, threshold: 0.4)
+                                let result = await WaxStore.getSemanticLinks(for: items, threshold: 0.4)
                                 let response = ["type": "pack_semantic_links", "data": [
                                     "links": result.links.map { ["source": $0.source, "target": $0.target, "strength": $0.strength] },
                                     "topics": result.topics
@@ -251,7 +265,7 @@ public struct CodeContextServer: Sendable {
                             
                             Task {
                                 do {
-                                    let builder = RepoMapBuilder(db: db, counter: { text in await wax.countTokens(text) })
+                                    let builder = RepoMapBuilder(db: db, counter: { text in TokenEstimator.shared.estimate(text) })
                                     let delegate = WebSocketRepoMapProgressDelegate(state: state)
                                     let map = try await builder.buildMap(budget: budget, focusTerms: focus, delegate: delegate)
                                     
@@ -341,7 +355,7 @@ public struct CodeContextServer: Sendable {
                         case "search_for_pack":
                             if let query = json["query"] as? String {
                                 let semanticQuery = query.hasPrefix("semantic:") ? String(query.dropFirst(9)) : query
-                                let waxResults = (try? await wax.search(semanticQuery, limit: 15)) ?? []
+                                let waxResults = await arenaSearch(semanticQuery, limit: 15)
                                 var items: [[String: String]] = []
                                 var reasons: [String] = []
                                 for res in waxResults {
@@ -400,7 +414,7 @@ public struct CodeContextServer: Sendable {
                                 }
                                 
                                 // Use Wax for accurate count
-                                let tokenCount = await wax.countTokens(contextText)
+                                let tokenCount = TokenEstimator.shared.estimate(contextText)
                                 let response = ["type": "pack_text_preview", "data": contextText, "estimate": Double(tokenCount)]
                                 let responseData = try JSONSerialization.data(withJSONObject: response)
                                 try await outbound.write(.text(String(data: responseData, encoding: .utf8)!))
@@ -573,7 +587,7 @@ public struct CodeContextServer: Sendable {
                                     let files = try db.getFilesLike(pattern: stripped, strict: allowVectorFallback)
                                     let symbols = try db.getSymbolsLike(name: stripped, strict: allowVectorFallback)
                                     if allowVectorFallback && files.isEmpty && symbols.isEmpty {
-                                        let waxResults = (try? await wax.search(stripped, limit: 8)) ?? []
+                                        let waxResults = await arenaSearch(stripped, limit: 8)
                                         var semanticMatches: [[String: Any]] = []
                                         for res in waxResults {
                                             if let sym = try db.getSymbols(qualifiedName: res.symbol).first {
@@ -598,7 +612,7 @@ public struct CodeContextServer: Sendable {
                                         ] }
                                     }
                                 case .vector(let semanticQuery):
-                                    let waxResults = (try? await wax.search(semanticQuery, limit: 8)) ?? []
+                                    let waxResults = await arenaSearch(semanticQuery, limit: 8)
                                     var semanticMatches: [[String: Any]] = []
                                     for res in waxResults {
                                         if let sym = try db.getSymbols(qualifiedName: res.symbol).first {
@@ -632,7 +646,7 @@ public struct CodeContextServer: Sendable {
 
                         case "estimate_tokens":
                             if let text = json["text"] as? String {
-                                let count = await wax.countTokens(text)
+                                let count = TokenEstimator.shared.estimate(text)
                                 let response = ["type": "estimate_result", "count": count]
                                 let responseData = try JSONSerialization.data(withJSONObject: response)
                                 try await outbound.write(.text(String(data: responseData, encoding: .utf8)!))

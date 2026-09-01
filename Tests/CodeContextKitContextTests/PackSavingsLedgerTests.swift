@@ -518,4 +518,37 @@ final class PackSavingsLedgerTests: XCTestCase {
         XCTAssertEqual(entries.map(\.task), ["a", "b"])
         try? FileManager.default.removeItem(at: dir)
     }
+
+    /// A torn line (crash mid-append) must degrade the ledger to "skip and
+    /// warn", never brick every search/pack that appends to the file.
+    func testMalformedLinesAreSkippedNotFatal() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cckit-ledger-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("pack_savings.jsonl")
+        let ledger = PackSavingsLedger(fileURL: file)
+        let now = Date()
+
+        try ledger.append(PackSavingsEntry(
+            timestamp: now,
+            task: "valid",
+            repo: "/r",
+            requestedMode: "auto",
+            deliveredMode: "surgical",
+            deliveredTokens: 10,
+            sourceWholeFileTokens: 20,
+            tokensSaved: 10,
+            budget: 100
+        ), now: now)
+
+        let handle = try FileHandle(forWritingTo: file)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"task\": \"torn-trunc".utf8))
+        try handle.write(contentsOf: Data("\nnot json at all\n".utf8))
+
+        let entries = try ledger.loadEntries(now: now.addingTimeInterval(60))
+        XCTAssertEqual(entries.map(\.task), ["valid"])
+    }
 }

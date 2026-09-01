@@ -45,6 +45,9 @@ public struct PackResult: Sendable {
     public let waxFillRan: Bool
     /// Raw Wax search hits behind the fill (0 when the fill did not run).
     public let waxHitCount: Int
+    /// Primaries dropped by assembly to stay under the budget. Zero means the
+    /// packet is complete for its primary set (or there was no primary set).
+    public let droppedPrimaries: Int
 
     public init(
         packet: String,
@@ -56,7 +59,8 @@ public struct PackResult: Sendable {
         sourceWholeFileTokens: Int = 0,
         primaryCount: Int = 0,
         waxFillRan: Bool = false,
-        waxHitCount: Int = 0
+        waxHitCount: Int = 0,
+        droppedPrimaries: Int = 0
     ) {
         self.packet = packet
         self.requestedMode = requestedMode
@@ -68,6 +72,7 @@ public struct PackResult: Sendable {
         self.primaryCount = primaryCount
         self.waxFillRan = waxFillRan
         self.waxHitCount = waxHitCount
+        self.droppedPrimaries = droppedPrimaries
     }
 
     /// Tokens avoided versus reading whole source files drawn into the packet.
@@ -202,7 +207,8 @@ public final class ContextPacker {
                     sourceWholeFileTokens: sourceWhole,
                     primaryCount: delivered.primaryCount,
                     waxFillRan: delivered.waxFillRan,
-                    waxHitCount: delivered.waxHitCount
+                    waxHitCount: delivered.waxHitCount,
+                    droppedPrimaries: delivered.droppedPrimaries
                 )
             }
             let surgical = try await packOnce(
@@ -246,7 +252,8 @@ public final class ContextPacker {
                     sourceWholeFileTokens: sourceWhole,
                     primaryCount: delivered.primaryCount,
                     waxFillRan: delivered.waxFillRan,
-                    waxHitCount: delivered.waxHitCount
+                    waxHitCount: delivered.waxHitCount,
+                    droppedPrimaries: delivered.droppedPrimaries
                 )
             }
             let full = try await packOnce(
@@ -284,7 +291,8 @@ public final class ContextPacker {
                 sourceWholeFileTokens: sourceWhole,
                 primaryCount: delivered.primaryCount,
                 waxFillRan: delivered.waxFillRan,
-                waxHitCount: delivered.waxHitCount
+                waxHitCount: delivered.waxHitCount,
+                droppedPrimaries: delivered.droppedPrimaries
             )
         }
 
@@ -310,7 +318,8 @@ public final class ContextPacker {
                 sourceWholeFileTokens: sourceWhole,
                 primaryCount: assembled.primaryCount,
                 waxFillRan: assembled.waxFillRan,
-                waxHitCount: assembled.waxHitCount
+                waxHitCount: assembled.waxHitCount,
+                droppedPrimaries: assembled.droppedPrimaries
             )
         }
 
@@ -338,7 +347,8 @@ public final class ContextPacker {
             sourceWholeFileTokens: sourceWhole,
             primaryCount: assembled.primaryCount,
             waxFillRan: assembled.waxFillRan,
-            waxHitCount: assembled.waxHitCount
+            waxHitCount: assembled.waxHitCount,
+            droppedPrimaries: assembled.droppedPrimaries
         )
     }
 
@@ -350,6 +360,10 @@ public final class ContextPacker {
         var primaryCount: Int
         var waxFillRan: Bool
         var waxHitCount: Int
+        /// Primaries that did not fit the budget and were silently dropped by
+        /// assembly. Zero-primary truncation gets its own probe in the CLI;
+        /// this surfaces the partial case.
+        var droppedPrimaries: Int = 0
     }
 
     private struct BaselineDelivery: Sendable {
@@ -359,6 +373,7 @@ public final class ContextPacker {
         var primaryCount: Int
         var waxFillRan: Bool
         var waxHitCount: Int
+        var droppedPrimaries: Int
     }
 
     /// Auto must never deliver a packet larger than reading its primary files
@@ -376,7 +391,7 @@ public final class ContextPacker {
         sourceWhole: Int
     ) async -> BaselineDelivery {
         guard let best = candidates.min(by: { $0.2 < $1.2 }) else {
-            return BaselineDelivery(packet: "", mode: .raw, tokens: 0, primaryCount: 0, waxFillRan: false, waxHitCount: 0)
+            return BaselineDelivery(packet: "", mode: .raw, tokens: 0, primaryCount: 0, waxFillRan: false, waxHitCount: 0, droppedPrimaries: 0)
         }
         if best.2 <= sourceWhole || fallbackPaths.isEmpty {
             return BaselineDelivery(
@@ -385,7 +400,8 @@ public final class ContextPacker {
                 tokens: best.2,
                 primaryCount: best.0.primaryCount,
                 waxFillRan: best.0.waxFillRan,
-                waxHitCount: best.0.waxHitCount
+                waxHitCount: best.0.waxHitCount,
+                droppedPrimaries: best.0.droppedPrimaries
             )
         }
 
@@ -408,7 +424,8 @@ public final class ContextPacker {
                         tokens: rawTokens,
                         primaryCount: raw.primaryCount,
                         waxFillRan: raw.waxFillRan,
-                        waxHitCount: raw.waxHitCount
+                        waxHitCount: raw.waxHitCount,
+                        droppedPrimaries: raw.droppedPrimaries
                     )
                 }
             }
@@ -424,7 +441,8 @@ public final class ContextPacker {
                 tokens: minimalTokens,
                 primaryCount: best.0.primaryCount,
                 waxFillRan: best.0.waxFillRan,
-                waxHitCount: best.0.waxHitCount
+                waxHitCount: best.0.waxHitCount,
+                droppedPrimaries: best.0.droppedPrimaries
             )
         }
         return BaselineDelivery(
@@ -433,7 +451,8 @@ public final class ContextPacker {
             tokens: best.2,
             primaryCount: best.0.primaryCount,
             waxFillRan: best.0.waxFillRan,
-            waxHitCount: best.0.waxHitCount
+            waxHitCount: best.0.waxHitCount,
+            droppedPrimaries: best.0.droppedPrimaries
         )
     }
 
@@ -587,6 +606,7 @@ public final class ContextPacker {
         var primarySymbolCount = 0
         var primaryFullFileCount = 0
         var associatedSkeletonCount = 0
+        var droppedPrimaries = 0
         var emittedFullPaths = Set<String>()
         var primaryFilePaths = Set<String>()
         var anyHintsTruncated = false
@@ -628,8 +648,11 @@ public final class ContextPacker {
                 stagedFiles.append(sym.filePath)
             }
 
-            for path in stagedFiles {
-                if currentTokens >= budget { break }
+            for (stageIndex, path) in stagedFiles.enumerated() {
+                if currentTokens >= budget {
+                    droppedPrimaries += stagedFiles.count - stageIndex
+                    break
+                }
                 guard let content = readFile(path: path, rootURL: rootURL) else { continue }
                 let section = formatFullFileSection(path: path, content: content)
                 let sectionTokens = await countTokens(section)
@@ -639,6 +662,8 @@ public final class ContextPacker {
                     primaryFullFileCount += 1
                     emittedFullPaths.insert(path)
                     primaryFilePaths.insert(path)
+                } else {
+                    droppedPrimaries += 1
                 }
             }
         } else {
@@ -685,8 +710,10 @@ public final class ContextPacker {
                             emittedAsFull = false
                         }
                     } else {
-                        section = symbolSection
-                        emittedAsFull = false
+                        // The whole file is already in the packet from an
+                        // earlier primary; a fresh slice would duplicate bytes
+                        // already delivered.
+                        continue
                     }
                 }
 
@@ -701,6 +728,8 @@ public final class ContextPacker {
                     } else {
                         primarySymbolCount += 1
                     }
+                } else {
+                    droppedPrimaries += 1
                 }
             }
         }
@@ -768,7 +797,8 @@ public final class ContextPacker {
             primaryFilePaths: primaryFilePaths,
             primaryCount: primarySymbolCount + primaryFullFileCount,
             waxFillRan: waxFillRan,
-            waxHitCount: waxHitCount
+            waxHitCount: waxHitCount,
+            droppedPrimaries: droppedPrimaries
         )
     }
 

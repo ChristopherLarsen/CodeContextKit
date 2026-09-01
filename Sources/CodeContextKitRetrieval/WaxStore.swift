@@ -125,8 +125,12 @@ public actor WaxStore {
         let text = SemanticIndexPolicy.documentText(for: symbol, body: body)
         let hash = Self.fnv1a64(text)
         let mandate = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        let token = Self.mandateToken(mandate)
-        let stored = text + "\n" + token
+        // The mandate rides in metadata only. Appending it to the embedded
+        // text spent MiniLM context on a random token per document and added
+        // per-document noise to every vector; nothing ever searched by the
+        // token (mandate bookkeeping is SQLite-side). Previews of arenas
+        // written by older builds still strip it (stripMandate).
+        let stored = text
 
         let metadata = [
             "qualifiedName": symbol.qualifiedName,
@@ -191,7 +195,10 @@ public actor WaxStore {
         return order.prefix(limit).compactMap { bestBySymbol[$0] }
     }
 
-    public func getSemanticLinks(for items: [String: String], threshold: Float = 0.3) async -> SemanticResponse {
+    /// Pure local math (hash proxy vectors + cosine), no arena needed —
+    /// static so the visualizer can compute semantic links on a lexical-only
+    /// repo or without holding the arena lease.
+    public static func getSemanticLinks(for items: [String: String], threshold: Float = 0.3) async -> SemanticResponse {
         var links: [SemanticLink] = []
         let ids = Array(items.keys)
         var vectors: [String: [Float]] = [:]
@@ -217,7 +224,7 @@ public actor WaxStore {
         return SemanticResponse(links: links, topics: categories)
     }
 
-    private func extractMainTopic(from text: String) -> String {
+    private static func extractMainTopic(from text: String) -> String {
         let stopWords: Set<String> = ["the", "and", "func", "struct", "class", "var", "let", "return", "if", "else", "for", "in", "import", "public", "private", "extension", "case", "enum"]
         let words = text.lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
@@ -381,11 +388,10 @@ public actor WaxStore {
         Self.waxFileAllocatedBytes(at: path)
     }
 
-    private static func mandateToken(_ mandate: String) -> String {
-        "cckitwax_\(mandate)"
-    }
-
     private static func stripMandate(_ text: String) -> String {
+        // Legacy arenas (pre-v3) embedded a trailing `cckitwax_<mandate>`
+        // token in every document; strip it from previews. New documents
+        // carry the mandate in metadata only and pass through unchanged.
         guard let range = text.range(of: "\ncckitwax_", options: .backwards) else {
             return text
         }
@@ -403,7 +409,7 @@ public actor WaxStore {
     }
 
     // Internal Math for Graph forces
-    private func generateProxyVector(for text: String) -> [Float] {
+    private static func generateProxyVector(for text: String) -> [Float] {
         var vector = [Float](repeating: 0.0, count: 128)
         let words = text.lowercased().components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
         for word in words {
@@ -415,7 +421,7 @@ public actor WaxStore {
         return vector
     }
 
-    private func cosineSimilarity(_ v1: [Float], _ v2: [Float]) -> Float {
+    private static func cosineSimilarity(_ v1: [Float], _ v2: [Float]) -> Float {
         guard v1.count == v2.count else { return 0 }
         var dotProduct: Float = 0
         for i in 0..<v1.count { dotProduct += v1[i] * v2[i] }
@@ -517,7 +523,10 @@ public struct SearchResult: Codable, Sendable {
 /// must rebuild via `cckit index` before `semantic:` / pack / serve work.
 public enum WaxEmbedderIdentity {
     /// Bump when the embedding model/dimensions change so indexes are rebuilt.
-    public static let current = "Wax.BuiltIn.miniLM.v2-selective"
+    /// v3: the per-document mandate token was removed from the embedded text
+    /// (metadata-only now), so every document must re-embed for consistent
+    /// scoring — the mismatch rebuild happens automatically on the next index.
+    public static let current = "Wax.BuiltIn.miniLM.v3-selective"
     public static let sidecarFileName = "wax-embedder-id"
 
     public enum ReadinessError: Error, LocalizedError, Equatable {

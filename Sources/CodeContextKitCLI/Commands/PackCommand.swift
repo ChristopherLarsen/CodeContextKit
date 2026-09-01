@@ -186,7 +186,11 @@ struct PackCommand: AsyncParsableCommand {
 
         // Preview is a routing aid (map + names), not a compressed delivery —
         // comparing it against whole-file baselines produces fake negatives.
-        let recordsSavings = !noLedger && mode != .preview
+        // Zero-primary packets (empty lexical results, budget-truncated
+        // headers, degraded-semantic responses) are chrome-only: recording
+        // them in the savings ledger books negative "savings" that is really
+        // the cost of the warning text. action_history already has the call.
+        let recordsSavings = !noLedger && mode != .preview && result.primaryCount > 0
         if recordsSavings {
             let repo = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).path
             try PackSavingsLedger(repoRoot: ".").record(
@@ -211,6 +215,20 @@ struct PackCommand: AsyncParsableCommand {
         if result.primaryCount == 0, result.waxFillRan, result.waxHitCount == 0, let wax {
             semanticUnavailable = ((try? db.waxMandateCount()) ?? 0) > 0
         }
+        // Partial budget truncation: primaries existed but did not fit. The
+        // zero-primary case has its own probe above; the partial case used to
+        // look like a confident small answer.
+        if !preview, result.droppedPrimaries > 0 {
+            InteractiveProgress.write(
+                "Warning: budget \(budget) dropped \(result.droppedPrimaries) primary hit(s) to stay under the ceiling. "
+                    + "Re-run with a larger --budget for the rest.\n",
+                to: .standardError
+            )
+        }
+        // A lexical-only pack with zero primaries is either a true absence or
+        // a prose-shaped task the locators cannot see. Never deliver it as a
+        // silent confident negative.
+        let lexicalEmpty = wax == nil && !preview && result.primaryCount == 0
         var packet = result.packet
         if let truncation {
             packet = ContextPacker.appendBudgetNotice(
@@ -226,11 +244,12 @@ struct PackCommand: AsyncParsableCommand {
                 to: .standardError
             )
         }
-        if semanticUnavailable || breachWarning != nil {
+        if semanticUnavailable || breachWarning != nil || lexicalEmpty {
             packet = Self.appendDegradedNotice(
                 to: packet,
                 semanticUnavailable: semanticUnavailable,
-                breachWarning: breachWarning
+                breachWarning: breachWarning,
+                lexicalEmpty: lexicalEmpty
             )
         }
 
@@ -264,6 +283,12 @@ struct PackCommand: AsyncParsableCommand {
                     enriched["budgetTruncated"] = true
                     enriched["unconstrainedTokens"] = truncation.unconstrainedTokens
                 }
+                if result.droppedPrimaries > 0 {
+                    enriched["droppedPrimaries"] = result.droppedPrimaries
+                }
+                if lexicalEmpty {
+                    enriched["lexicalEmpty"] = true
+                }
                 if let data = try? JSONSerialization.data(withJSONObject: enriched, options: [.sortedKeys]) {
                     print("PACK_STATS \(String(decoding: data, as: UTF8.self))")
                 }
@@ -289,7 +314,8 @@ struct PackCommand: AsyncParsableCommand {
     static func appendDegradedNotice(
         to packet: String,
         semanticUnavailable: Bool,
-        breachWarning: String?
+        breachWarning: String?,
+        lexicalEmpty: Bool = false
     ) -> String {
         var lines: [String] = []
         if semanticUnavailable {
@@ -301,6 +327,14 @@ struct PackCommand: AsyncParsableCommand {
         }
         if let breachWarning {
             lines.append(breachWarning)
+        }
+        if lexicalEmpty {
+            lines.append(
+                "No locator matches for this task and the index is lexical-only (no semantic arena), " +
+                    "so no vector fill ran. The packet may be a true absence, or the task may need " +
+                    "identifier-shaped terms. Verify with `cckit search` or `cckit map`; re-index " +
+                    "semantically with 'CCKIT_NO_SEMANTIC=0 cckit index .' to enable vector retrieval."
+            )
         }
         guard !lines.isEmpty else { return packet }
         return packet.trimmingCharacters(in: .newlines) + "\n\n## Warning\n\n" + lines.joined(separator: "\n") + "\n"

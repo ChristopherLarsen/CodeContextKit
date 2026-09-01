@@ -156,6 +156,10 @@ public final class Indexer: Sendable {
         var updatedCount = 0
         var skippedCount = 0
         var totalSymbols = 0
+        // Files whose arena documents were saved this run, awaiting the
+        // durability pass. Mandate + coverage rows are written only AFTER
+        // flush() commits — see the durability contract at the flush site.
+        var pendingCoverage: [(fileId: Int64, mandates: [String])] = []
         
         for (index, fileURL) in files.enumerated() {
             let relativePath = relativePath(for: fileURL, rootPath: absolutePath)
@@ -256,26 +260,16 @@ public final class Indexer: Sendable {
                 try db.saveSymbols(symbols, references: references, fileId: fileId)
 
                 if let wax {
+                    var mandates: [String] = []
                     for symbol in symbols {
                         let body = symbol.kind == .file ? content : LineRangeBodyExtractor.body(for: symbol, content: content)
                         let ingest = try await wax.saveSymbol(symbol, body: body)
                         if ingest.didWrite {
-                            try db.saveWaxFrames(
-                                fileId: fileId,
-                                mandate: ingest.mandate,
-                                frameIDs: ingest.frameIDs
-                            )
+                            mandates.append(ingest.mandate)
                         }
                     }
-
-                    // Written last: an interrupted or partially failed file has
-                    // no coverage marker, forcing the next run to rebuild/retry.
-                    // Files with no eligible semantic symbols still get covered,
-                    // so a true no-op does not rebuild forever. Lexical-only
-                    // runs claim no semantic coverage.
-                    try db.markWaxCoverage(fileId: fileId)
+                    pendingCoverage.append((fileId, mandates))
                 }
-                
                 updatedCount += 1
                 totalSymbols += symbols.count
             } catch {
@@ -296,8 +290,25 @@ public final class Indexer: Sendable {
             }
         }
 
+        // Durability contract: the arena commit and the SQLite bookkeeping for
+        // it must land in this order. Wax saves are uncommitted memory until
+        // flush(), while SQLite rows commit immediately — writing coverage
+        // markers before the flush meant an interrupted run (SIGKILL, mid-run
+        // cap abort) left rows claiming arena documents that died with the
+        // process. The read gate cannot see that shape (frameCount > 0, no
+        // uncovered paths), so the arena went silently partial. Deferring the
+        // rows until after a successful flush keeps the invariant one-way:
+        // coverage implies committed documents. An interrupted run now leaves
+        // the affected files uncovered, and the existing delta preflight
+        // retries them on the next run.
         if let wax {
             try await wax.flush()
+            for (fileId, mandates) in pendingCoverage {
+                for mandate in mandates {
+                    try db.saveWaxFrames(fileId: fileId, mandate: mandate, frameIDs: [])
+                }
+                try db.markWaxCoverage(fileId: fileId)
+            }
         }
         let currentWaxRecordCount = try db.waxFrameCount()
 
