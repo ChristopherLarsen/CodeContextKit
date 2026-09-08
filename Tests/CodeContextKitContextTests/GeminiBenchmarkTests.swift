@@ -89,10 +89,13 @@ final class GeminiBenchmarkTests: XCTestCase {
         let baselineContext = "## AuthManager.swift\n\(authContent)\n## APIClient.swift\n\(apiContent)"
         let baselineTokens = estimator.estimate(baselineContext)
         
-        // 2. CCKit Approach: Targeted Repo Map with focus terms
+        // 2. CCKit Approach: Targeted Repo Map with path/module focus terms
         let localEstimator = TokenEstimator()
         let builder = RepoMapBuilder(db: db, counter: { text in localEstimator.estimate(text) })
-        let cckitContext = try await builder.buildMap(budget: 1500, focusTerms: "refreshToken APIClient")
+        let cckitContext = try await builder.buildMap(
+            budget: 1500,
+            focusTerms: "AuthManager APIClient"
+        )
         let cckitTokens = estimator.estimate(cckitContext)
         
         print("--- BASELINE CONTEXT (\(baselineTokens) tokens) ---")

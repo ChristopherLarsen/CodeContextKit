@@ -1,0 +1,332 @@
+{
+  "auditDate": "2026-09-07",
+  "commit": "d080e7e",
+  "branch": "cckit-improvements",
+  "fixtureMode": "lexical-only",
+  "tokenizer": "tiktoken o200k_base, encoded strings only, not billing usage",
+  "releaseBuild": "passed",
+  "swiftTests": {
+    "result": "passed",
+    "count": 30,
+    "filter": "ContextPackerSliceTests|SymbolBodyResolverTests|RepoMapAssemblerTests|BudgetTruncationNoticeTests"
+  },
+  "mcpTests": {
+    "result": "passed",
+    "count": 112,
+    "environment": "CCKIT_BIN=/usr/bin/false isolates unmocked external calls"
+  },
+  "probeResults": {
+    "preview_body": {
+      "firstLine": "# Context Packet (Tokens: 496/1500 \u00b7 primary: 2 symbols \u00b7 associated: 0 skeletons \u00b7 mode: preview)",
+      "o200kTokens": 293,
+      "chars": 1093,
+      "targetBody": true,
+      "secondBody": false,
+      "smallBody": false,
+      "failureKept": false,
+      "stats": null,
+      "stderr": ""
+    },
+    "surgical_ok": {
+      "firstLine": "# Context Packet (Tokens: 627/2000 \u00b7 primary: 1 symbols \u00b7 associated: 0 skeletons \u00b7 mode: surgical)",
+      "o200kTokens": 340,
+      "chars": 1431,
+      "targetBody": true,
+      "secondBody": false,
+      "smallBody": false,
+      "failureKept": false,
+      "stats": {
+        "deliveredMode": "surgical",
+        "deliveredTokens": 627,
+        "sourceWholeFileTokens": 6290,
+        "tokensSaved": 5663
+      },
+      "stderr": ""
+    },
+    "auto_empty": {
+      "firstLine": "# Context Packet (Tokens: 72/2000 \u00b7 primary: 0 symbols \u00b7 associated: 0 skeletons \u00b7 mode: raw)",
+      "o200kTokens": 171,
+      "chars": 709,
+      "targetBody": false,
+      "secondBody": false,
+      "smallBody": false,
+      "failureKept": false,
+      "stats": {
+        "budgetTruncated": true,
+        "deliveredMode": "raw",
+        "deliveredTokens": 72,
+        "droppedPrimaries": 1,
+        "lexicalEmpty": true,
+        "sourceWholeFileTokens": 0,
+        "tokensSaved": -72,
+        "unconstrainedTokens": 758
+      },
+      "stderr": "Warning: budget 2000 dropped 1 primary hit(s) to stay under the ceiling. Re-run with a larger --budget for the rest.\nWarning: budget 2000 delivered 0 primaries for this task; an unconstrained pack is ~758 tokens (1 primaries). Raise --budget to retrieve real context."
+    },
+    "surgical_two": {
+      "firstLine": "# Context Packet (Tokens: 707/2000 \u00b7 primary: 1 symbols, 1 full files \u00b7 associated: 0 skeletons \u00b7 mode: surgical)",
+      "o200kTokens": 385,
+      "chars": 1606,
+      "targetBody": true,
+      "secondBody": false,
+      "smallBody": true,
+      "failureKept": false,
+      "stats": {
+        "deliveredMode": "surgical",
+        "deliveredTokens": 707,
+        "sourceWholeFileTokens": 6324,
+        "tokensSaved": 5617
+      },
+      "stderr": ""
+    },
+    "auto_partial": {
+      "firstLine": "# Context Packet (Tokens: 35/2000 \u00b7 mode: raw)",
+      "o200kTokens": 37,
+      "chars": 129,
+      "targetBody": false,
+      "secondBody": false,
+      "smallBody": true,
+      "failureKept": false,
+      "stats": {
+        "deliveredMode": "raw",
+        "deliveredTokens": 58,
+        "droppedPrimaries": 1,
+        "sourceWholeFileTokens": 34,
+        "tokensSaved": -24
+      },
+      "stderr": "Warning: budget 2000 dropped 1 primary hit(s) to stay under the ceiling. Re-run with a larger --budget for the rest."
+    },
+    "leaf": {
+      "firstLine": "# Context Packet (Tokens: 611/2000 \u00b7 primary: 1 symbols \u00b7 associated: 0 skeletons \u00b7 mode: surgical)",
+      "o200kTokens": 333,
+      "chars": 1383,
+      "targetBody": true,
+      "secondBody": false,
+      "smallBody": false,
+      "failureKept": false,
+      "stats": {
+        "deliveredMode": "surgical",
+        "deliveredTokens": 611,
+        "sourceWholeFileTokens": 6290,
+        "tokensSaved": 5679
+      },
+      "stderr": ""
+    },
+    "qualified": {
+      "firstLine": "# Context Packet (Tokens: 73/2000 \u00b7 primary: 0 symbols \u00b7 associated: 0 skeletons \u00b7 mode: surgical)",
+      "o200kTokens": 172,
+      "chars": 704,
+      "targetBody": false,
+      "secondBody": false,
+      "smallBody": false,
+      "failureKept": false,
+      "stats": {
+        "budgetTruncated": true,
+        "deliveredMode": "surgical",
+        "deliveredTokens": 73,
+        "droppedPrimaries": 1,
+        "lexicalEmpty": true,
+        "sourceWholeFileTokens": 0,
+        "tokensSaved": -73,
+        "unconstrainedTokens": 6405
+      },
+      "stderr": "Warning: budget 2000 dropped 1 primary hit(s) to stay under the ceiling. Re-run with a larger --budget for the rest.\nWarning: budget 2000 delivered 0 primaries for this task; an unconstrained pack is ~6405 tokens (1 primaries). Raise --budget to retrieve real context."
+    },
+    "two_same_file": {
+      "firstLine": "# Context Packet (Tokens: 616/2000 \u00b7 primary: 1 symbols \u00b7 associated: 0 skeletons \u00b7 mode: surgical)",
+      "o200kTokens": 335,
+      "chars": 1396,
+      "targetBody": true,
+      "secondBody": false,
+      "smallBody": false,
+      "failureKept": false,
+      "stats": {
+        "deliveredMode": "surgical",
+        "deliveredTokens": 616,
+        "sourceWholeFileTokens": 6290,
+        "tokensSaved": 5674
+      },
+      "stderr": ""
+    },
+    "failure_dropped": {
+      "firstLine": "# Context Packet (Tokens: 35/2000 \u00b7 mode: raw)",
+      "o200kTokens": 37,
+      "chars": 129,
+      "targetBody": false,
+      "secondBody": false,
+      "smallBody": true,
+      "failureKept": false,
+      "stats": {
+        "deliveredMode": "raw",
+        "deliveredTokens": 58,
+        "sourceWholeFileTokens": 34,
+        "tokensSaved": -24
+      },
+      "stderr": ""
+    },
+    "preview_oversize": {
+      "firstLine": "# Context Packet (Tokens: 2299/512 \u00b7 primary: 1 symbols \u00b7 associated: 0 skeletons \u00b7 mode: preview)",
+      "o200kTokens": 1177,
+      "chars": 7657,
+      "targetBody": false,
+      "secondBody": false,
+      "smallBody": false,
+      "failureKept": false,
+      "stats": null,
+      "stderr": ""
+    },
+    "overload": {
+      "count": 1,
+      "sourceWholeFileTokens": 120,
+      "symbols": [
+        {
+          "body": "    func processValue(_ x: Int) -> String {\n        return \"INT_OVERLOAD\"\n    }",
+          "endLine": 4,
+          "filePath": "OverloadService.swift",
+          "kind": "function",
+          "qualifiedName": "OverloadService.processValue",
+          "startLine": 2
+        }
+      ],
+      "tokensDelivered": 120,
+      "tokensSaved": 0
+    },
+    "type_extensions": {
+      "count": 1,
+      "sourceWholeFileTokens": 120,
+      "symbols": [
+        {
+          "body": "struct OverloadService {\n    func processValue(_ x: Int) -> String {\n        return \"INT_OVERLOAD\"\n    }\n    func processValue(_ x: String) -> String {\n        return \"STRING_OVERLOAD\"\n    }\n}",
+          "endLine": 8,
+          "filePath": "OverloadService.swift",
+          "kind": "struct",
+          "qualifiedName": "OverloadService",
+          "startLine": 1
+        }
+      ],
+      "tokensDelivered": 168,
+      "tokensSaved": -48
+    },
+    "mcp_partial": {
+      "keys": [
+        "text",
+        "savings"
+      ],
+      "warned": false,
+      "targetBody": false
+    },
+    "miss_detection": {
+      "missDetected": false,
+      "keys": [
+        "text",
+        "savings"
+      ],
+      "containsEcho": true
+    },
+    "dedup_small": {
+      "beforeTokens": 120,
+      "afterTokens": 163,
+      "reportedSaved": 14,
+      "beforeBody": "    func probeValue() -> Int {\n        return 314159\n    }",
+      "afterBody": "[unchanged since earlier this session \u2014 ~14 tokens delivered previously (TinyService.swift:2). Pass refresh=true to re-fetch.]",
+      "gatherRefreshSupported": false
+    },
+    "cross_tool_dedup": {
+      "gatherDelivered": true,
+      "symbolDeliveredAgain": true,
+      "deduplicated": false
+    },
+    "text_truncation": {
+      "shownMatches": 40,
+      "totalMatches": 40,
+      "truncated": false,
+      "hint": "outline(path)/symbol(name) for bodies."
+    },
+    "literal_fallback": {
+      "shownMatches": 2,
+      "text": "'a.b' \u2014 2 match(es) in 1 file(s)\nmatches.txt: 76-77\n  76: a.b"
+    },
+    "unicode_estimator": {
+      "characters": 2400,
+      "cliEstimate": "Estimated tokens: 1",
+      "o200kTokens": 1500
+    },
+    "stale_body": {
+      "body": "// lines inserted after index\n// lines inserted after index\n// lines inserted after index",
+      "stale": null,
+      "refresh": {
+        "refreshed": false,
+        "reason": "index_in_progress",
+        "stale": false
+      }
+    }
+  },
+  "followupResults": {
+    "stale_actual_lock": {
+      "symbols": [
+        {
+          "body": "// lines inserted after index\n// lines inserted after index\n// lines inserted after index",
+          "endLine": 4,
+          "filePath": "TinyService.swift",
+          "kind": "function",
+          "qualifiedName": "TinyService.probeValue",
+          "startLine": 2
+        }
+      ],
+      "stale": null,
+      "refresh": {
+        "refreshed": false,
+        "skipped": true,
+        "reason": "index_in_progress",
+        "stale": false,
+        "indexedCommit": "4e543515217c6fafb5034c53b147475f87547b7b",
+        "indexedBranch": "main",
+        "headCommit": "4e543515217c6fafb5034c53b147475f87547b7b",
+        "headBranch": "main"
+      }
+    },
+    "text_across_files": {
+      "shownMatches": 50,
+      "totalMatches": 75,
+      "truncated": false,
+      "hint": "outline(path)/symbol(name) for bodies."
+    },
+    "failure_over_budget": {
+      "firstLine": "# Context Packet (Tokens: 1905/512 \u00b7 primary: 0 symbols \u00b7 associated: 0 skeletons \u00b7 mode: surgical)",
+      "o200kTokens": 1101
+    },
+    "packet_chrome": {
+      "bodyTokens": 26,
+      "surgicalPacketTokens": 333,
+      "minimalLocatedBodyTokens": 40
+    },
+    "sdk_output": {
+      "registeredTools": 8,
+      "schemaJsonO200kTokens": 3011,
+      "callResultType": "tuple",
+      "dictTextAndStructured": true,
+      "representationChars": 2083
+    },
+    "revert_to_head_freshness": {
+      "needsIndex": false,
+      "freshness": {
+        "stale": false,
+        "indexedCommit": "4e543515217c6fafb5034c53b147475f87547b7b",
+        "indexedBranch": "main",
+        "headCommit": "4e543515217c6fafb5034c53b147475f87547b7b",
+        "headBranch": "main"
+      },
+      "symbol": [
+        {
+          "body": "",
+          "endLine": 19,
+          "filePath": "TinyService.swift",
+          "kind": "function",
+          "qualifiedName": "TinyService.probeValue",
+          "startLine": 17
+        }
+      ]
+    }
+  },
+  "scratchArtifacts": "/tmp/cckit-token-audit-20260907"
+}

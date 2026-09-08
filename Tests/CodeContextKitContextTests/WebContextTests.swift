@@ -65,13 +65,28 @@ final class WebContextTests: XCTestCase {
         
         let packer = ContextPacker(db: db, wax: wax, rootPath: fixtureURL.path)
         
-        // Pack context based on a task that relates to our symbols
-        let packet = try await packer.pack(task: "calculate total in shopping cart", budget: 4000).packet
+        // Ask for an exact declaration so the assertion does not depend on
+        // nondeterministic semantic ranking between calculateTotal and ShoppingCart.
+        let result = try await packer.pack(
+            task: "calculateTotal",
+            budget: 4000,
+            mode: .surgical
+        )
+        let packet = result.packet
         
-        // ContextPacker uses Wax search to find relevant symbols, then emits
-        // symbol body slices (or FULL for tiny files). calculateTotal should appear.
-        XCTAssertTrue(packet.contains("function calculateTotal"), "Packet should contain JS function body")
-        XCTAssertTrue(packet.contains("mode: surgical") || packet.contains("Tokens:"), "Packet should include token banner")
+        // Regex-indexed JS records declaration locators, not reliable closing spans.
+        // Surgical mode must identify that limitation instead of claiming a
+        // one-line declaration is the function body; callers can request full mode.
+        XCTAssertTrue(packet.contains("### calculateTotal (LOCATOR"), packet)
+        XCTAssertTrue(packet.contains("function calculateTotal(items) {"), packet)
+        XCTAssertTrue(packet.contains("Implementation span is unavailable"), packet)
+        XCTAssertFalse(packet.contains("return items.reduce"), packet)
+        XCTAssertEqual(result.requiredTargetIDs, result.deliveredTargetIDs)
+        XCTAssertTrue(
+            result.omitted.contains(where: { $0.reason.contains("locator-only language") }),
+            "Expected an explicit locator-only capability notice: \(result.omitted)"
+        )
+        XCTAssertTrue(packet.contains("mode: surgical"), "Packet should include surgical token banner")
     }
 
     func testWebContextPackingFullMode() async throws {
