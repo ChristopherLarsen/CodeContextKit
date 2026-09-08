@@ -28,7 +28,9 @@ Keep the routing table and rules identical across all three; a consistency test
 3. Content tools (`gather_code_context`, `symbol`, `outline`) read disk;
    locators (`find_symbol`, `find_references`, `map`) use the last index. A
    dirty worktree does not retire these tools — MCP auto-refreshes HEAD drift
-   and dirty indexable files, and retries once on a locator miss.
+   and dirty indexable files, and retries once on a locator miss. Pass
+   `refresh=true` on gather/symbol/outline to re-fetch bodies already
+   delivered this conversation.
 4. On a miss: gather misses invite retrying gather with prose; locator misses
    invite outline/symbol. Grep stays valid for non-indexable files (markdown,
    project files, logs) and string literals.

@@ -48,6 +48,14 @@ public struct PackResult: Sendable {
     /// Primaries dropped by assembly to stay under the budget. Zero means the
     /// packet is complete for its primary set (or there was no primary set).
     public let droppedPrimaries: Int
+    /// Explicitly requested targets that resolution selected.
+    public let requiredTargetIDs: [String]
+    /// Targets that actually appear in the delivered packet.
+    public let deliveredTargetIDs: [String]
+    /// Requested or resolved targets omitted, with reasons.
+    public let omitted: [PacketOmission]
+    /// True when at least one delivered file's current hash differs from the index.
+    public let contentStale: Bool
 
     public init(
         packet: String,
@@ -60,7 +68,11 @@ public struct PackResult: Sendable {
         primaryCount: Int = 0,
         waxFillRan: Bool = false,
         waxHitCount: Int = 0,
-        droppedPrimaries: Int = 0
+        droppedPrimaries: Int = 0,
+        requiredTargetIDs: [String] = [],
+        deliveredTargetIDs: [String] = [],
+        omitted: [PacketOmission] = [],
+        contentStale: Bool = false
     ) {
         self.packet = packet
         self.requestedMode = requestedMode
@@ -73,6 +85,10 @@ public struct PackResult: Sendable {
         self.waxFillRan = waxFillRan
         self.waxHitCount = waxHitCount
         self.droppedPrimaries = droppedPrimaries
+        self.requiredTargetIDs = requiredTargetIDs
+        self.deliveredTargetIDs = deliveredTargetIDs
+        self.omitted = omitted
+        self.contentStale = contentStale
     }
 
     /// Tokens avoided versus reading whole source files drawn into the packet.
@@ -113,6 +129,10 @@ public final class ContextPacker {
 
     /// Per-line cap for failure-log summaries (minified bundles are unbounded).
     public static let failureLineMaxChars: Int = 500
+    /// Total token budget reserved for a failure summary (all lines together).
+    public static let failureSummaryMaxTokens: Int = 200
+    /// Tokens reserved for banner, omission notices, and truncation warnings.
+    public static let metadataReserveTokens: Int = 80
     /// Preview packets stay under this many tokens regardless of requested budget —
     /// the tier exists so looking is cheap.
     public static let previewBudgetCap: Int = 1500
@@ -172,46 +192,17 @@ public final class ContextPacker {
         mapBudget: Int? = nil,
         relatedHintCap: Int = 5
     ) async throws -> PackResult {
+        let resolver = PacketTargetResolver(
+            db: db,
+            wax: wax,
+            rootPath: rootPath,
+            maxPrimarySymbols: maxPrimarySymbols
+        )
+        let evidence = try await resolver.resolve(task: task)
+
         if mode == .auto {
-            // Identifier-only tasks skip MiniLM fill; one surgical pack is enough.
-            if SemanticIndexPolicy.shouldSkipPackFiller(task: task) {
-                let surgical = try await packOnce(
-                    task: task,
-                    budget: budget,
-                    failureLog: failureLog,
-                    mode: .surgical,
-                    mapBudget: mapBudget,
-                    relatedHintCap: relatedHintCap
-                )
-                let surgicalTokens = await countTokens(surgical.packet)
-                let sourceWhole = await countWholeFileTokens(paths: surgical.primaryFilePaths)
-                // Auto must never deliver more than reading the files outright.
-                // If surgical lost to the baseline, fall back to raw (and then to
-                // raw-minimal) before admitting defeat.
-                let delivered = await enforceBaseline(
-                    candidates: [(surgical, .surgical, surgicalTokens)],
-                    fallbackPaths: surgical.primaryFilePaths,
-                    failureLog: failureLog,
-                    task: task,
-                    budget: budget,
-                    relatedHintCap: relatedHintCap,
-                    sourceWhole: sourceWhole
-                )
-                return PackResult(
-                    packet: delivered.packet,
-                    requestedMode: .auto,
-                    deliveredMode: delivered.mode,
-                    deliveredTokens: delivered.tokens,
-                    surgicalTokens: surgicalTokens,
-                    fullBaselineTokens: nil,
-                    sourceWholeFileTokens: sourceWhole,
-                    primaryCount: delivered.primaryCount,
-                    waxFillRan: delivered.waxFillRan,
-                    waxHitCount: delivered.waxHitCount,
-                    droppedPrimaries: delivered.droppedPrimaries
-                )
-            }
-            let surgical = try await packOnce(
+            let surgical = try await render(
+                evidence: evidence,
                 task: task,
                 budget: budget,
                 failureLog: failureLog,
@@ -219,8 +210,8 @@ public final class ContextPacker {
                 mapBudget: mapBudget,
                 relatedHintCap: relatedHintCap
             )
-            let surgicalTokens = await countTokens(surgical.packet)
-            let raw = try await packOnce(
+            let raw = try await render(
+                evidence: evidence,
                 task: task,
                 budget: budget,
                 failureLog: failureLog,
@@ -228,79 +219,45 @@ public final class ContextPacker {
                 mapBudget: 0,
                 relatedHintCap: relatedHintCap
             )
+            let surgicalTokens = await countTokens(surgical.packet)
             let rawTokens = await countTokens(raw.packet)
-            // Full is chrome on top of the same primaries as raw. If surgical
-            // already beats raw, full cannot win — skip the third assembly.
-            if surgicalTokens <= rawTokens {
-                let sourceWhole = await countWholeFileTokens(paths: surgical.primaryFilePaths)
-                let delivered = await enforceBaseline(
-                    candidates: [(surgical, .surgical, surgicalTokens), (raw, .raw, rawTokens)],
-                    fallbackPaths: surgical.primaryFilePaths,
-                    failureLog: failureLog,
-                    task: task,
-                    budget: budget,
-                    relatedHintCap: relatedHintCap,
-                    sourceWhole: sourceWhole
-                )
-                return PackResult(
-                    packet: delivered.packet,
-                    requestedMode: .auto,
-                    deliveredMode: delivered.mode,
-                    deliveredTokens: delivered.tokens,
-                    surgicalTokens: surgicalTokens,
-                    fullBaselineTokens: nil,
-                    sourceWholeFileTokens: sourceWhole,
-                    primaryCount: delivered.primaryCount,
-                    waxFillRan: delivered.waxFillRan,
-                    waxHitCount: delivered.waxHitCount,
-                    droppedPrimaries: delivered.droppedPrimaries
-                )
-            }
-            let full = try await packOnce(
-                task: task,
-                budget: budget,
-                failureLog: failureLog,
-                mode: .full,
-                mapBudget: mapBudget,
-                relatedHintCap: relatedHintCap
-            )
-            let fullTokens = await countTokens(full.packet)
-            let candidates: [(PackAssembly, PackMode, Int)] = [
+            var counted: [(PackAssembly, PackMode, Int)] = [
                 (surgical, .surgical, surgicalTokens),
-                (full, .full, fullTokens),
                 (raw, .raw, rawTokens),
             ]
-            let best = candidates.min(by: { $0.2 < $1.2 })!
-            let sourceWhole = await countWholeFileTokens(paths: best.0.primaryFilePaths)
-            let delivered = await enforceBaseline(
-                candidates: candidates,
-                fallbackPaths: best.0.primaryFilePaths,
-                failureLog: failureLog,
-                task: task,
-                budget: budget,
-                relatedHintCap: relatedHintCap,
-                sourceWhole: sourceWhole
-            )
-            return PackResult(
-                packet: delivered.packet,
-                requestedMode: .auto,
-                deliveredMode: delivered.mode,
-                deliveredTokens: delivered.tokens,
+            if requiredCoverage(surgical, evidence: evidence) < evidence.required.count
+                || surgicalTokens > rawTokens
+            {
+                let full = try await render(
+                    evidence: evidence,
+                    task: task,
+                    budget: budget,
+                    failureLog: failureLog,
+                    mode: .full,
+                    mapBudget: mapBudget,
+                    relatedHintCap: relatedHintCap
+                )
+                let fullTokens = await countTokens(full.packet)
+                counted.append((full, .full, fullTokens))
+            }
+            let picked = pickEqualCoverage(counted, evidence: evidence)
+            let sourceWhole = await countWholeFileTokens(paths: picked.assembly.primaryFilePaths)
+            return makeResult(
+                assembly: picked.assembly,
+                requested: .auto,
+                delivered: picked.mode,
+                tokens: picked.tokens,
                 surgicalTokens: surgicalTokens,
-                fullBaselineTokens: fullTokens,
-                sourceWholeFileTokens: sourceWhole,
-                primaryCount: delivered.primaryCount,
-                waxFillRan: delivered.waxFillRan,
-                waxHitCount: delivered.waxHitCount,
-                droppedPrimaries: delivered.droppedPrimaries
+                fullBaselineTokens: counted.first(where: { $0.1 == .full })?.2,
+                sourceWhole: sourceWhole,
+                evidence: evidence
             )
         }
 
         if mode == .preview {
-            // Progressive disclosure first tier: keep it cheap enough that an
-            // agent can afford to look before committing to bodies.
             let previewBudget = min(budget, Self.previewBudgetCap)
-            let assembled = try await packOnce(
+            let assembled = try await render(
+                evidence: evidence,
                 task: task,
                 budget: previewBudget,
                 failureLog: failureLog,
@@ -310,24 +267,20 @@ public final class ContextPacker {
             )
             let tokens = await countTokens(assembled.packet)
             let sourceWhole = await countWholeFileTokens(paths: assembled.primaryFilePaths)
-            return PackResult(
-                packet: assembled.packet,
-                requestedMode: .preview,
-                deliveredMode: .preview,
-                deliveredTokens: tokens,
-                sourceWholeFileTokens: sourceWhole,
-                primaryCount: assembled.primaryCount,
-                waxFillRan: assembled.waxFillRan,
-                waxHitCount: assembled.waxHitCount,
-                droppedPrimaries: assembled.droppedPrimaries
+            return makeResult(
+                assembly: assembled,
+                requested: .preview,
+                delivered: .preview,
+                tokens: tokens,
+                surgicalTokens: nil,
+                fullBaselineTokens: nil,
+                sourceWhole: sourceWhole,
+                evidence: evidence
             )
         }
 
-        if mode == .raw {
-            // Requested raw is not a public mode; treat as full primary dumps without chrome.
-        }
-
-        let assembled = try await packOnce(
+        let assembled = try await render(
+            evidence: evidence,
             task: task,
             budget: budget,
             failureLog: failureLog,
@@ -337,18 +290,62 @@ public final class ContextPacker {
         )
         let tokens = await countTokens(assembled.packet)
         let sourceWhole = await countWholeFileTokens(paths: assembled.primaryFilePaths)
-        return PackResult(
-            packet: assembled.packet,
-            requestedMode: mode == .raw ? .full : mode,
-            deliveredMode: mode,
-            deliveredTokens: tokens,
+        return makeResult(
+            assembly: assembled,
+            requested: mode == .raw ? .full : mode,
+            delivered: mode,
+            tokens: tokens,
             surgicalTokens: mode == .surgical ? tokens : nil,
             fullBaselineTokens: (mode == .full || mode == .raw) ? tokens : nil,
+            sourceWhole: sourceWhole,
+            evidence: evidence
+        )
+    }
+
+    private func requiredCoverage(_ assembly: PackAssembly, evidence: PacketEvidence) -> Int {
+        let delivered = Set(assembly.deliveredTargetIDs)
+        return evidence.required.filter { delivered.contains($0.targetID) }.count
+    }
+
+    private func pickEqualCoverage(
+        _ candidates: [(PackAssembly, PackMode, Int)],
+        evidence: PacketEvidence
+    ) -> (assembly: PackAssembly, mode: PackMode, tokens: Int) {
+        let requiredCount = evidence.required.count
+        let complete = candidates.filter { requiredCoverage($0.0, evidence: evidence) == requiredCount }
+        let pool = complete.isEmpty ? candidates : complete
+        let bestCoverage = pool.map { requiredCoverage($0.0, evidence: evidence) }.max() ?? 0
+        let covered = pool.filter { requiredCoverage($0.0, evidence: evidence) == bestCoverage }
+        let winner = covered.min(by: { $0.2 < $1.2 }) ?? candidates[0]
+        return (winner.0, winner.1, winner.2)
+    }
+
+    private func makeResult(
+        assembly: PackAssembly,
+        requested: PackMode,
+        delivered: PackMode,
+        tokens: Int,
+        surgicalTokens: Int?,
+        fullBaselineTokens: Int?,
+        sourceWhole: Int,
+        evidence: PacketEvidence
+    ) -> PackResult {
+        PackResult(
+            packet: assembly.packet,
+            requestedMode: requested,
+            deliveredMode: delivered,
+            deliveredTokens: tokens,
+            surgicalTokens: surgicalTokens,
+            fullBaselineTokens: fullBaselineTokens,
             sourceWholeFileTokens: sourceWhole,
-            primaryCount: assembled.primaryCount,
-            waxFillRan: assembled.waxFillRan,
-            waxHitCount: assembled.waxHitCount,
-            droppedPrimaries: assembled.droppedPrimaries
+            primaryCount: assembly.primaryCount,
+            waxFillRan: evidence.waxFillRan,
+            waxHitCount: evidence.waxHitCount,
+            droppedPrimaries: assembly.droppedPrimaries,
+            requiredTargetIDs: evidence.requiredIDs,
+            deliveredTargetIDs: assembly.deliveredTargetIDs,
+            omitted: assembly.omissions,
+            contentStale: evidence.contentStale
         )
     }
 
@@ -358,117 +355,10 @@ public final class ContextPacker {
         /// uses this set — associated skeletons are not whole-file Reads.
         var primaryFilePaths: Set<String>
         var primaryCount: Int
-        var waxFillRan: Bool
-        var waxHitCount: Int
-        /// Primaries that did not fit the budget and were silently dropped by
-        /// assembly. Zero-primary truncation gets its own probe in the CLI;
-        /// this surfaces the partial case.
+        /// Primaries that did not fit the budget.
         var droppedPrimaries: Int = 0
-    }
-
-    private struct BaselineDelivery: Sendable {
-        var packet: String
-        var mode: PackMode
-        var tokens: Int
-        var primaryCount: Int
-        var waxFillRan: Bool
-        var waxHitCount: Int
-        var droppedPrimaries: Int
-    }
-
-    /// Auto must never deliver a packet larger than reading its primary files
-    /// outright — a negative-savings row is a real regression, not bookkeeping.
-    ///
-    /// If the token-smallest candidate still loses to the whole-file baseline,
-    /// fall back to raw, then to raw-minimal (files with per-path headers only).
-    private func enforceBaseline(
-        candidates: [(PackAssembly, PackMode, Int)],
-        fallbackPaths: Set<String>,
-        failureLog: String?,
-        task: String,
-        budget: Int,
-        relatedHintCap: Int,
-        sourceWhole: Int
-    ) async -> BaselineDelivery {
-        guard let best = candidates.min(by: { $0.2 < $1.2 }) else {
-            return BaselineDelivery(packet: "", mode: .raw, tokens: 0, primaryCount: 0, waxFillRan: false, waxHitCount: 0, droppedPrimaries: 0)
-        }
-        if best.2 <= sourceWhole || fallbackPaths.isEmpty {
-            return BaselineDelivery(
-                packet: best.0.packet,
-                mode: best.1,
-                tokens: best.2,
-                primaryCount: best.0.primaryCount,
-                waxFillRan: best.0.waxFillRan,
-                waxHitCount: best.0.waxHitCount,
-                droppedPrimaries: best.0.droppedPrimaries
-            )
-        }
-
-        // First fallback: chrome-free raw over the same primaries.
-        if best.1 != .raw {
-            let raw = try? await packOnce(
-                task: task,
-                budget: budget,
-                failureLog: nil,
-                mode: .raw,
-                mapBudget: 0,
-                relatedHintCap: relatedHintCap
-            )
-            if let raw {
-                let rawTokens = await countTokens(raw.packet)
-                if rawTokens <= sourceWhole {
-                    return BaselineDelivery(
-                        packet: raw.packet,
-                        mode: .raw,
-                        tokens: rawTokens,
-                        primaryCount: raw.primaryCount,
-                        waxFillRan: raw.waxFillRan,
-                        waxHitCount: raw.waxHitCount,
-                        droppedPrimaries: raw.droppedPrimaries
-                    )
-                }
-            }
-        }
-
-        // Last resort: raw-minimal strips every header but one line per file.
-        let minimal = await rawMinimalPacket(paths: fallbackPaths, budget: budget)
-        let minimalTokens = await countTokens(minimal)
-        if minimalTokens < best.2 {
-            return BaselineDelivery(
-                packet: minimal,
-                mode: .raw,
-                tokens: minimalTokens,
-                primaryCount: best.0.primaryCount,
-                waxFillRan: best.0.waxFillRan,
-                waxHitCount: best.0.waxHitCount,
-                droppedPrimaries: best.0.droppedPrimaries
-            )
-        }
-        return BaselineDelivery(
-            packet: best.0.packet,
-            mode: best.1,
-            tokens: best.2,
-            primaryCount: best.0.primaryCount,
-            waxFillRan: best.0.waxFillRan,
-            waxHitCount: best.0.waxHitCount,
-            droppedPrimaries: best.0.droppedPrimaries
-        )
-    }
-
-    /// Last-resort delivery when even raw lost to the baseline: file contents
-    /// only (plus one banner line), separated by blank lines. Any per-file
-    /// marker (header, fence) costs tokens the baseline does not pay, so this
-    /// is the one form that cannot meaningfully lose to reading files outright.
-    private func rawMinimalPacket(paths: Set<String>, budget: Int) async -> String {
-        let rootURL = URL(fileURLWithPath: rootPath)
-        var body = ""
-        for path in paths.sorted() {
-            guard let content = readFile(path: path, rootURL: rootURL) else { continue }
-            body += content + "\n"
-        }
-        let tokens = await countTokens(body)
-        return "# Context Packet (Tokens: \(tokens)/\(budget) · mode: raw)\n\n" + body
+        var deliveredTargetIDs: [String] = []
+        var omissions: [PacketOmission] = []
     }
 
     private func countWholeFileTokens(paths: Set<String>) async -> Int {
@@ -481,7 +371,8 @@ public final class ContextPacker {
         return total
     }
 
-    private func packOnce(
+    private func render(
+        evidence: PacketEvidence,
         task: String,
         budget: Int,
         failureLog: String?,
@@ -489,96 +380,31 @@ public final class ContextPacker {
         mapBudget: Int?,
         relatedHintCap: Int
     ) async throws -> PackAssembly {
+        let bodyBudget = max(32, budget - Self.metadataReserveTokens)
         var output = "# Context Packet\n\n"
-        output += "## Task\n\(task)\n\n"
-
-        // Lexical identifier hits first. Identifier-heavy tasks skip vector fill,
-        // associated skeletons, and the repo map (`shouldSkipPackFiller`). Prose
-        // that names types still vector-fills remaining slots.
-        var primaries: [SymbolRecord] = []
-        var seenQualifiedNames = Set<String>()
-        var associatedFiles: [String: String] = [:] // Path -> Reason
-        var waxFillRan = false
-        var waxHitCount = 0
-
-        func considerPrimary(_ sym: SymbolRecord) {
-            guard primaries.count < maxPrimarySymbols else { return }
-            guard seenQualifiedNames.insert(sym.qualifiedName).inserted else { return }
-            // One primary hit per file: further same-file symbols are neighbors (related
-            // hints / skeletons), not additional bodies. Without this, Wax fill can stack
-            // several slices from one file and reintroduce noise the lexical hit avoided.
-            if primaries.contains(where: { $0.filePath == sym.filePath }) { return }
-            primaries.append(sym)
-        }
-
-        // Exact leaf / qualified matches only (not loose LIKE) so prose identifiers
-        // surface ground-truth symbols without dragging in every substring hit.
-        let lexicalTokens = SemanticIndexPolicy.identifierTokens(in: task)
-        for token in lexicalTokens {
-            guard primaries.count < maxPrimarySymbols else { break }
-            let likes = try db.getSymbolsLike(name: token, strict: true).filter { sym in
-                sym.name == token
-                    || sym.qualifiedName == token
-                    || sym.qualifiedName.hasSuffix(".\(token)")
-            }
-            let ranked = likes.sorted { lhs, rhs in
-                let lType = SemanticIndexPolicy.typeKinds.contains(lhs.kind)
-                let rType = SemanticIndexPolicy.typeKinds.contains(rhs.kind)
-                // Prefer members over types so a method hit isn't replaced by its enclosing type
-                // (which would force a whole-file dump and reintroduce noise).
-                if lType != rType { return !lType && rType }
-                return lhs.qualifiedName.count < rhs.qualifiedName.count
-            }
-            for sym in ranked {
-                guard primaries.count < maxPrimarySymbols else { break }
-                if SemanticIndexPolicy.typeKinds.contains(sym.kind),
-                   primaries.contains(where: { $0.filePath == sym.filePath }) {
-                    continue
-                }
-                // One primary per leaf NAME across files: a generic method name
-                // (e.g. `bump`) matches ten near-duplicate types — stacking five
-                // of them as primaries is noise that also torches the savings
-                // baseline. find_symbol exists for enumerating same-name hits.
-                if primaries.contains(where: { $0.name == sym.name }) {
-                    continue
-                }
-                considerPrimary(sym)
-            }
-        }
+        let taskText = truncateToBudget(task, tokens: min(200, bodyBudget / 4))
+        output += "## Task\n\(taskText)\n\n"
 
         let skipFiller = SemanticIndexPolicy.shouldSkipPackFiller(task: task)
-
-        let remainingSlots = maxPrimarySymbols - primaries.count
-        if remainingSlots > 0 && !skipFiller, let wax {
-            waxFillRan = true
-            // Modest overfetch for unresolved Wax hits; never request more than 2× remaining slots.
-            let searchResults = try await wax.search(task, limit: remainingSlots * 2)
-            waxHitCount = searchResults.count
-            for res in searchResults {
-                guard primaries.count < maxPrimarySymbols else { break }
-                guard let sym = try db.getSymbols(qualifiedName: res.symbol).first else { continue }
-                considerPrimary(sym)
-            }
-        }
-
+        let targets = evidence.required + evidence.optional
+        var associatedFiles: [String: String] = [:]
         if !skipFiller {
-            for sym in primaries {
-                let refs = try db.getReferencesInFile(path: sym.filePath)
+            for target in evidence.required {
+                let refs = try db.getReferencesInFile(path: target.symbol.filePath)
                 for ref in refs {
                     let defs = try db.getSymbols(qualifiedName: ref.name)
-                    for def in defs where def.filePath != sym.filePath {
-                        let leaf = sym.filePath.split(separator: "/").last.map(String.init) ?? sym.filePath
+                    for def in defs where def.filePath != target.symbol.filePath {
+                        let leaf = target.symbol.filePath.split(separator: "/").last.map(String.init)
+                            ?? target.symbol.filePath
                         associatedFiles[def.filePath] = "Defines '\(def.name)' used in '\(leaf)'"
                     }
                 }
             }
         }
 
-        // Repo map — skipped at small budgets / raw / named-identifier filler skip
-        // unless the caller passed an explicit mapBudget.
         let resolvedMapBudget: Int
-        if mode == .raw {
-            resolvedMapBudget = 0
+        if mode == .raw || mode == .preview {
+            resolvedMapBudget = mode == .preview ? (mapBudget ?? 0) : 0
         } else if skipFiller && mapBudget == nil {
             resolvedMapBudget = 0
         } else {
@@ -594,14 +420,11 @@ public final class ContextPacker {
             output += "## Repository Map\n\(repoMap)\n\n"
         }
 
-        if let failureLog = failureLog {
-            let summary = extractFailureSummary(from: failureLog)
+        if let failureLog {
+            let summary = extractFailureSummary(from: failureLog, tokenBudget: Self.failureSummaryMaxTokens)
             output += "## Failure Summary\n\(summary)\n\n"
         }
 
-        // Preview assembly: names and spans only — no bodies. Everything else
-        // (map, skeletons) still applies so the agent can decide what to expand.
-        let rootURL = URL(fileURLWithPath: rootPath)
         var currentTokens = await countTokens(output)
         var primarySymbolCount = 0
         var primaryFullFileCount = 0
@@ -609,97 +432,157 @@ public final class ContextPacker {
         var droppedPrimaries = 0
         var emittedFullPaths = Set<String>()
         var primaryFilePaths = Set<String>()
+        var deliveredIDs: [String] = []
+        var omissions = evidence.omissions
         var anyHintsTruncated = false
+
+        func content(for path: String) -> String? {
+            evidence.fileContents[path] ?? readFile(path: path, rootURL: URL(fileURLWithPath: rootPath))
+        }
+
+        func tryAppend(_ section: String) async -> Bool {
+            let sectionTokens = await countTokens(section)
+            if currentTokens + sectionTokens <= bodyBudget {
+                output += section
+                currentTokens += sectionTokens
+                return true
+            }
+            return false
+        }
 
         if mode == .preview {
             output += "## Primary hits\n\n"
             output += "Bodies omitted (preview). Fetch one with `symbol` "
             output += "(qualified name), or re-gather with `mode=surgical` for slices "
             output += "or `mode=full` for whole files.\n\n"
-            for sym in primaries {
+            for target in targets {
+                let sym = target.symbol
                 let bodyTokens: Int
-                if let content = readFile(path: sym.filePath, rootURL: rootURL) {
-                    let body = LineRangeBodyExtractor.body(for: sym, content: content)
-                    bodyTokens = await countTokens(body)
+                if let fileContent = content(for: sym.filePath) {
+                    let slice = FreshSymbolResolver.slice(
+                        symbol: sym,
+                        content: fileContent,
+                        indexedHash: evidence.indexedHashes[sym.filePath],
+                        currentHash: evidence.sourceHashes[sym.filePath] ?? ""
+                    )
+                    bodyTokens = await countTokens(slice.body)
                 } else {
                     bodyTokens = 0
                 }
-                output += "- \(sym.qualifiedName) (\(sym.kind.rawValue) · "
-                output += "\(sym.filePath):\(sym.startLine)-\(sym.endLine)"
+                var line = "- \(sym.qualifiedName) (\(sym.kind.rawValue) · "
+                line += "\(sym.filePath):\(sym.startLine)-\(sym.endLine)"
                 if bodyTokens > 0 {
-                    output += " · body ≈\(bodyTokens) tokens"
+                    line += " · body ≈\(bodyTokens) tokens"
                 }
-                output += ")\n"
-                primarySymbolCount += 1
-                primaryFilePaths.insert(sym.filePath)
+                if !ImplementationSpanPolicy.hasReliableImplementationSpan(filePath: sym.filePath) {
+                    line += " · locator-only"
+                }
+                line += ")\n"
+                if await tryAppend(line) {
+                    primarySymbolCount += 1
+                    primaryFilePaths.insert(sym.filePath)
+                    deliveredIDs.append(target.targetID)
+                } else {
+                    droppedPrimaries += 1
+                    omissions.append(PacketOmission(targetID: target.targetID, reason: "budget"))
+                }
             }
             output += "\n"
-            currentTokens = await countTokens(output)
-        } else {
-            if mode != .raw {
-                output += "## Surgical Context\n\n"
-            }
+            return await finishPacket(
+                output: output,
+                budget: budget,
+                mode: mode,
+                primarySymbolCount: primarySymbolCount,
+                primaryFullFileCount: 0,
+                associatedSkeletonCount: 0,
+                primaryFilePaths: primaryFilePaths,
+                droppedPrimaries: droppedPrimaries,
+                deliveredIDs: deliveredIDs,
+                omissions: omissions
+            )
+        }
+
+        if mode != .raw {
+            output += "## Surgical Context\n\n"
         }
 
         if mode == .full || mode == .raw {
             var stagedFiles: [String] = []
             var seenPaths = Set<String>()
-            for sym in primaries where seenPaths.insert(sym.filePath).inserted {
-                stagedFiles.append(sym.filePath)
+            var idsByFile: [String: [String]] = [:]
+            for target in targets {
+                idsByFile[target.symbol.filePath, default: []].append(target.targetID)
+                if seenPaths.insert(target.symbol.filePath).inserted {
+                    stagedFiles.append(target.symbol.filePath)
+                }
             }
 
-            for (stageIndex, path) in stagedFiles.enumerated() {
-                if currentTokens >= budget {
-                    droppedPrimaries += stagedFiles.count - stageIndex
-                    break
-                }
-                guard let content = readFile(path: path, rootURL: rootURL) else { continue }
-                let section = formatFullFileSection(path: path, content: content)
-                let sectionTokens = await countTokens(section)
-                if currentTokens + sectionTokens < budget {
-                    output += section
-                    currentTokens += sectionTokens
+            for path in stagedFiles {
+                guard let fileContent = content(for: path) else { continue }
+                let section = formatFullFileSection(path: path, content: fileContent)
+                if await tryAppend(section) {
                     primaryFullFileCount += 1
                     emittedFullPaths.insert(path)
                     primaryFilePaths.insert(path)
+                    deliveredIDs.append(contentsOf: idsByFile[path] ?? [])
                 } else {
-                    droppedPrimaries += 1
+                    droppedPrimaries += (idsByFile[path] ?? []).count
+                    for id in idsByFile[path] ?? [] {
+                        omissions.append(PacketOmission(targetID: id, reason: "budget"))
+                    }
                 }
             }
         } else {
-            for sym in primaries {
-                if currentTokens >= budget { break }
-                guard let content = readFile(path: sym.filePath, rootURL: rootURL) else { continue }
+            for target in targets {
+                let sym = target.symbol
+                guard let fileContent = content(for: sym.filePath) else { continue }
+                let slice = FreshSymbolResolver.slice(
+                    symbol: sym,
+                    content: fileContent,
+                    indexedHash: evidence.indexedHashes[sym.filePath],
+                    currentHash: evidence.sourceHashes[sym.filePath] ?? ""
+                )
+                let body = slice.body
+                if slice.locatorOnly {
+                    let note = formatLocatorSection(symbol: slice.symbol, locator: body)
+                    if await tryAppend(note) {
+                        primarySymbolCount += 1
+                        primaryFilePaths.insert(sym.filePath)
+                        deliveredIDs.append(target.targetID)
+                    } else {
+                        droppedPrimaries += 1
+                        omissions.append(PacketOmission(targetID: target.targetID, reason: "budget"))
+                    }
+                    continue
+                }
 
-                let body = LineRangeBodyExtractor.body(for: sym, content: content)
-                let preferFullFast = shouldPreferFullFile(symbol: sym, content: content, body: body)
-
+                let preferFullFast = shouldPreferFullFile(symbol: slice.symbol, content: fileContent, body: body)
                 let section: String
                 let emittedAsFull: Bool
                 if preferFullFast {
-                    if emittedFullPaths.contains(sym.filePath) { continue }
-                    // Tiny / high-coverage: whole file, no related-hint chrome.
-                    section = formatFullFileSection(path: sym.filePath, content: content)
+                    if emittedFullPaths.contains(sym.filePath) {
+                        deliveredIDs.append(target.targetID)
+                        continue
+                    }
+                    section = formatFullFileSection(path: sym.filePath, content: fileContent)
                     emittedAsFull = true
                 } else {
                     let fileSymbols = try db.getSymbols(path: sym.filePath)
                     let fileRefs = try db.getReferencesInFile(path: sym.filePath)
                     let related = buildSameFileRelatedHints(
-                        symbol: sym,
+                        symbol: slice.symbol,
                         fileSymbols: fileSymbols,
                         fileRefs: fileRefs,
                         limitPerCategory: relatedHintCap
                     )
                     anyHintsTruncated = anyHintsTruncated || related.truncated
                     let symbolSection = formatSymbolSection(
-                        symbol: sym,
+                        symbol: slice.symbol,
                         body: body,
                         relatedHints: related.text
                     )
-                    // If surgical chrome (slice + related lists) is not cheaper than the
-                    // whole file, emit the file instead — no point paying for "surgical".
                     if !emittedFullPaths.contains(sym.filePath) {
-                        let fullSection = formatFullFileSection(path: sym.filePath, content: content)
+                        let fullSection = formatFullFileSection(path: sym.filePath, content: fileContent)
                         let symbolTokens = await countTokens(symbolSection)
                         let fullTokens = await countTokens(fullSection)
                         if fullTokens <= symbolTokens {
@@ -710,18 +593,14 @@ public final class ContextPacker {
                             emittedAsFull = false
                         }
                     } else {
-                        // The whole file is already in the packet from an
-                        // earlier primary; a fresh slice would duplicate bytes
-                        // already delivered.
+                        deliveredIDs.append(target.targetID)
                         continue
                     }
                 }
 
-                let sectionTokens = await countTokens(section)
-                if currentTokens + sectionTokens < budget {
-                    output += section
-                    currentTokens += sectionTokens
+                if await tryAppend(section) {
                     primaryFilePaths.insert(sym.filePath)
+                    deliveredIDs.append(target.targetID)
                     if emittedAsFull {
                         primaryFullFileCount += 1
                         emittedFullPaths.insert(sym.filePath)
@@ -730,27 +609,22 @@ public final class ContextPacker {
                     }
                 } else {
                     droppedPrimaries += 1
+                    omissions.append(PacketOmission(targetID: target.targetID, reason: "budget"))
                 }
             }
         }
 
-        // Skeletons — skipped in raw mode.
-        if mode != .raw {
-        let primaryPaths = Set(primaries.map(\.filePath))
-        for (path, reason) in associatedFiles
-        where !primaryPaths.contains(path) && !emittedFullPaths.contains(path) {
-            if associatedSkeletonCount >= maxAssociatedSkeletons { break }
-            if currentTokens >= budget { break }
-
-            let symbols = try db.getSymbols(path: path)
-            let section = formatSkeletonSection(path: path, reason: reason, symbols: symbols)
-            let sectionTokens = await countTokens(section)
-            if currentTokens + sectionTokens < budget {
-                output += section
-                currentTokens += sectionTokens
-                associatedSkeletonCount += 1
+        if mode != .raw && mode != .preview {
+            let primaryPaths = Set(targets.map { $0.symbol.filePath })
+            for (path, reason) in associatedFiles
+            where !primaryPaths.contains(path) && !emittedFullPaths.contains(path) {
+                if associatedSkeletonCount >= maxAssociatedSkeletons { break }
+                let symbols = try db.getSymbols(path: path)
+                let section = formatSkeletonSection(path: path, reason: reason, symbols: symbols)
+                if await tryAppend(section) {
+                    associatedSkeletonCount += 1
+                }
             }
-        }
         }
 
         if mode == .surgical && primarySymbolCount > 0 && anyHintsTruncated {
@@ -758,13 +632,44 @@ public final class ContextPacker {
                 relatedHintCap: relatedHintCap,
                 anyTruncated: true
             )
-            let guidanceTokens = await countTokens(guidance)
-            if currentTokens + guidanceTokens < budget {
-                output += guidance
-                currentTokens += guidanceTokens
-            }
+            _ = await tryAppend(guidance)
         }
 
+        if !omissions.isEmpty {
+            var notice = "## Omitted\n"
+            for omission in omissions.prefix(12) {
+                notice += "- \(omission.targetID): \(omission.reason)\n"
+            }
+            notice += "\n"
+            _ = await tryAppend(notice)
+        }
+
+        return await finishPacket(
+            output: output,
+            budget: budget,
+            mode: mode,
+            primarySymbolCount: primarySymbolCount,
+            primaryFullFileCount: primaryFullFileCount,
+            associatedSkeletonCount: associatedSkeletonCount,
+            primaryFilePaths: primaryFilePaths,
+            droppedPrimaries: droppedPrimaries,
+            deliveredIDs: deliveredIDs,
+            omissions: omissions
+        )
+    }
+
+    private func finishPacket(
+        output: String,
+        budget: Int,
+        mode: PackMode,
+        primarySymbolCount: Int,
+        primaryFullFileCount: Int,
+        associatedSkeletonCount: Int,
+        primaryFilePaths: Set<String>,
+        droppedPrimaries: Int,
+        deliveredIDs: [String],
+        omissions: [PacketOmission]
+    ) async -> PackAssembly {
         let packetPrefix = "# Context Packet\n\n"
         let body: String
         if output.hasPrefix(packetPrefix) {
@@ -787,19 +692,53 @@ public final class ContextPacker {
                 + " · associated: \(associatedSkeletonCount) skeletons · mode: \(modeLabel))\n\n"
         }
 
-        // Stamp once with a provisional count, then recount the assembled packet so
-        // the banner matches what callers actually receive.
-        var packet = makeBanner(tokens: currentTokens) + body
-        let finalTokens = await countTokens(packet)
-        packet = makeBanner(tokens: finalTokens) + body
+        var workingBody = body
+        var extra = ""
+        var packet = makeBanner(tokens: 0) + workingBody
+        var finalTokens = await countTokens(packet)
+        if finalTokens > budget {
+            extra =
+                "\n## Warning\n\nPacket exceeded the \(budget)-token ceiling after serialization "
+                + "(\(finalTokens) tokens). Raise --budget; required targets may be listed under Omitted.\n"
+            var guardrail = 0
+            while finalTokens > budget && !workingBody.isEmpty && guardrail < 40 {
+                let dropCount = max(1, workingBody.count / 5)
+                workingBody = String(workingBody.dropLast(dropCount))
+                packet = makeBanner(tokens: 0) + workingBody + extra
+                finalTokens = await countTokens(packet)
+                guardrail += 1
+            }
+        }
+        packet = makeBanner(tokens: finalTokens) + workingBody + extra
         return PackAssembly(
             packet: packet,
             primaryFilePaths: primaryFilePaths,
             primaryCount: primarySymbolCount + primaryFullFileCount,
-            waxFillRan: waxFillRan,
-            waxHitCount: waxHitCount,
-            droppedPrimaries: droppedPrimaries
+            droppedPrimaries: droppedPrimaries,
+            deliveredTargetIDs: deliveredIDs,
+            omissions: omissions
         )
+    }
+
+    private func truncateToBudget(_ text: String, tokens: Int) -> String {
+        if TokenEstimator.shared.estimate(text) <= tokens { return text }
+        var end = text.endIndex
+        while end > text.startIndex {
+            let candidate = String(text[..<end])
+            if TokenEstimator.shared.estimate(candidate) <= tokens {
+                return candidate + "…"
+            }
+            end = text.index(before: end)
+        }
+        return "…"
+    }
+
+    private func formatLocatorSection(symbol: SymbolRecord, locator: String) -> String {
+        let header =
+            "### \(symbol.name) (LOCATOR · \(symbol.filePath):\(symbol.startLine)-\(symbol.endLine))\n"
+        return header
+            + "Implementation span is unavailable for this language; declaration line only.\n"
+            + "```\n\(locator)\n```\n\n"
     }
 
     // MARK: - Formatting
@@ -983,7 +922,7 @@ public final class ContextPacker {
         return try? String(contentsOf: fullURL, encoding: .utf8)
     }
 
-    private func extractFailureSummary(from logPath: String) -> String {
+    private func extractFailureSummary(from logPath: String, tokenBudget: Int = ContextPacker.failureSummaryMaxTokens) -> String {
         do {
             let content = try String(contentsOfFile: logPath, encoding: .utf8)
             let lines = content.components(separatedBy: .newlines)
@@ -993,11 +932,19 @@ public final class ContextPacker {
             if errorLines.isEmpty {
                 return "No explicit errors found in log."
             }
-            // Cap per-line length: one minified-bundle error line once leaked
-            // ~50k tokens into a packet.
-            return errorLines.prefix(10)
-                .map { String($0.prefix(Self.failureLineMaxChars)) }
-                .joined(separator: "\n")
+            var kept: [String] = []
+            var used = 0
+            for line in errorLines.prefix(10) {
+                let clipped = String(line.prefix(Self.failureLineMaxChars))
+                let cost = TokenEstimator.shared.estimate(clipped)
+                if used + cost > tokenBudget {
+                    kept.append("… failure summary truncated to \(tokenBudget) tokens")
+                    break
+                }
+                kept.append(clipped)
+                used += cost
+            }
+            return kept.joined(separator: "\n")
         } catch {
             return "Could not read failure log: \(error.localizedDescription)"
         }

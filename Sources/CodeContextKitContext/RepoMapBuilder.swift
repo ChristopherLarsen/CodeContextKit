@@ -36,7 +36,7 @@ public final class RepoMapBuilder {
 
         let dbStart = Date()
         var symbols = try db.getSymbolsForRepoMap()
-        if let changedPaths, !changedPaths.isEmpty {
+        if let changedPaths {
             symbols = symbols.filter { changedPaths.contains($0.filePath) }
         }
         let dbDuration = Date().timeIntervalSince(dbStart)
@@ -130,10 +130,13 @@ public final class RepoMapBuilder {
 
     private static func matchesFocus(_ symbol: SymbolRecord, terms: String?) -> Bool {
         guard let terms, !terms.isEmpty else { return false }
-        let name = symbol.name.lowercased()
-        let doc = symbol.docComment?.lowercased() ?? ""
+        let path = symbol.filePath.lowercased()
+        let module = ((symbol.filePath as NSString).deletingLastPathComponent as NSString)
+            .lastPathComponent
+            .lowercased()
         return terms.lowercased().split(separator: " ").contains { term in
-            name.contains(term) || doc.contains(term)
+            let needle = String(term)
+            return path.contains(needle) || module.contains(needle)
         }
     }
 

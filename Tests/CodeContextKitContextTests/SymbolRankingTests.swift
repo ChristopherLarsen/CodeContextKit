@@ -230,6 +230,21 @@ final class IndexFreshnessCompactTests: XCTestCase {
         XCTAssertEqual(d["headBranch"] as? String, "feature")
     }
 
+    func testCompactWhenContentStaleEvenIfHeadMatches() {
+        let f = IndexFreshness(
+            stale: false,
+            indexedCommit: "aaaaaaaaaaaaaaaa",
+            indexedBranch: "main",
+            headCommit: "aaaaaaaaaaaaaaaa",
+            headBranch: "main",
+            contentStale: true
+        )
+        let d = f.compactDictionary
+        XCTAssertEqual(d["stale"] as? Bool, true)
+        XCTAssertEqual(d["contentStale"] as? Bool, true)
+        XCTAssertNotNil(f.softWarning)
+    }
+
     func testCompactOmitsBranchesWhenSame() {
         let f = IndexFreshness(
             stale: true,

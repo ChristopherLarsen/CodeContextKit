@@ -265,7 +265,7 @@ struct PackCommand: AsyncParsableCommand {
             print(packet)
             // Machine-readable trailing line for the MCP shim (CCKIT_CALLER=mcp):
             // powers the per-response savings footer without parsing prose.
-            if ProcessInfo.processInfo.environment["CCKIT_CALLER"] == "mcp", mode != .preview {
+            if ProcessInfo.processInfo.environment["CCKIT_CALLER"] == "mcp" {
                 let stats: [String: Any] = [
                     "deliveredTokens": result.deliveredTokens,
                     "sourceWholeFileTokens": result.sourceWholeFileTokens,
@@ -285,6 +285,19 @@ struct PackCommand: AsyncParsableCommand {
                 }
                 if result.droppedPrimaries > 0 {
                     enriched["droppedPrimaries"] = result.droppedPrimaries
+                }
+                if !result.requiredTargetIDs.isEmpty {
+                    enriched["requiredTargetIDs"] = result.requiredTargetIDs
+                }
+                if !result.deliveredTargetIDs.isEmpty {
+                    enriched["deliveredTargetIDs"] = result.deliveredTargetIDs
+                }
+                if !result.omitted.isEmpty {
+                    enriched["omitted"] = result.omitted.map(\.dictionary)
+                }
+                enriched["primaryCount"] = result.primaryCount
+                if result.contentStale {
+                    enriched["contentStale"] = true
                 }
                 if lexicalEmpty {
                     enriched["lexicalEmpty"] = true

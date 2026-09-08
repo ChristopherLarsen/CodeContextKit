@@ -66,7 +66,8 @@ public struct RegexSplitter: CodeSplitter, Sendable {
                                 signature: line.trimmingCharacters(in: .whitespaces),
                                 filePath: filePath,
                                 startLine: index + 1,
-                                endLine: index + 1, // Regex base is line-based for now
+                                endLine: index + 1, // locator-only: RegexSplitter does not recover implementation spans
+
                                 estimatedTokens: estimator.estimate(line)
                             ))
                         }

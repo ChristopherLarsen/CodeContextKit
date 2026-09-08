@@ -75,8 +75,8 @@ public enum SemanticIndexPolicy: Sendable {
 
     /// Identifier-shaped tokens embedded in prose or queries (CamelCase, snake_case).
     ///
-    /// Used by pack for lexical SQLite hits. Vector fill is gated separately by
-    /// `queryLooksIdentifierHeavy` so one CamelCase name in prose does not skip neighbors.
+    /// Dots split tokens here; pack resolution uses `retrievalQueries` so a
+    /// qualified name is tried exact-match before its pieces.
     public static func identifierTokens(in text: String) -> [String] {
         var separators = CharacterSet.alphanumerics.inverted
         separators.remove(charactersIn: "_")
@@ -90,6 +90,42 @@ public enum SemanticIndexPolicy: Sendable {
             guard isIdentifierLike(token) else { continue }
             if seen.insert(token).inserted {
                 out.append(token)
+            }
+        }
+        return out
+    }
+
+    /// Exact qualified names (`Type.member`) plus leftover identifier leaves.
+    ///
+    /// Qualified names are resolved first so `BigAuditService.targetMethod` is
+    /// not decomposed into a type hit that crowds out the named method.
+    public static func retrievalQueries(in text: String) -> (qualified: [String], leaves: [String]) {
+        let qualified = qualifiedNames(in: text)
+        var coveredParts = Set<String>()
+        for name in qualified {
+            for part in name.split(separator: ".") {
+                coveredParts.insert(String(part))
+            }
+        }
+        let leaves = identifierTokens(in: text).filter { !coveredParts.contains($0) }
+        return (qualified, leaves)
+    }
+
+    /// Dotted identifier sequences preserved as a single query (`Foo.bar.baz`).
+    public static func qualifiedNames(in text: String) -> [String] {
+        let pattern = #"\b[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        var seen = Set<String>()
+        var out: [String] = []
+        regex.enumerateMatches(in: text, range: range) { match, _, _ in
+            guard let match, let swiftRange = Range(match.range, in: text) else { return }
+            let name = String(text[swiftRange])
+            let parts = name.split(separator: ".")
+            let identifierLike = parts.contains { isIdentifierLike(String($0)) }
+            guard identifierLike else { return }
+            if seen.insert(name).inserted {
+                out.append(name)
             }
         }
         return out

@@ -97,6 +97,17 @@ final class SemanticIndexPolicyTests: XCTestCase {
         ))
     }
 
+    func testRetrievalQueriesKeepQualifiedNamesIntact() {
+        let queries = SemanticIndexPolicy.retrievalQueries(in: "BigAuditService.targetMethod")
+        XCTAssertEqual(queries.qualified, ["BigAuditService.targetMethod"])
+        XCTAssertFalse(queries.leaves.contains("targetMethod"))
+        XCTAssertFalse(queries.leaves.contains("BigAuditService"))
+
+        let multi = SemanticIndexPolicy.retrievalQueries(in: "targetMethod secondTarget")
+        XCTAssertTrue(multi.leaves.contains("targetMethod"))
+        XCTAssertTrue(multi.leaves.contains("secondTarget"))
+    }
+
     func testIdentifierTokensExtractedFromProse() {
         let tokens = SemanticIndexPolicy.identifierTokens(
             in: "Fix gameStateLabel when renewGalacticCredentials fails"

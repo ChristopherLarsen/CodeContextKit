@@ -8,7 +8,7 @@ import CodeContextKitRetrieval
 struct HistoryBenchmarkCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "history-benchmark",
-        abstract: "Sample git history to graph map compression versus naive file reads."
+        abstract: "Sample git history to graph pack tokens and identifier recall versus naive file reads."
     )
 
     @Option(name: .shortAndLong, help: "Path to the target git repository.")
@@ -37,8 +37,9 @@ struct HistoryBenchmarkCommand: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        let originalBranch = try runShell("git rev-parse --abbrev-ref HEAD", at: repoURL.path)
-        print("Original branch: \(originalBranch)")
+        let originalHead = try runShell("git rev-parse HEAD", at: repoURL.path)
+        let originalRef = originalHead
+        print("Original HEAD: \(originalRef)")
 
         let logOutput = try runShell("git log --format='%H|%s' -n \(limit)", at: repoURL.path)
         let lines = logOutput.components(separatedBy: .newlines).filter { !$0.isEmpty }
@@ -50,6 +51,10 @@ struct HistoryBenchmarkCommand: AsyncParsableCommand {
 
         var results: [[String: Any]] = []
         let estimator = TokenEstimator.shared
+
+        defer {
+            _ = try? runShell("git checkout \(originalRef)", at: repoURL.path)
+        }
 
         for (i, commit) in commits.enumerated() {
             print("\n--- Cycle \(i + 1)/\(commits.count): Checkout \(commit.hash.prefix(7)) ---")
@@ -63,7 +68,7 @@ struct HistoryBenchmarkCommand: AsyncParsableCommand {
             let indexer = Indexer(db: db, wax: wax)
 
             print("Indexing...")
-            try await indexer.index(at: repoURL.path)
+            _ = try await indexer.index(at: repoURL.path)
 
             var totalFiles = 0
             var naiveTokens = 0
@@ -82,13 +87,20 @@ struct HistoryBenchmarkCommand: AsyncParsableCommand {
                 }
             }
 
-            let mapFocus = focus.isEmpty ? commit.message : focus
-            print("Mapping...")
-            let builder = RepoMapBuilder(db: db, counter: { text in await wax.countTokens(text) })
-            let map = try await builder.buildMap(budget: budget, focusTerms: mapFocus)
-            let mapTokens = await wax.countTokens(map)
-            let isFocusPreserved = mapFocus.isEmpty
-                || map.lowercased().contains(mapFocus.lowercased())
+            let packTask = focus.isEmpty ? commit.message : focus
+            print("Packing...")
+            let packer = ContextPacker(db: db, wax: wax, rootPath: repoURL.path)
+            let pack = try await packer.pack(task: packTask, budget: budget, mode: .surgical, mapBudget: 0)
+            let packTokens = pack.deliveredTokens
+            let required = SemanticIndexPolicy.retrievalQueries(in: packTask)
+            let needles = required.qualified + required.leaves
+            let recalled = needles.filter { needle in
+                pack.deliveredTargetIDs.contains(where: { $0.contains(needle) })
+                    || pack.packet.contains(needle)
+            }
+            let fileRecall = needles.isEmpty
+                ? 1.0
+                : Double(recalled.count) / Double(needles.count)
 
             results.append([
                 "cycle": i + 1,
@@ -96,20 +108,25 @@ struct HistoryBenchmarkCommand: AsyncParsableCommand {
                 "message": commit.message,
                 "totalFiles": totalFiles,
                 "naiveTokens": naiveTokens,
-                "mapTokens": mapTokens,
-                "focusPreserved": isFocusPreserved,
-                "compressionRatio": naiveTokens > 0 ? Double(naiveTokens) / Double(max(mapTokens, 1)) : 0,
+                "packTokens": packTokens,
+                "primaryCount": pack.primaryCount,
+                "requiredTargetCount": pack.requiredTargetIDs.count,
+                "deliveredTargetCount": pack.deliveredTargetIDs.count,
+                "fileRecall": fileRecall,
+                "identifierRecall": fileRecall,
             ])
-            print("Naive Tokens: \(naiveTokens) | Map Tokens: \(mapTokens) | Preserved: \(isFocusPreserved)")
+            print(
+                "Naive Tokens: \(naiveTokens) | Pack Tokens: \(packTokens) | "
+                    + "Recall: \(recalled.count)/\(max(needles.count, 1))"
+            )
 
             try await wax.close()
             try? FileManager.default.removeItem(atPath: tempDBPath)
             try? FileManager.default.removeItem(atPath: tempWaxPath)
         }
 
-        print("\nRestoring original state...")
-        let restoreRef = originalBranch == "HEAD" ? "main" : originalBranch
-        _ = try runShell("git checkout \(restoreRef)", at: repoURL.path)
+        _ = try runShell("git checkout \(originalRef)", at: repoURL.path)
+        print("Restored \(originalRef)")
 
         let jsonData = try JSONSerialization.data(
             withJSONObject: ["results": results],
@@ -132,6 +149,14 @@ struct HistoryBenchmarkCommand: AsyncParsableCommand {
         // child fills the ~64 KB pipe buffer (e.g. a large `git log -p`).
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
-        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard task.terminationStatus == 0 else {
+            throw NSError(
+                domain: "HistoryBenchmark",
+                code: Int(task.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: "Command failed (\(task.terminationStatus)): \(command)\n\(text)"]
+            )
+        }
+        return text
     }
 }

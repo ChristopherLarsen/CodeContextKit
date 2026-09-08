@@ -191,11 +191,28 @@ class GatherHeuristicTests(unittest.TestCase):
     def test_gather_miss_when_packet_lacks_named_idents(self) -> None:
         task = "Finish HTMLRenderPlan and MarkupInputSeamTiming"
         packet = "## File: ParsedMarkdown.swift\nstruct ParsedMarkdown {}"
-        self.assertTrue(gather_packet_is_miss(task, packet))
+        self.assertTrue(
+            gather_packet_is_miss(task, packet, {"primaryCount": 0})
+        )
 
     def test_gather_not_miss_when_packet_contains_ident(self) -> None:
         task = "Finish HTMLRenderPlan and MarkupInputSeamTiming"
         packet = "## File\nstruct HTMLRenderPlan {}"
+        self.assertFalse(
+            gather_packet_is_miss(
+                task,
+                packet,
+                {
+                    "primaryCount": 1,
+                    "deliveredTargetIDs": ["HTMLRenderPlan@ParsedMarkdown.swift:1-2"],
+                },
+            )
+        )
+
+    def test_gather_miss_ignores_task_echo_in_packet_text(self) -> None:
+        task = "NonexistentService"
+        packet = "## Task\nNonexistentService\n# Context Packet\n"
+        self.assertTrue(gather_packet_is_miss(task, packet, {"primaryCount": 0}))
         self.assertFalse(gather_packet_is_miss(task, packet))
 
     def test_gather_not_miss_when_task_has_no_idents(self) -> None:
@@ -452,9 +469,15 @@ class DeliveryDedupTests(unittest.TestCase):
     def setUp(self) -> None:
         mcp._delivery_ledger.clear()
         mcp._dedup_saved_total = 0
+        mcp._ledger_loaded_repos.clear()
 
     def tearDown(self) -> None:
         mcp._delivery_ledger.clear()
+        mcp._ledger_loaded_repos.clear()
+
+    @staticmethod
+    def _big_body() -> str:
+        return "let x = 1\n" * 80
 
     @staticmethod
     def _payload(body: str, name: str = "A.b") -> dict:
@@ -473,14 +496,21 @@ class DeliveryDedupTests(unittest.TestCase):
         }
 
     def test_second_identical_delivery_is_stubbed(self) -> None:
-        first = mcp.apply_delivery_dedup(self._payload("let x = 1"), "/repo")
+        body = self._big_body()
+        first = mcp.apply_delivery_dedup(self._payload(body), "/repo")
         self.assertNotIn("deduplicated", first)
-        second = mcp.apply_delivery_dedup(self._payload("let x = 1"), "/repo")
+        second = mcp.apply_delivery_dedup(self._payload(body), "/repo")
         item = second["symbols"][0]
         self.assertTrue(item["deduplicated"])
-        self.assertIn("unchanged since earlier this session", item["body"])
+        self.assertIn("unchanged since earlier this conversation", item["body"])
         self.assertIn("refresh=true", item["body"])
         self.assertGreater(second["dedupSavedTokens"], 0)
+
+    def test_tiny_body_is_not_stubbed_when_stub_costs_more(self) -> None:
+        mcp.apply_delivery_dedup(self._payload("x"), "/repo")
+        out = mcp.apply_delivery_dedup(self._payload("x"), "/repo")
+        self.assertNotIn("deduplicated", out)
+        self.assertEqual(out["symbols"][0]["body"], "x")
 
     def test_changed_body_re_delivers_in_full(self) -> None:
         mcp.apply_delivery_dedup(self._payload("old"), "/repo")
@@ -489,12 +519,13 @@ class DeliveryDedupTests(unittest.TestCase):
         self.assertEqual(out["symbols"][0]["body"], "new")
 
     def test_refresh_bypasses_stub_but_records_fingerprint(self) -> None:
-        mcp.apply_delivery_dedup(self._payload("same"), "/repo")
+        body = self._big_body()
+        mcp.apply_delivery_dedup(self._payload(body), "/repo")
         refreshed = mcp.apply_delivery_dedup(
-            self._payload("same"), "/repo", refresh=True
+            self._payload(body), "/repo", refresh=True
         )
         self.assertNotIn("deduplicated", refreshed)
-        again = mcp.apply_delivery_dedup(self._payload("same"), "/repo")
+        again = mcp.apply_delivery_dedup(self._payload(body), "/repo")
         self.assertTrue(again["symbols"][0]["deduplicated"])
 
     def test_env_opt_out_disables_stubbing(self) -> None:
@@ -511,10 +542,11 @@ class DeliveryDedupTests(unittest.TestCase):
             )
         self.assertLessEqual(len(mcp._delivery_ledger), mcp._DELIVERY_LEDGER_CAP)
 
-    def test_same_body_other_repo_not_stubbed(self) -> None:
-        mcp.apply_delivery_dedup(self._payload("x"), "/repoA")
-        out = mcp.apply_delivery_dedup(self._payload("x"), "/repoB")
-        self.assertNotIn("deduplicated", out)
+    def test_same_body_other_repo_shares_conversation_ledger(self) -> None:
+        body = self._big_body()
+        mcp.apply_delivery_dedup(self._payload(body), "/repoA")
+        out = mcp.apply_delivery_dedup(self._payload(body), "/repoB")
+        self.assertTrue(out["symbols"][0]["deduplicated"])
 
     def test_non_symbol_payload_untouched(self) -> None:
         payload = {"count": 0}
@@ -535,9 +567,30 @@ class DeliveryDedupTests(unittest.TestCase):
         self.assertNotIn("deduplicated", first)
         second = mcp.apply_packet_dedup(self._packet(big), "/repo")
         self.assertTrue(second.get("deduplicated"))
-        self.assertIn("unchanged since earlier this session", second["text"])
+        self.assertIn("unchanged since earlier this conversation", second["text"])
         self.assertIn("### Auth.refresh", second["text"])
         self.assertGreater(second["dedupSavedTokens"], 0)
+
+    def test_gather_and_symbol_share_content_identity(self) -> None:
+        body = self._big_body()
+        packet = self._packet(body)
+        # Align gather location Sources/A.swift:10-40 with a symbol payload.
+        mcp.apply_packet_dedup(packet, "/repo")
+        symbol_payload = {
+            "count": 1,
+            "symbols": [
+                {
+                    "qualifiedName": "Auth.refresh",
+                    "kind": "function",
+                    "filePath": "Sources/A.swift",
+                    "startLine": 10,
+                    "endLine": 40,
+                    "body": body,
+                }
+            ],
+        }
+        stubbed = mcp.apply_delivery_dedup(symbol_payload, "/repo")
+        self.assertTrue(stubbed["symbols"][0]["deduplicated"])
 
     def test_packet_dedup_skips_small_bodies(self) -> None:
         first = mcp.apply_packet_dedup(self._packet("tiny"), "/repo")
@@ -551,10 +604,10 @@ class DeliveryDedupTests(unittest.TestCase):
         self.assertNotIn("deduplicated", first)
         second = mcp.apply_outline_dedup(dict(payload), "/repo", "X.swift")
         self.assertTrue(second.get("deduplicated"))
-        self.assertIn("unchanged since earlier this session", second["text"])
+        self.assertIn("unchanged since earlier this conversation", second["text"])
         self.assertEqual(
             second["originalOutlineTokens"],
-            max(1, len(payload["text"]) // 4),
+            mcp.estimate_tokens(payload["text"]),
         )
 
     def test_ledger_persists_and_reloads(self) -> None:
@@ -563,13 +616,13 @@ class DeliveryDedupTests(unittest.TestCase):
 
         with _tf.TemporaryDirectory() as tmp:
             repo = str(_Path(tmp))
-            mcp.apply_delivery_dedup(self._payload("persist-me"), repo)
+            mcp.apply_delivery_dedup(self._payload(self._big_body()), repo)
             path = _Path(repo) / ".cckit" / "delivery_ledger.json"
             self.assertTrue(path.exists())
             mcp._delivery_ledger.clear()
             loaded = mcp.load_delivery_ledger(repo)
             self.assertEqual(loaded, 1)
-            stubbed = mcp.apply_delivery_dedup(self._payload("persist-me"), repo)
+            stubbed = mcp.apply_delivery_dedup(self._payload(self._big_body()), repo)
             self.assertTrue(stubbed["symbols"][0]["deduplicated"])
 
     def test_dedup_savings_rows_written(self) -> None:
@@ -658,6 +711,31 @@ class SearchTextTests(unittest.TestCase):
             got = mcp._python_text_search(root, compiled, stop_after=100)
         self.assertEqual([(path, line) for path, line, _ in got], [("src/a.swift", 1)])
 
+    def test_python_fallback_escapes_literals_and_honors_include(self) -> None:
+        import tempfile as _tf
+        from pathlib import Path as _Path
+        with _tf.TemporaryDirectory() as tmp:
+            root = _Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "a.swift").write_text("let axb = 1\nlet a.b = 2\n", encoding="utf-8")
+            (root / "src" / "a.kt").write_text("val a.b = 3\n", encoding="utf-8")
+            literal = re.compile(re.escape("a.b"))
+            got = mcp._python_text_search(root, literal, stop_after=100, include="*.swift")
+        paths_lines = [(path, line, content) for path, line, content in got]
+        self.assertEqual(paths_lines, [("src/a.swift", 2, "let a.b = 2")])
+
+    def test_search_text_flags_shown_less_than_total(self) -> None:
+        matches = [("f.swift", i, "needle") for i in range(1, 76)]
+        with mock.patch.object(mcp.shutil, "which", return_value="/usr/bin/rg"):
+            with mock.patch.object(mcp, "_stream_rg", return_value=(matches, None, False)):
+                with mock.patch.object(mcp, "resolve_repo", return_value=Path("/tmp")):
+                    with mock.patch.object(mcp, "with_freshness", side_effect=lambda payload, _repo: payload):
+                        out = mcp.search_text_tool(query="needle", repo="/tmp", limit=50)
+        self.assertEqual(out["totalMatches"], 75)
+        self.assertEqual(out["shownMatches"], 50)
+        self.assertTrue(out["truncated"])
+        self.assertFalse(out["totalIsLowerBound"])
+
 
 class WorkingTreeNeedsIndexTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -670,6 +748,19 @@ class WorkingTreeNeedsIndexTests(unittest.TestCase):
 
     def test_clean_tree_does_not_need_index(self) -> None:
         self.assertFalse(working_tree_needs_index(self.repo))
+
+    def test_reverted_clean_tree_still_needs_index(self) -> None:
+        self.swift.write_text("struct Foo { var x: Int }\n", encoding="utf-8")
+        sha = hashlib.sha256(self.swift.read_bytes()).hexdigest()
+        conn = sqlite3.connect(self.repo / ".cckit" / "index.sqlite")
+        conn.execute("UPDATE fileRecord SET sha256 = ? WHERE path = ?", (sha, "Foo.swift"))
+        conn.commit()
+        conn.close()
+        _git(self.repo, "checkout", "--", "Foo.swift")
+        self.assertTrue(working_tree_needs_index(self.repo))
+        freshness = mcp.index_freshness(self.repo)
+        self.assertTrue(freshness.get("contentStale"))
+        self.assertTrue(freshness.get("stale"))
 
     def test_modified_swift_needs_index(self) -> None:
         self.swift.write_text("struct Foo { var x: Int }\n", encoding="utf-8")

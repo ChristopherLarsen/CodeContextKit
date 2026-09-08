@@ -45,19 +45,23 @@ public struct IndexFreshness: Sendable, Equatable {
     public var indexedBranch: String?
     public var headCommit: String?
     public var headBranch: String?
+    /// True when indexed file bytes differ from disk (including a revert to HEAD).
+    public var contentStale: Bool
 
     public init(
         stale: Bool,
         indexedCommit: String? = nil,
         indexedBranch: String? = nil,
         headCommit: String? = nil,
-        headBranch: String? = nil
+        headBranch: String? = nil,
+        contentStale: Bool = false
     ) {
         self.stale = stale
         self.indexedCommit = indexedCommit
         self.indexedBranch = indexedBranch
         self.headCommit = headCommit
         self.headBranch = headBranch
+        self.contentStale = contentStale
     }
 
     /// Snapshot current git HEAD (commit + branch) for `repoRoot`.
@@ -103,8 +107,11 @@ public struct IndexFreshness: Sendable, Equatable {
     /// Compact envelope for locator/content tools: empty when fresh; minimal when stale.
     /// Absence of `stale` means the index is current.
     public var compactDictionary: [String: Any] {
-        guard stale else { return [:] }
+        guard stale || contentStale else { return [:] }
         var dict: [String: Any] = ["stale": true]
+        if contentStale {
+            dict["contentStale"] = true
+        }
         if let indexedCommit {
             dict["indexedCommit"] = String(indexedCommit.prefix(8))
         }
@@ -121,7 +128,13 @@ public struct IndexFreshness: Sendable, Equatable {
     /// Soft CLI note — staleness usually means line numbers in recently touched files may drift,
     /// not that the whole tool is untrustworthy.
     public var softWarning: String? {
-        guard stale else { return nil }
+        guard stale || contentStale else { return nil }
+        if contentStale && !stale {
+            return
+                "Note: indexed file contents differ from the working tree "
+                + "(including a revert to a clean HEAD). Line numbers may be wrong; "
+                + "run `cckit index` (or let MCP auto-refresh) when exact lines matter."
+        }
         let headShort = headCommit.map { String($0.prefix(8)) } ?? "?"
         let indexedShort = indexedCommit.map { String($0.prefix(8)) } ?? "?"
         var lag = "HEAD \(headShort) vs indexed \(indexedShort)"

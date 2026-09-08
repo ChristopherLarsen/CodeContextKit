@@ -361,6 +361,7 @@ public enum SymbolBodyResolver: Sendable {
     }
 
     /// Exact → leaf-strict (1 serve / 2–8 candidates / else top-5 loose) ladder.
+    /// Exact qualified names return every matching declaration (overloads, extensions).
     public static func resolve(requested: String, db: Database) throws -> Outcome {
         let exact = try db.getSymbols(qualifiedName: requested)
         if !exact.isEmpty {
@@ -475,5 +476,15 @@ public enum SymbolBodyResolver: Sendable {
             lines.append("  (+\(members.count - cap) more)")
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// Extension declarations of a type, including those in other files.
+    public static func extensions(of symbol: SymbolRecord, db: Database) throws -> [SymbolRecord] {
+        guard symbol.kind.isType else { return [] }
+        let likes = try db.getSymbolsLike(name: symbol.name, strict: true)
+        return likes.filter { other in
+            other.kind == .extension
+                && (other.name == symbol.name || other.qualifiedName == symbol.qualifiedName)
+        }
     }
 }

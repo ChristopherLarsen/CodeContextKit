@@ -37,13 +37,21 @@ struct SymbolCommand: AsyncParsableCommand {
         var candidateBlocks: [String] = []
         var missBlocks: [String] = []
         var resolvedSymbols: [SymbolRecord] = []
-        var seenQualified = Set<String>()
+        var seenIdentity = Set<DeclarationIdentity>()
+        var contentStale = false
 
         for requested in names {
             let outcome = try SymbolBodyResolver.resolve(requested: requested, db: db)
             switch outcome {
             case .bodies(let symbols, let resolvedFrom):
-                for sym in symbols where seenQualified.insert(sym.qualifiedName).inserted {
+                var expanded = symbols
+                for sym in symbols where sym.kind.isType {
+                    let extras = try SymbolBodyResolver.extensions(of: sym, db: db)
+                    expanded.append(contentsOf: extras)
+                }
+                for sym in expanded {
+                    let identity = DeclarationIdentity(sym)
+                    guard seenIdentity.insert(identity).inserted else { continue }
                     resolvedSymbols.append(sym)
                     if let omission = try SymbolBodyResolver.hugeOmission(for: sym, db: db) {
                         symbolItems.append(
@@ -55,16 +63,34 @@ struct SymbolCommand: AsyncParsableCommand {
                                 members: omission.members
                             )
                         )
-                    } else {
-                        let body = Self.readBody(symbol: sym, repoRoot: root)
-                        symbolItems.append(
-                            SymbolBodyResolver.slimPayload(
-                                symbol: sym,
-                                body: body,
-                                resolvedFrom: resolvedFrom
-                            )
-                        )
+                        continue
                     }
+                    if !ImplementationSpanPolicy.hasReliableImplementationSpan(filePath: sym.filePath) {
+                        let locator = Self.readBody(symbol: sym, repoRoot: root, db: db).body
+                        var row = SymbolBodyResolver.slimPayload(
+                            symbol: sym,
+                            body: "",
+                            resolvedFrom: resolvedFrom,
+                            omitted: "locator-only language: implementation span is the declaration line"
+                        )
+                        row["locatorOnly"] = true
+                        row["locator"] = locator
+                        row["signature"] = sym.signature
+                        symbolItems.append(row)
+                        continue
+                    }
+                    let read = Self.readBody(symbol: sym, repoRoot: root, db: db)
+                    contentStale = contentStale || read.contentStale
+                    var row = SymbolBodyResolver.slimPayload(
+                        symbol: read.symbol,
+                        body: read.body,
+                        resolvedFrom: resolvedFrom
+                    )
+                    row["signature"] = read.symbol.signature
+                    if read.contentStale {
+                        row["contentStale"] = true
+                    }
+                    symbolItems.append(row)
                 }
             case .candidates(let block):
                 candidateBlocks.append(block)
@@ -97,6 +123,10 @@ struct SymbolCommand: AsyncParsableCommand {
                 payload["tokensDelivered"] = deliveredTokens
                 payload["sourceWholeFileTokens"] = sourceTokens
                 payload["tokensSaved"] = sourceTokens - deliveredTokens
+            }
+            if contentStale {
+                payload["contentStale"] = true
+                payload["stale"] = true
             }
             for (key, value) in freshness.compactDictionary {
                 payload[key] = value
@@ -182,7 +212,11 @@ struct SymbolCommand: AsyncParsableCommand {
         return total
     }
 
-    private static func readBody(symbol: SymbolRecord, repoRoot: URL) -> String {
+    private static func readBody(symbol: SymbolRecord, repoRoot: URL, db: Database) -> (
+        symbol: SymbolRecord,
+        body: String,
+        contentStale: Bool
+    ) {
         let url: URL
         if symbol.filePath.hasPrefix("/") {
             url = URL(fileURLWithPath: symbol.filePath)
@@ -190,8 +224,17 @@ struct SymbolCommand: AsyncParsableCommand {
             url = repoRoot.appendingPathComponent(symbol.filePath)
         }
         guard let content = try? String(contentsOf: url, encoding: .utf8) else {
-            return ""
+            return (symbol, "", false)
         }
-        return LineRangeBodyExtractor.body(for: symbol, content: content)
+        let hasher = FileHasher()
+        let currentHash = hasher.hash(content: content)
+        let indexedHash = try? db.getFile(path: symbol.filePath)?.sha256
+        let slice = FreshSymbolResolver.slice(
+            symbol: symbol,
+            content: content,
+            indexedHash: indexedHash,
+            currentHash: currentHash
+        )
+        return (slice.symbol, slice.body, indexedHash != nil && indexedHash != currentHash)
     }
 }

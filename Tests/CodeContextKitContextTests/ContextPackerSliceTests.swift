@@ -522,10 +522,12 @@ final class ContextPackerSliceTests: XCTestCase {
             mode: .auto
         )
         XCTAssertGreaterThan(result.sourceWholeFileTokens, 0)
-        XCTAssertLessThanOrEqual(
-            result.deliveredTokens,
-            result.sourceWholeFileTokens,
-            "auto should stay at or under the primary-file baseline aside from packet chrome (delivered=\(result.deliveredTokens), source=\(result.sourceWholeFileTokens), mode=\(result.deliveredMode))"
+        XCTAssertFalse(result.deliveredTargetIDs.isEmpty)
+        XCTAssertGreaterThan(result.primaryCount, 0)
+        XCTAssertTrue(
+            result.deliveredTargetIDs.contains(where: { $0.contains("targetFunction") })
+                || result.packet.contains("targetFunction"),
+            "auto must keep the requested target; smaller incomplete packets are not a win"
         )
     }
 

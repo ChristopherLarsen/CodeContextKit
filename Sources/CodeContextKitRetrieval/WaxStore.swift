@@ -136,6 +136,9 @@ public actor WaxStore {
             "qualifiedName": symbol.qualifiedName,
             "filePath": symbol.filePath,
             "kind": "\(symbol.kind)",
+            "startLine": String(symbol.startLine),
+            "endLine": String(symbol.endLine),
+            "signature": symbol.signature,
             "contentHash": String(hash),
             "mandate": mandate
         ]
@@ -168,31 +171,37 @@ public actor WaxStore {
 
         // Append-only delta runs leak stale twins: the previous document for
         // a re-saved symbol stays in the arena alongside its fresh twin until
-        // the next rebuild. Dedupe by qualified name (best score wins) so a
-        // leaked twin cannot crowd a fresh hit out of the top-K, and resolve
-        // bodies through SQLite/disk as before.
-        var bestBySymbol: [String: SearchResult] = [:]
+        // the next rebuild. Dedupe by declaration identity (file + range +
+        // signature), not display name, so overloads and extensions survive
+        // while leaked twins of the same span still collapse to the best score.
+        var bestByIdentity: [String: SearchResult] = [:]
         var order: [String] = []
         for res in results.items {
             let preview = Self.stripMandate(res.text)
+            let startLine = res.metadata["startLine"].flatMap(Int.init)
+            let endLine = res.metadata["endLine"].flatMap(Int.init)
             let result = SearchResult(
                 symbol: res.metadata["qualifiedName"] ?? "Unknown",
                 file: res.metadata["filePath"] ?? "Unknown",
                 kind: res.metadata["kind"] ?? "unknown",
                 score: Float(res.score),
                 preview: preview,
-                estimatedTokens: TokenEstimator.shared.estimate(preview)
+                estimatedTokens: TokenEstimator.shared.estimate(preview),
+                startLine: startLine,
+                endLine: endLine,
+                signature: res.metadata["signature"]
             )
-            if bestBySymbol[result.symbol] != nil {
-                if result.score > bestBySymbol[result.symbol]!.score {
-                    bestBySymbol[result.symbol] = result
+            let identity = result.declarationKey
+            if bestByIdentity[identity] != nil {
+                if result.score > bestByIdentity[identity]!.score {
+                    bestByIdentity[identity] = result
                 }
             } else {
-                bestBySymbol[result.symbol] = result
-                order.append(result.symbol)
+                bestByIdentity[identity] = result
+                order.append(identity)
             }
         }
-        return order.prefix(limit).compactMap { bestBySymbol[$0] }
+        return order.prefix(limit).compactMap { bestByIdentity[$0] }
     }
 
     /// Pure local math (hash proxy vectors + cosine), no arena needed —
@@ -511,9 +520,35 @@ public struct SearchResult: Codable, Sendable {
     public let score: Float
     public let preview: String
     public let estimatedTokens: Int
-    
-    public init(symbol: String, file: String, kind: String, score: Float, preview: String, estimatedTokens: Int) {
-        self.symbol = symbol; self.file = file; self.kind = kind; self.score = score; self.preview = preview; self.estimatedTokens = estimatedTokens
+    public let startLine: Int?
+    public let endLine: Int?
+    public let signature: String?
+
+    public init(
+        symbol: String,
+        file: String,
+        kind: String,
+        score: Float,
+        preview: String,
+        estimatedTokens: Int,
+        startLine: Int? = nil,
+        endLine: Int? = nil,
+        signature: String? = nil
+    ) {
+        self.symbol = symbol
+        self.file = file
+        self.kind = kind
+        self.score = score
+        self.preview = preview
+        self.estimatedTokens = estimatedTokens
+        self.startLine = startLine
+        self.endLine = endLine
+        self.signature = signature
+    }
+
+    /// Identity used to collapse stale arena twins without dropping overloads.
+    public var declarationKey: String {
+        "\(file)|\(symbol)|\(startLine ?? 0)|\(endLine ?? 0)|\(signature ?? "")"
     }
 }
 

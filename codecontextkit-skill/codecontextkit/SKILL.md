@@ -28,7 +28,7 @@ commands in parentheses do the same thing for shell use.
 
 1. Prefer gather over Grep/Read for source on the first retrieval of task-shaped work. Treat the packet as starting context.
 2. After a gather or locator hit, do not Grep that name. If you lack the next name, outline the file. Huge hits: nested name or narrow Read — symbol will not dump the whole type.
-3. Content tools read disk; locators use the last index. A dirty worktree does not retire them — MCP auto-refreshes HEAD drift and dirty files, and retries once on a locator miss.
+3. Content tools read disk; locators use the last index. A dirty worktree does not retire them — MCP auto-refreshes HEAD drift and dirty files, and retries once on a locator miss. Pass `refresh=true` on gather/symbol/outline to re-fetch bodies already delivered this conversation.
 4. On a miss: gather misses invite retrying gather with prose; locator misses invite outline/symbol (find_symbol after gather, or when you only need a qualified name). Grep stays valid for markdown, project files, logs, and string literals.
 5. Successful responses carry a savings line (`~delivered vs whole-file`). Stay surgical when it shows a big win; escalate to `mode=full` only when truly needed.
 6. Pass `repo=` when unsure. Do not call `index` yourself — MCP auto-refreshes; index only on `no_index`.

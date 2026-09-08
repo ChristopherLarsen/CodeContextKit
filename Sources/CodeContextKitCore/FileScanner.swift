@@ -94,31 +94,32 @@ public struct FileScanner {
 
 private struct IgnoreRules {
     private let defaultRules: [IgnoreRule]
-    private let gitignoreRules: [IgnoreRule]
     private let excludeRules: [IgnoreRule]
     private let includeRules: [IgnoreRule]
+    /// Patterns from every `.gitignore`, rooted at the file's directory. Last match wins.
+    private let gitignoreLayers: [(base: String, rules: [GitIgnoreLine])]
 
     init(rootURL: URL, exclude: [String], includeFolders: [String]) {
         let defaultRules = [".build/", ".git/", "DerivedData/", "node_modules/", ".DS_Store"]
-        let gitignoreRules = Self.loadGitignoreRules(rootURL: rootURL)
         self.defaultRules = defaultRules.compactMap(IgnoreRule.init)
-        self.gitignoreRules = gitignoreRules.compactMap(IgnoreRule.init)
         self.excludeRules = exclude.compactMap(IgnoreRule.init)
         self.includeRules = includeFolders.compactMap(IgnoreRule.init)
+        self.gitignoreLayers = Self.loadGitignoreLayers(rootURL: rootURL)
     }
 
     func shouldSkipDirectory(path: String) -> Bool {
         if defaultRules.contains(where: { $0.matches(path: path, isDirectory: true) }) { return true }
         if excludeRules.contains(where: { $0.matches(path: path, isDirectory: true) }) { return true }
         if isIncluded(path: path) || containsIncludedDescendant(path: path) { return false }
-        return gitignoreRules.contains { $0.matches(path: path, isDirectory: true) }
+        // Do not skipDescendants for gitignore: a later `!` pattern may re-include a child.
+        return false
     }
 
     func excludesFile(path: String) -> Bool {
         if defaultRules.contains(where: { $0.matches(path: path, isDirectory: false) }) { return true }
         if excludeRules.contains(where: { $0.matches(path: path, isDirectory: false) }) { return true }
         if isIncluded(path: path) { return false }
-        return gitignoreRules.contains { $0.matches(path: path, isDirectory: false) }
+        return gitIgnored(path: path, isDirectory: false)
     }
 
     func isIncluded(path: String) -> Bool {
@@ -129,20 +130,78 @@ private struct IgnoreRules {
         includeRules.contains { $0.isDescendant(of: path) }
     }
 
-    private static func loadGitignoreRules(rootURL: URL) -> [String] {
-        let gitignoreURL = rootURL.appendingPathComponent(".gitignore")
-        guard let content = try? String(contentsOf: gitignoreURL, encoding: .utf8) else {
-            return []
-        }
-
-        return content.components(separatedBy: .newlines).compactMap { line in
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), !trimmed.hasPrefix("!") else {
-                return nil
+    private func gitIgnored(path: String, isDirectory: Bool) -> Bool {
+        var ignored = false
+        for layer in gitignoreLayers {
+            let relative: String
+            if layer.base.isEmpty {
+                relative = path
+            } else if path == layer.base || path.hasPrefix(layer.base + "/") {
+                relative = String(path.dropFirst(layer.base.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            } else {
+                continue
             }
-            return trimmed
+            for line in layer.rules {
+                if line.rule.matches(path: relative, isDirectory: isDirectory)
+                    || line.rule.matches(path: path, isDirectory: isDirectory)
+                {
+                    ignored = !line.negated
+                }
+            }
         }
+        return ignored
     }
+
+    private static func loadGitignoreLayers(rootURL: URL) -> [(base: String, rules: [GitIgnoreLine])] {
+        var layers: [(base: String, rules: [GitIgnoreLine])] = []
+        if let root = parseGitignore(rootURL.appendingPathComponent(".gitignore")) {
+            layers.append((base: "", rules: root))
+        }
+        let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsPackageDescendants]
+        )
+        while let fileURL = enumerator?.nextObject() as? URL {
+            if fileURL.lastPathComponent == ".git" {
+                enumerator?.skipDescendants()
+                continue
+            }
+            guard fileURL.lastPathComponent == ".gitignore" else { continue }
+            let parent = fileURL.deletingLastPathComponent()
+            let rootPath = rootURL.resolvingSymlinksInPath().path
+            var rel = String(parent.resolvingSymlinksInPath().path.dropFirst(rootPath.count))
+            if rel.hasPrefix("/") { rel.removeFirst() }
+            if rel.isEmpty { continue }
+            if let parsed = parseGitignore(fileURL) {
+                layers.append((base: rel, rules: parsed))
+            }
+        }
+        return layers
+    }
+
+    private static func parseGitignore(_ url: URL) -> [GitIgnoreLine]? {
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        var lines: [GitIgnoreLine] = []
+        for raw in content.components(separatedBy: .newlines) {
+            var trimmed = raw.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
+            var negated = false
+            if trimmed.hasPrefix("!") {
+                negated = true
+                trimmed.removeFirst()
+                trimmed = trimmed.trimmingCharacters(in: .whitespaces)
+            }
+            guard let rule = IgnoreRule(trimmed) else { continue }
+            lines.append(GitIgnoreLine(negated: negated, rule: rule))
+        }
+        return lines
+    }
+}
+
+private struct GitIgnoreLine {
+    var negated: Bool
+    var rule: IgnoreRule
 }
 
 private struct IgnoreRule {

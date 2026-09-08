@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import copy
 import threading
 import time
 from contextlib import contextmanager
@@ -215,7 +216,8 @@ GATHER_DESCRIPTION = (
     "know help matching and belong here, not in a first find_symbol. "
     "mode=preview returns just names/ranges/body-sizes (~1500 token cap) — "
     "cheap first look before committing to bodies. symbol for one known "
-    "body. Pass repo= when unsure."
+    "body. Pass refresh=true to re-fetch bodies already delivered this "
+    "conversation. Pass repo= when unsure."
 )
 
 MAP_DESCRIPTION = (
@@ -722,12 +724,42 @@ def task_identifiers(task: str) -> list[str]:
     return out
 
 
-def gather_packet_is_miss(task: str, packet_text: str) -> bool:
-    """True when the task named identifiers and the packet contains none of them."""
+def gather_packet_is_miss(
+    task: str,
+    packet_text: str = "",
+    stats: dict[str, Any] | None = None,
+) -> bool:
+    """True when retrieval delivered none of the requested targets.
+
+    Absence is taken from structured retrieval results (PACK_STATS / target
+    IDs / primary count), never from a free-text search of the packet — the
+    echoed ``## Task`` line would otherwise hide every miss.
+    """
+    _ = packet_text
     idents = task_identifiers(task)
     if not idents:
         return False
-    return not any(ident in packet_text for ident in idents)
+    if stats:
+        delivered = stats.get("deliveredTargetIDs") or []
+        required = stats.get("requiredTargetIDs") or []
+        primary = stats.get("primaryCount")
+        if required:
+            return len(delivered) == 0
+        if primary is not None:
+            return int(primary) == 0
+    return False
+
+
+def gather_is_miss(payload: dict[str, Any], task: str) -> bool:
+    if "error" in payload:
+        return False
+    text = payload.get("text")
+    stats = payload.get("packStats") if isinstance(payload.get("packStats"), dict) else None
+    if stats is None and isinstance(text, str):
+        _, stats = split_trailing_stats(text, _PACK_STATS_LINE)
+    if not isinstance(text, str) and stats is None:
+        return False
+    return gather_packet_is_miss(task, text if isinstance(text, str) else "", stats)
 
 
 def find_symbol_is_miss(payload: dict[str, Any]) -> bool:
@@ -754,24 +786,59 @@ def symbol_is_miss(payload: dict[str, Any]) -> bool:
     return not isinstance(symbols, list) or len(symbols) == 0
 
 
-def gather_is_miss(payload: dict[str, Any], task: str) -> bool:
-    if "error" in payload:
-        return False
-    text = payload.get("text")
-    if not isinstance(text, str):
-        return False
-    return gather_packet_is_miss(task, text)
-
-
 # --- Session delivery ledger --------------------------------------------
-# The shim process lives for a whole agent session. Re-sending an unchanged
-# symbol body costs tokens without adding information. Bodies delivered this
-# session are fingerprinted; identical re-deliveries become one-line stubs.
-# Opt out with CCKIT_DEDUP=off; per-call refresh=true forces full bodies.
+# Fingerprints are scoped to this process (and execv, which keeps the pid)
+# plus an optional CCKIT_CONTEXT_ID. A new agent process does not inherit
+# another conversation's bodies. Opt out with CCKIT_DEDUP=off; refresh=true
+# forces full bodies on symbol, outline, and gather_code_context.
 
 _DELIVERY_LEDGER_CAP = 512
 _delivery_ledger: OrderedDict[tuple[str, str], str] = OrderedDict()
 _dedup_saved_total = 0
+_ledger_loaded_repos: set[str] = set()
+_DELIVERY_CONTEXT = os.environ.get("CCKIT_CONTEXT_ID") or f"pid:{os.getpid()}"
+
+
+def delivery_context_id() -> str:
+    return os.environ.get("CCKIT_CONTEXT_ID") or _DELIVERY_CONTEXT
+
+
+def estimate_tokens(text: str) -> int:
+    """Conservative Unicode-aware token estimate (CJK = 1 token per letter)."""
+    if not text:
+        return 0
+    tokens = 0
+    latin_run = 0
+    whitespace_run = False
+
+    def flush_latin() -> None:
+        nonlocal tokens, latin_run
+        if latin_run:
+            tokens += 1 + (latin_run // 4)
+            latin_run = 0
+
+    for ch in text:
+        if ch == "\n":
+            flush_latin()
+            whitespace_run = False
+            tokens += 1
+            continue
+        if ch.isspace():
+            flush_latin()
+            if not whitespace_run:
+                tokens += 1
+                whitespace_run = True
+            continue
+        whitespace_run = False
+        o = ord(ch)
+        if (48 <= o <= 57) or (65 <= o <= 90) or (97 <= o <= 122):
+            latin_run += 1
+            continue
+        flush_latin()
+        if ch.isalpha() or ch.isdigit() or not ch.isalnum():
+            tokens += 1
+    flush_latin()
+    return max(1, tokens)
 
 
 def dedup_disabled() -> bool:
@@ -787,77 +854,117 @@ def _body_fingerprint(body: str) -> str:
     return hashlib.sha1(body.encode("utf-8", "replace")).hexdigest()
 
 
+def _content_identity(file_path: str, start: Any, end: Any, body: str) -> str:
+    return f"{file_path}:{start}-{end}:{_body_fingerprint(body)}"
+
+
+_LOCATION_RANGE = re.compile(r":(\d+)-(\d+)$")
+
+
+def _identity_from_location(location: str, body: str) -> str:
+    """Share gather/symbol identity: path + range + body hash, not display name."""
+    match = _LOCATION_RANGE.search(location)
+    if match:
+        return _content_identity(
+            location[: match.start()],
+            int(match.group(1)),
+            int(match.group(2)),
+            body,
+        )
+    return _content_identity(location, 0, 0, body)
+
+
+def _ledger_key(identity: str) -> tuple[str, str]:
+    return (delivery_context_id(), identity)
+
+
+def _payload_dump(payload: dict[str, Any]) -> str:
+    try:
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    except TypeError:
+        return str(payload)
+
+
 def apply_delivery_dedup(
     payload: dict[str, Any],
     repo: str,
     *,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    """Stub symbol bodies already delivered unchanged earlier this session.
-
-    Fingerprints are always updated (so a refreshed body becomes the new
-    baseline); only the stubbing is skipped when `refresh` is true.
-    """
+    """Stub symbol bodies already delivered unchanged in this conversation."""
     global _dedup_saved_total
+    ensure_delivery_ledger(repo)
     symbols = payload.get("symbols")
     if not isinstance(symbols, list) or not symbols:
         return payload
 
-    key_prefix = str(repo)
+    original_payload = copy.deepcopy(payload)
+    original = _payload_dump(original_payload)
+    working = copy.deepcopy(symbols)
     saved = 0
-    stubbed_any = False
-    for item in symbols:
+    for item in working:
         if not isinstance(item, dict):
             continue
-        name = item.get("qualifiedName")
         body = item.get("body")
-        if not isinstance(name, str) or not name:
-            continue
         if not isinstance(body, str) or not body:
             continue
-        key = (key_prefix, name)
+        identity = _content_identity(
+            str(item.get("filePath") or ""),
+            item.get("startLine") or 0,
+            item.get("endLine") or 0,
+            body,
+        )
+        key = _ledger_key(identity)
         fingerprint = _body_fingerprint(body)
         prior = _delivery_ledger.get(key)
-        estimated = max(1, len(body) // 4)
         if (
             not refresh
             and not dedup_disabled()
             and prior is not None
             and prior == fingerprint
         ):
-            item["originalBodyTokens"] = estimated
             location = f"{item.get('filePath', '')}:{item.get('startLine', '')}"
-            item["body"] = (
-                f"[unchanged since earlier this session — ~{estimated} tokens "
+            stub = (
+                f"[unchanged since earlier this conversation — "
                 f"delivered previously ({location}). Pass refresh=true to "
                 "re-fetch.]"
             )
-            item["deduplicated"] = True
-            saved += estimated
-            stubbed_any = True
-        _delivery_ledger[key] = fingerprint
-        _delivery_ledger.move_to_end(key)
+            trial = dict(item)
+            trial["body"] = stub
+            trial["deduplicated"] = True
+            if estimate_tokens(_payload_dump({"symbols": [trial]})) < estimate_tokens(
+                _payload_dump({"symbols": [item]})
+            ):
+                item["originalBodyTokens"] = estimate_tokens(body)
+                item["body"] = stub
+                item["deduplicated"] = True
+                saved += max(0, estimate_tokens(body) - estimate_tokens(stub))
+        _record_fingerprint(key, fingerprint)
 
-    while len(_delivery_ledger) > _DELIVERY_LEDGER_CAP:
-        _delivery_ledger.popitem(last=False)
-
-    if saved:
-        _dedup_saved_total += saved
+    candidate = dict(payload)
+    candidate["symbols"] = working
+    net = estimate_tokens(original) - estimate_tokens(_payload_dump(candidate))
+    if saved and net > 0:
+        _dedup_saved_total += net
+        payload["symbols"] = working
         payload["deduplicated"] = True
-        payload["dedupSavedTokens"] = saved
-        record_dedup_saving(repo, "symbol", saved)
+        payload["dedupSavedTokens"] = net
+        record_dedup_saving(repo, "symbol", net)
+        save_delivery_ledger(repo)
+        return payload
     save_delivery_ledger(repo)
     return payload
 
 
-_GATHER_BODY_MIN_CHARS = 200
+_GATHER_BODY_MIN_CHARS = 40
 _GATHER_SECTION_RE = re.compile(
-    r"(?ms)^### (?P<name>.+?) \(SYMBOL · (?P<location>[^\n)]+)\)\n"
+    r"(?ms)^### (?P<name>.+?) \((?P<kind>SYMBOL|FULL|LOCATOR) · (?P<location>[^\n)]+)\)\n"
+    r"(?:Implementation span is unavailable for this language; declaration line only.\n)?"
     r"```(?P<fence>\w*)\n(?P<body>.*?)\n```$"
 )
 _DEDUP_STUB_LINE = (
-    "[unchanged since earlier this session — ~{tokens} tokens delivered "
-    "previously. Pass refresh=true to re-fetch.]"
+    "[unchanged since earlier this conversation — delivered previously. "
+    "Pass refresh=true on symbol, outline, or gather_code_context to re-fetch.]"
 )
 
 
@@ -865,11 +972,15 @@ def _ledger_path(repo: str) -> Path:
     return Path(repo) / ".cckit" / "delivery_ledger.json"
 
 
-def load_delivery_ledger(repo: str | None) -> int:
-    """Merge persisted fingerprints for `repo` into memory; returns count loaded.
+def ensure_delivery_ledger(repo: str | None) -> None:
+    if not repo or repo in _ledger_loaded_repos:
+        return
+    _ledger_loaded_repos.add(repo)
+    load_delivery_ledger(repo)
 
-    Survives shim self-reload (execv) and client reconnects.
-    """
+
+def load_delivery_ledger(repo: str | None) -> int:
+    """Merge persisted fingerprints for this conversation context."""
     if not repo:
         return 0
     try:
@@ -880,6 +991,11 @@ def load_delivery_ledger(repo: str | None) -> int:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return 0
+    if isinstance(data, dict) and data.get("contextId") not in {
+        None,
+        delivery_context_id(),
+    }:
+        return 0
     entries = data.get("entries") if isinstance(data, dict) else None
     loaded = 0
     for row in entries or []:
@@ -887,6 +1003,8 @@ def load_delivery_ledger(repo: str | None) -> int:
             continue
         scope, name, fingerprint = row
         if not all(isinstance(part, str) for part in row):
+            continue
+        if scope != delivery_context_id():
             continue
         key = (scope, name)
         if key not in _delivery_ledger:
@@ -896,14 +1014,14 @@ def load_delivery_ledger(repo: str | None) -> int:
 
 
 def save_delivery_ledger(repo: str | None) -> None:
-    """Write this repo's fingerprints to .cckit/delivery_ledger.json."""
+    """Write this conversation's fingerprints to .cckit/delivery_ledger.json."""
     if not repo:
         return
-    prefix = str(repo)
+    ctx = delivery_context_id()
     rows = [
         [scope, name, fingerprint]
         for (scope, name), fingerprint in _delivery_ledger.items()
-        if scope == prefix or scope.startswith(f"outline:{prefix}") or scope.startswith(f"gather:{prefix}")
+        if scope == ctx
     ]
     if not rows:
         return
@@ -911,7 +1029,11 @@ def save_delivery_ledger(repo: str | None) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"version": 1, "entries": rows[-_DELIVERY_LEDGER_CAP:]}),
+            json.dumps({
+                "version": 2,
+                "contextId": ctx,
+                "entries": rows[-_DELIVERY_LEDGER_CAP:],
+            }),
             encoding="utf-8",
         )
     except OSError:
@@ -949,56 +1071,55 @@ def apply_packet_dedup(
     *,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    """Stub unchanged primary-symbol bodies inside a gather packet.
-
-    Primary sections are '### NAME (SYMBOL · loc)' followed by a fenced body;
-    only bodies >= _GATHER_BODY_MIN_CHARS participate (smaller ones cost more
-    to stub than they save).
-    """
+    """Stub unchanged bodies (symbol slices and full files) in a gather packet."""
     global _dedup_saved_total
+    ensure_delivery_ledger(repo)
     text = payload.get("text")
-    if not isinstance(text, str) or "SYMBOL ·" not in text:
+    if not isinstance(text, str):
+        return payload
+    if "SYMBOL ·" not in text and "FULL ·" not in text and "LOCATOR ·" not in text:
         return payload
 
     disabled = dedup_disabled()
+    original_tokens = estimate_tokens(text)
     nonlocal_saved = [0]
 
     def replace(match: re.Match[str]) -> str:
-        name = match.group("name").strip()
         location = match.group("location").strip()
         body = match.group("body")
+        kind = match.group("kind")
         fence = match.group("fence")
-        if len(body) < _GATHER_BODY_MIN_CHARS:
-            return match.group(0)
-        key = (f"gather:{repo}", f"{name}@{location}")
+        identity = _identity_from_location(location, body)
+        key = _ledger_key(identity)
         fingerprint = _body_fingerprint(body)
         prior = _delivery_ledger.get(key)
-        estimated = max(1, len(body) // 4)
+        stub = _DEDUP_STUB_LINE
         if (
             not refresh
             and not disabled
             and prior is not None
             and prior == fingerprint
+            and estimate_tokens(stub) < estimate_tokens(match.group(0))
         ):
-            stub = _DEDUP_STUB_LINE.format(tokens=estimated)
-            stubbed_tokens = max(1, len(stub) // 4)
             _record_fingerprint(key, fingerprint)
-            nonlocal_saved[0] += max(0, estimated - stubbed_tokens)
+            nonlocal_saved[0] += max(0, estimate_tokens(body) - estimate_tokens(stub))
             return (
-                f"### {match.group('name')} (SYMBOL · {location})\n"
+                f"### {match.group('name')} ({kind} · {location})\n"
                 f"```{fence}\n{stub}\n```"
             )
         _record_fingerprint(key, fingerprint)
         return match.group(0)
 
     new_text = _GATHER_SECTION_RE.sub(replace, text)
-    saved = nonlocal_saved[0]
-    if saved > 0:
-        _dedup_saved_total += saved
+    net = original_tokens - estimate_tokens(new_text)
+    if net > 0 and nonlocal_saved[0] > 0:
+        _dedup_saved_total += net
         payload["text"] = new_text
         payload["deduplicated"] = True
-        payload["dedupSavedTokens"] = saved
-        record_dedup_saving(repo, "gather", saved)
+        payload["dedupSavedTokens"] = net
+        record_dedup_saving(repo, "gather", net)
+        save_delivery_ledger(repo)
+    else:
         save_delivery_ledger(repo)
     return payload
 
@@ -1010,26 +1131,32 @@ def apply_outline_dedup(
     *,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    """Stub an identical outline re-delivered this session."""
+    """Stub an identical outline re-delivered this conversation.
+
+    Outlines are metadata, not bodies — they share the conversation ledger
+    but use an outline-specific identity so a body does not suppress an outline.
+    """
     global _dedup_saved_total
+    ensure_delivery_ledger(repo)
     text = payload.get("text")
-    if not isinstance(text, str) or len(text) < _GATHER_BODY_MIN_CHARS:
+    if not isinstance(text, str):
         return payload
-    key = (f"outline:{repo}", file_path)
+    identity = f"outline:{file_path}:{_body_fingerprint(text)}"
+    key = _ledger_key(identity)
     fingerprint = _body_fingerprint(text)
     prior = _delivery_ledger.get(key)
-    estimated = max(1, len(text) // 4)
+    stub = _DEDUP_STUB_LINE
     if (
         not refresh
         and not dedup_disabled()
         and prior is not None
         and prior == fingerprint
+        and estimate_tokens(stub) < estimate_tokens(text)
     ):
-        stub = _DEDUP_STUB_LINE.format(tokens=estimated)
-        saved = max(0, estimated - max(1, len(stub) // 4))
+        saved = estimate_tokens(text) - estimate_tokens(stub)
         _record_fingerprint(key, fingerprint)
         payload["text"] = stub
-        payload["originalOutlineTokens"] = estimated
+        payload["originalOutlineTokens"] = estimate_tokens(text)
         _dedup_saved_total += saved
         payload["deduplicated"] = True
         payload["dedupSavedTokens"] = saved
@@ -1039,6 +1166,7 @@ def apply_outline_dedup(
     _record_fingerprint(key, fingerprint)
     save_delivery_ledger(repo)
     return payload
+
 
 server = FastMCP("cckit", instructions=SERVER_INSTRUCTIONS)
 
@@ -1053,7 +1181,6 @@ RepoPath = Annotated[
 
 
 _TEXT_SEARCH_LINE_CHARS = 240
-_TEXT_SEARCH_PER_FILE_CAP = 40
 _TEXT_SEARCH_TIMEOUT = 30
 _TEXT_SEARCH_SKIP_DIRS = frozenset({
     ".git", ".cckit", ".build", ".gradle", ".idea", ".venv", "venv",
@@ -1143,8 +1270,6 @@ def _rg_args(
         "--max-columns",
         str(_TEXT_SEARCH_LINE_CHARS),
         "--max-columns-preview",
-        "--max-count",
-        str(_TEXT_SEARCH_PER_FILE_CAP),
     ]
     if not regex:
         args.append("-F")
@@ -1160,24 +1285,26 @@ def _stream_rg(
     args: list[str],
     cwd: str,
     stop_after: int,
-) -> list[tuple[str, int, str]]:
-    """Stream rg stdout, stopping at stop_after matches (bounds memory/tokens)."""
+) -> tuple[list[tuple[str, int, str]], str | None, bool]:
+    """Stream rg stdout. Returns (matches, error, hit_cap)."""
     import time
 
     matches: list[tuple[str, int, str]] = []
     deadline = time.monotonic() + _TEXT_SEARCH_TIMEOUT
+    hit_cap = False
     try:
         proc = subprocess.Popen(
             args,
             cwd=cwd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             errors="replace",
         )
-    except OSError:
-        return matches
+    except OSError as error:
+        return [], str(error), False
     assert proc.stdout is not None
+    stderr_text = ""
     try:
         for line in proc.stdout:
             parsed = _parse_rg_line(line.rstrip("\n"))
@@ -1185,15 +1312,21 @@ def _stream_rg(
                 continue
             matches.append(parsed)
             if len(matches) >= stop_after or time.monotonic() > deadline:
+                hit_cap = True
                 break
     finally:
         try:
             if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=5)
+            if proc.stderr is not None:
+                stderr_text = proc.stderr.read()
         except subprocess.TimeoutExpired:
             pass
-    return matches
+    if proc.returncode not in (0, 1, None, -9) and not matches:
+        err = stderr_text.strip() or f"rg exited {proc.returncode}"
+        return [], err, False
+    return matches, None, hit_cap
 
 
 def _load_gitignore_patterns(root: Path) -> list[str]:
@@ -1233,6 +1366,7 @@ def _python_text_search(
     root: Path,
     pattern: re.Pattern[str],
     stop_after: int,
+    include: str | None = None,
 ) -> list[tuple[str, int, str]]:
     """Fallback scanner over indexable text suffixes honoring .gitignore."""
     ignore_patterns = _load_gitignore_patterns(root)
@@ -1250,6 +1384,8 @@ def _python_text_search(
             try:
                 rel = str(path.relative_to(root))
             except ValueError:
+                continue
+            if include and not fnmatch.fnmatch(rel, include) and not fnmatch.fnmatch(filename, include):
                 continue
             if ignore_patterns and _is_gitignored(rel, ignore_patterns):
                 continue
@@ -1321,22 +1457,25 @@ def search_text_tool(
             include=include,
             root=str(cwd),
         )
-        matches = _stream_rg(args, str(cwd), stop_after)
+        matches, error, hit_cap = _stream_rg(args, str(cwd), stop_after)
+        if error:
+            return {"error": "search_failed", "message": error}
         total_matches = len(matches)
-        truncated = len(matches) >= stop_after
+        total_is_lower_bound = hit_cap
     else:
         try:
             compiled = re.compile(
-                pattern_text,
+                pattern_text if regex else re.escape(pattern_text),
                 0 if case_sensitive else re.IGNORECASE,
             )
         except re.error as error:
             return {"error": "bad_regex", "message": str(error)}
-        matches = _python_text_search(cwd, compiled, stop_after)
+        matches = _python_text_search(cwd, compiled, stop_after, include=include)
         total_matches = len(matches)
-        truncated = len(matches) >= stop_after
+        total_is_lower_bound = len(matches) >= stop_after
 
     shown = matches[:limit]
+    truncated = total_is_lower_bound or len(shown) < total_matches
     payload: dict[str, Any] = {
         "text": _group_text_matches(
             pattern_text,
@@ -1347,6 +1486,7 @@ def search_text_tool(
         "totalMatches": total_matches,
         "shownMatches": len(shown),
         "truncated": truncated,
+        "totalIsLowerBound": total_is_lower_bound,
         "hint": (
             "Raise limit for more, or outline(path)/symbol(name) for bodies."
             if truncated
@@ -1653,40 +1793,51 @@ def wax_needs_compact(repo: Path) -> bool:
     return grown >= _WAX_COMPACT_GROWTH_BYTES or live >= int(last * _WAX_COMPACT_GROWTH_RATIO)
 
 
-def working_tree_needs_index(repo: Path) -> bool:
-    """True when an indexable dirty path is missing from the DB or hash-mismatched."""
-    paths = indexable_dirty_paths(repo)
-    if not paths:
-        return False
+def _file_record_hashes(repo: Path) -> dict[str, str] | None:
     db_path = repo / ".cckit" / "index.sqlite"
     if not db_path.is_file():
-        return False
+        return None
     try:
         conn = sqlite3.connect(str(db_path), timeout=2)
         try:
-            placeholders = ",".join("?" * len(paths))
-            rows = dict(
-                conn.execute(
-                    f"SELECT path, sha256 FROM fileRecord WHERE path IN ({placeholders})",
-                    paths,
-                ).fetchall()
-            )
+            rows = conn.execute("SELECT path, sha256 FROM fileRecord").fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
-        return False
-    for rel in paths:
+        return None
+    return {str(path): str(digest) for path, digest in rows}
+
+
+def indexed_content_mismatches(repo: Path) -> list[str]:
+    """Indexed sha256 vs current bytes, including a revert to a clean HEAD."""
+    rows = _file_record_hashes(repo)
+    if not rows:
+        return []
+    mismatched: list[str] = []
+    for rel, digest in rows.items():
         full = repo / rel
         if not full.is_file():
-            if rel in rows:
-                return True
+            mismatched.append(rel)
             continue
+        try:
+            current = hashlib.sha256(full.read_bytes()).hexdigest()
+        except OSError:
+            mismatched.append(rel)
+            continue
+        if current != digest:
+            mismatched.append(rel)
+    return mismatched
+
+
+def working_tree_needs_index(repo: Path) -> bool:
+    """True when dirty indexable paths or any indexed file hash is stale."""
+    rows = _file_record_hashes(repo)
+    if rows is None:
+        return False
+    for rel in indexable_dirty_paths(repo):
         if rel not in rows:
             return True
-        digest = hashlib.sha256(full.read_bytes()).hexdigest()
-        if digest != rows[rel]:
-            return True
-    return False
+    return bool(indexed_content_mismatches(repo))
 
 
 def index_freshness(repo: Path) -> dict[str, Any]:
@@ -1711,7 +1862,12 @@ def index_freshness(repo: Path) -> dict[str, Any]:
     else:
         stale = False
 
-    out: dict[str, Any] = {"stale": stale}
+    mismatches = indexed_content_mismatches(repo)
+    content_stale = bool(mismatches)
+    out: dict[str, Any] = {
+        "stale": stale or content_stale,
+        "contentStale": content_stale,
+    }
     if indexed_commit:
         out["indexedCommit"] = indexed_commit
     if indexed_branch:
@@ -1720,6 +1876,8 @@ def index_freshness(repo: Path) -> dict[str, Any]:
         out["headCommit"] = head_commit
     if head_branch:
         out["headBranch"] = head_branch
+    if mismatches[:8]:
+        out["mismatchedPaths"] = mismatches[:8]
     return out
 
 
@@ -1731,11 +1889,19 @@ def _short_commit(value: str | None) -> str | None:
 
 def with_freshness(payload: dict[str, Any], repo: Path) -> dict[str, Any]:
     freshness = index_freshness(repo)
-    # Only attach freshness when stale or the payload is already an error.
-    if not freshness.get("stale") and "error" not in payload:
+    # Attach when HEAD drifted or indexed file bytes differ from disk.
+    if (
+        not freshness.get("stale")
+        and not freshness.get("contentStale")
+        and "error" not in payload
+    ):
         return payload
 
-    compact: dict[str, Any] = {"stale": bool(freshness.get("stale"))}
+    compact: dict[str, Any] = {
+        "stale": bool(freshness.get("stale") or freshness.get("contentStale")),
+    }
+    if freshness.get("contentStale"):
+        compact["contentStale"] = True
     if ic := _short_commit(freshness.get("indexedCommit")):
         compact["indexedCommit"] = ic
     if hc := _short_commit(freshness.get("headCommit")):
@@ -2093,6 +2259,14 @@ def gather_code_context(
             ),
         ),
     ] = "auto",
+    refresh: Annotated[
+        bool,
+        Field(
+            description=(
+                "Re-fetch bodies even when unchanged since earlier this conversation."
+            ),
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     # MCP name is gather_code_context; CLI remains `cckit pack`.
     resolved = mode.strip().lower()
@@ -2134,8 +2308,29 @@ def gather_code_context(
     text, stats = split_trailing_stats(out.get("text", ""), _PACK_STATS_LINE)
     if stats is not None:
         out["text"] = text
+        out["packStats"] = stats
+        if stats.get("droppedPrimaries"):
+            out["droppedPrimaries"] = stats["droppedPrimaries"]
+        if stats.get("requiredTargetIDs"):
+            out["requiredTargetIDs"] = stats["requiredTargetIDs"]
+        if stats.get("deliveredTargetIDs"):
+            out["deliveredTargetIDs"] = stats["deliveredTargetIDs"]
+        if stats.get("omitted"):
+            out["omitted"] = stats["omitted"]
+        if stats.get("primaryCount") is not None:
+            out["primaryCount"] = stats["primaryCount"]
+        if stats.get("contentStale"):
+            out["contentStale"] = True
+        if stats.get("droppedPrimaries") or stats.get("omitted"):
+            if "## Omitted" not in out.get("text", ""):
+                reasons = stats.get("omitted") or []
+                note = (
+                    f"Omitted {stats.get('droppedPrimaries', len(reasons))} "
+                    "requested primary(s); see omitted in the structured result."
+                )
+                out["text"] = out.get("text", "").rstrip() + "\n\n## Omitted\n" + note + "\n"
     try:
-        out = apply_packet_dedup(out, str(resolve_repo(repo)))
+        out = apply_packet_dedup(out, str(resolve_repo(repo)), refresh=refresh)
     except ValueError:
         pass
     out = attach_semantic_guess_hint(out, repo, task)
