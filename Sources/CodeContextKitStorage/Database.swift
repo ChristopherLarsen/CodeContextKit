@@ -13,6 +13,19 @@ import CodeContextKitCore
 /// 
 /// Verified by: `StorageTests`
 public final class Database: @unchecked Sendable {
+    /// SQLite-side proof that a file's semantic documents were committed to
+    /// the paired Wax arena. Keep this batch explicit so all coverage for one
+    /// arena generation lands in one SQLite transaction.
+    public struct WaxCoverage: Sendable {
+        public let fileId: Int64
+        public let mandates: [String]
+
+        public init(fileId: Int64, mandates: [String]) {
+            self.fileId = fileId
+            self.mandates = mandates
+        }
+    }
+
     private let writer: DatabaseWriter
     
     public init(path: String) throws {
@@ -290,6 +303,28 @@ public final class Database: @unchecked Sendable {
         try writer.write { db in
             var record = WaxFrameRecord(id: nil, fileId: fileId, frameId: nil, mandate: "")
             try record.save(db)
+        }
+    }
+
+    /// Persist an entire post-flush coverage batch atomically. Wax and
+    /// SQLite are independent stores, so this is deliberately called only
+    /// after Wax has flushed; a failed SQLite batch cannot leave a claim of
+    /// uncommitted Wax documents behind.
+    public func saveWaxCoverage(_ coverage: [WaxCoverage]) throws {
+        try writer.write { db in
+            for item in coverage {
+                for mandate in item.mandates where !mandate.isEmpty {
+                    var record = WaxFrameRecord(
+                        id: nil,
+                        fileId: item.fileId,
+                        frameId: nil,
+                        mandate: mandate
+                    )
+                    try record.save(db)
+                }
+                var marker = WaxFrameRecord(id: nil, fileId: item.fileId, frameId: nil, mandate: "")
+                try marker.save(db)
+            }
         }
     }
 

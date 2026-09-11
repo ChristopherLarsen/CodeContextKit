@@ -3,6 +3,29 @@ import Foundation
 @testable import CodeContextKitContext
 
 final class IndexSwapTests: XCTestCase {
+
+    func testCopyLiveIndexIntoStagingCopiesDatabaseSidecarsAndWax() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let staging = root.appendingPathComponent("staging")
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let db = root.appendingPathComponent("index.sqlite")
+        let wax = root.appendingPathComponent("repo.wax")
+        try Data("db".utf8).write(to: db)
+        try Data("wal".utf8).write(to: URL(fileURLWithPath: db.path + "-wal"))
+        try Data("wax".utf8).write(to: wax)
+
+        try IndexSwap.copyLiveIndexIntoStaging(
+            stagingDir: staging.path,
+            dbPath: db.path,
+            waxPath: wax.path,
+            includeWax: true
+        )
+
+        XCTAssertEqual(try Data(contentsOf: staging.appendingPathComponent("index.sqlite")), Data("db".utf8))
+        XCTAssertEqual(try Data(contentsOf: staging.appendingPathComponent("index.sqlite-wal")), Data("wal".utf8))
+        XCTAssertEqual(try Data(contentsOf: staging.appendingPathComponent("repo.wax")), Data("wax".utf8))
+    }
     var dir: URL!
 
     override func setUpWithError() throws {

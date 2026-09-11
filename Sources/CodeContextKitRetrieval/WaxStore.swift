@@ -294,11 +294,13 @@ public actor WaxStore {
         public let allocatedBytes: Int
         public let expectedLiveBytes: Int
         public let reclaimableBytes: Int
+        public let reason: String?
 
-        public init(allocatedBytes: Int, expectedLiveBytes: Int, reclaimableBytes: Int) {
+        public init(allocatedBytes: Int, expectedLiveBytes: Int, reclaimableBytes: Int, reason: String? = nil) {
             self.allocatedBytes = allocatedBytes
             self.expectedLiveBytes = expectedLiveBytes
             self.reclaimableBytes = reclaimableBytes
+            self.reason = reason
         }
     }
 
@@ -311,7 +313,9 @@ public actor WaxStore {
         "repo.wax breached its live-set ceiling " +
             "(allocated \(marker.allocatedBytes)B vs ~\(marker.expectedLiveBytes)B live" +
             (marker.reclaimableBytes > 0 ? ", \(marker.reclaimableBytes)B reclaimable" : "") +
-            "); run 'cckit index . --clean' to rebuild from scratch."
+            ")" +
+            (marker.reason.map { "; cause: \($0)" } ?? "") +
+            "; run 'cckit index . --clean' to rebuild from scratch."
     }
 
     /// The CLI's bloat veto writes `wax-breach-marker.json` next to repo.wax
@@ -335,7 +339,8 @@ public actor WaxStore {
         return WaxBreachMarker(
             allocatedBytes: allocated,
             expectedLiveBytes: expected,
-            reclaimableBytes: intValue("reclaimableBytes")
+            reclaimableBytes: intValue("reclaimableBytes"),
+            reason: json["reason"] as? String
         )
     }
 

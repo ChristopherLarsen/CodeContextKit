@@ -200,6 +200,22 @@ final class PackSavingsLedgerTests: XCTestCase {
         XCTAssertEqual(row.durationMs, 4210)
     }
 
+    func testRepeatedIdenticalIndexFailuresEscalateOnThirdAttempt() {
+        let failure = "Error: Failed to open MiniLM semantic store: Invalid footer"
+        let records = [
+            ActionRecord(prompt: "cckit index .", toolName: "index", status: "failed", response: failure),
+            ActionRecord(prompt: "cckit index .", toolName: "index", status: "failed", response: failure),
+            ActionRecord(prompt: "cckit index .", toolName: "index", status: "failed", response: failure),
+        ]
+        XCTAssertEqual(IndexFailureEscalation.repeatedReason(in: records), failure)
+        XCTAssertNil(IndexFailureEscalation.repeatedReason(in: Array(records.dropLast())))
+        XCTAssertNil(IndexFailureEscalation.repeatedReason(in: [
+            records[0],
+            ActionRecord(prompt: "cckit index .", toolName: "index", status: "completed"),
+            records[2],
+        ]))
+    }
+
     func testTokensAvoidedVersusSourceFileIsSigned() {
         let win = ActionRecord(
             prompt: "cckit outline F",

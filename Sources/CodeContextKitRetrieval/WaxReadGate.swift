@@ -12,6 +12,15 @@ import CodeContextKitStorage
 /// BEFORE results are trusted.
 public enum WaxReadGate {
 
+    /// An arena cannot be evaluated after Wax rejects it at open time. Keep
+    /// the classification here, beside the other read-integrity faults, so
+    /// command paths can arm the same breach-marker recovery contract.
+    public static func isArenaIntegrityFailure(_ detail: String) -> Bool {
+        let normalized = detail.lowercased()
+        return normalized.contains("invalid footer")
+            || normalized.contains("no valid footer")
+    }
+
     public enum Fault: Error, LocalizedError, Equatable, Sendable {
         /// The arena is materially smaller than the last known-complete arena
         /// for this repo. An interrupted rebuild (SIGTERM mid-write) leaves a

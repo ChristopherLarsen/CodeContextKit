@@ -21,6 +21,32 @@ public enum IndexSwap {
         }
     }
 
+    /// Seed a staged delta build with an untouched snapshot of the live
+    /// derived index. Every semantic mutation now happens on these copies;
+    /// the live SQLite/Wax pair is promoted only after both stores close.
+    /// APFS performs this efficiently as a clone where supported.
+    public static func copyLiveIndexIntoStaging(
+        stagingDir: String,
+        dbPath: String,
+        waxPath: String,
+        includeWax: Bool
+    ) throws {
+        let fm = FileManager.default
+        for suffix in ["", "-wal", "-shm"] {
+            let source = dbPath + suffix
+            guard fm.fileExists(atPath: source) else { continue }
+            let destination = (stagingDir as NSString).appendingPathComponent(
+                (source as NSString).lastPathComponent
+            )
+            try fm.copyItem(atPath: source, toPath: destination)
+        }
+        guard includeWax, fm.fileExists(atPath: waxPath) else { return }
+        let destination = (stagingDir as NSString).appendingPathComponent(
+            (waxPath as NSString).lastPathComponent
+        )
+        try fm.copyItem(atPath: waxPath, toPath: destination)
+    }
+
     /// Atomically exchange `stagingPath` with `livePath` via RENAME_SWAP.
     /// Returns true when the exchange primitive was used; false when a
     /// fallback move dance ran (filesystem without RENAME_SWAP, or no live

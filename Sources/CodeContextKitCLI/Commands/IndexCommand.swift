@@ -93,19 +93,48 @@ struct IndexCommand: AsyncParsableCommand {
         allocatedBytes: UInt64,
         expectedLiveBytes: UInt64,
         reclaimableBytes: UInt64,
-        factor: Double
+        factor: Double,
+        reason: String? = nil
     ) {
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "allocatedBytes": allocatedBytes,
             "expectedLiveBytes": expectedLiveBytes,
             "reclaimableBytes": reclaimableBytes,
             "factor": factor,
             "detectedAt": ISO8601DateFormatter().string(from: Date()),
         ]
+        if let reason, !reason.isEmpty {
+            payload["reason"] = reason
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) else {
             return
         }
         try? data.write(to: URL(fileURLWithPath: breachMarkerPath(cckitDir)), options: .atomic)
+    }
+
+    /// Leave a durable recovery instruction whenever Wax itself says its
+    /// footer is invalid. WaxReadGate owns the classification so the read and
+    /// write paths cannot disagree about which corruption modes are breaches.
+    static func armIntegrityBreach(
+        cckitDir: String,
+        waxPath: String,
+        detail: String,
+        expectedLiveBytes: Int
+    ) {
+        guard WaxReadGate.isArenaIntegrityFailure(detail) else { return }
+        let allocated = max(1, Self.waxFileAllocatedBytes(at: waxPath))
+        let expected = max(1, expectedLiveBytes)
+        Self.writeBreachMarker(
+            cckitDir: cckitDir,
+            allocatedBytes: UInt64(allocated),
+            expectedLiveBytes: UInt64(expected),
+            reclaimableBytes: UInt64(max(0, allocated - expected)),
+            factor: 1.0,
+            reason: "Wax integrity failure: \(detail)"
+        )
+        print(
+            "Breach marker armed for an invalid Wax footer: the next 'cckit index' will perform a staged clean rebuild."
+        )
     }
 
     /// Sweep Wax live-set rewrite residue (ask G, extended to every run).
@@ -337,11 +366,13 @@ struct IndexCommand: AsyncParsableCommand {
         // from action_history.jsonl — including "11 failures, 1 success".
         let ledger = ActionOrchestrator(repoRoot: ".")
         do {
+            let repeatedFailure = try? await ledger.getRecentActions(limit: 1_000)
             try await runIndex(
                 cckitDir: cckitDir,
                 fullCommand: fullCommand,
                 startTime: startTime,
-                ledger: ledger
+                ledger: ledger,
+                forceRecovery: repeatedFailure.flatMap { IndexFailureEscalation.repeatedReason(in: $0) }
             )
         } catch {
             let duration = Int(Date().timeIntervalSince(startTime) * 1000)
@@ -371,7 +402,8 @@ struct IndexCommand: AsyncParsableCommand {
         cckitDir: String,
         fullCommand: String,
         startTime: Date,
-        ledger: ActionOrchestrator
+        ledger: ActionOrchestrator,
+        forceRecovery: String?
     ) async throws {
         let dbPath = "\(cckitDir)/index.sqlite"
         let waxPath = "\(cckitDir)/repo.wax"
@@ -397,7 +429,8 @@ struct IndexCommand: AsyncParsableCommand {
 
         let storedEmbedderId = lexicalOnly ? nil : WaxEmbedderIdentity.storedId(cckitDir: cckitDir)
         let embedderMismatch = !lexicalOnly && storedEmbedderId != WaxEmbedderIdentity.current
-        let compactRequested = compact && !clean
+        let effectiveClean = clean || forceRecovery != nil
+        let compactRequested = compact && !effectiveClean
 
         if compactRequested {
             guard fm.fileExists(atPath: dbPath), fm.fileExists(atPath: waxPath) else {
@@ -416,14 +449,20 @@ struct IndexCommand: AsyncParsableCommand {
         // Breach markers and embedder mismatches are semantic concerns; a
         // lexical-only run must not nuke SQLite over them.
         let mustRebuild = lexicalOnly
-            ? clean
-            : clean
+            ? effectiveClean
+            : effectiveClean
                 || compactRequested
                 || Self.hasBreachMarker(cckitDir: cckitDir)
                 || (embedderMismatch && hasExistingIndex)
 
+        if let forceRecovery {
+            print(
+                "Warning: the last \(IndexFailureEscalation.threshold) index runs failed for the same reason; forcing a staged clean rebuild now. Previous reason: \(forceRecovery)"
+            )
+        }
+
         if mustRebuild && !lexicalOnly {
-            if embedderMismatch && !clean {
+            if embedderMismatch && !effectiveClean {
                 print("Semantic embedder changed (\(storedEmbedderId ?? "none") → \(WaxEmbedderIdentity.current)); rebuilding index for vector search...")
             }
             if compactRequested {
@@ -438,13 +477,27 @@ struct IndexCommand: AsyncParsableCommand {
         // breach-driven rebuilds used to mutate index.sqlite in place for the
         // full ~18-minute build; --clean deleted both stores up front, taking
         // every tool down. Now nothing live is touched until the atomic swap.
+        // Delta updates used to modify the live arena directly. A late SQLite
+        // failure could then skip Wax.close() and strand that live file
+        // without a footer. Stage every semantic run from a copy of the
+        // current pair: a failed delta is discarded, while a successful delta
+        // is promoted by the same snapshot-swap path as --clean.
+        let stagedBuild = !lexicalOnly || mustRebuild
         let stagingDir = "\(cckitDir)/staging"
-        if mustRebuild {
+        if stagedBuild {
             try? fm.removeItem(atPath: stagingDir)
             try fm.createDirectory(atPath: stagingDir, withIntermediateDirectories: true)
+            if !mustRebuild {
+                try IndexSwap.copyLiveIndexIntoStaging(
+                    stagingDir: stagingDir,
+                    dbPath: dbPath,
+                    waxPath: waxPath,
+                    includeWax: !lexicalOnly
+                )
+            }
         }
-        let buildDbPath = mustRebuild ? "\(stagingDir)/index.sqlite" : dbPath
-        let buildWaxPath = mustRebuild ? "\(stagingDir)/repo.wax" : waxPath
+        let buildDbPath = stagedBuild ? "\(stagingDir)/index.sqlite" : dbPath
+        let buildWaxPath = stagedBuild ? "\(stagingDir)/repo.wax" : waxPath
 
         let db = try Database(path: buildDbPath)
         let bytesBeforeIndexing = Self.waxFileAllocatedBytes(at: waxPath)
@@ -456,7 +509,7 @@ struct IndexCommand: AsyncParsableCommand {
         defer { stagingWaxLease?.release() }
         if !lexicalOnly {
             do {
-                if mustRebuild {
+                if stagedBuild {
                     // Staged build: the staging arena needs its own lease; the
                     // live lease stays held so concurrent writers stay out.
                     stagingWaxLease = try WaxStore.acquireLease(for: buildWaxPath)
@@ -480,6 +533,13 @@ struct IndexCommand: AsyncParsableCommand {
                     message += " Cause: \(openError)"
                 }
                 print(message)
+                Self.armIntegrityBreach(
+                    cckitDir: cckitDir,
+                    waxPath: waxPath,
+                    detail: message,
+                    expectedLiveBytes: WaxCompactStamp.readWatermark(cckitDir: cckitDir)?.waxBytes ?? bytesBeforeIndexing
+                )
+                try? await wax.close()
                 throw IndexFailure(reason: message)
             }
         }
@@ -517,23 +577,34 @@ struct IndexCommand: AsyncParsableCommand {
                     emitProgress: InteractiveProgress.shouldEmitTTYProgress(stdoutIsTTY: stdoutIsTTY)
                 )
             )
-        } catch let error as IndexerError {
-            // The cap tripped mid-run: arm the breach marker so the next run
-            // refuses and points at --clean, using the same numbers the cap
-            // just measured.
-            if case .arenaGrowthCapExceeded(let allocated, _) = error, !lexicalOnly {
+        } catch {
+            // Keep the existing mid-run growth cap contract: although this
+            // oversized write is confined to staging, arming the marker makes
+            // the next attempt choose a clean rebuild rather than retrying
+            // the same delta policy forever.
+            if case let IndexerError.arenaGrowthCapExceeded(allocated, _) = error, !lexicalOnly {
                 let expected = max(1, bytesBeforeIndexing)
                 Self.writeBreachMarker(
                     cckitDir: cckitDir,
                     allocatedBytes: UInt64(max(0, allocated)),
                     expectedLiveBytes: UInt64(expected),
                     reclaimableBytes: UInt64(max(0, allocated - expected)),
-                    factor: 8.0
+                    factor: 8.0,
+                    reason: "staged delta exceeded the Wax growth cap"
                 )
                 print(
                     "Breach marker armed: the next 'cckit index' rebuilds the arena from scratch (staged swap); reads carry the breach warning until it completes."
                 )
             }
+            // Flush alone does not guarantee Wax has written its terminal
+            // footer. Always close the staging handle before propagating an
+            // indexing error; because this run is staged, the live pair is
+            // still untouched even if close itself cannot finish.
+            if let wax {
+                try? await wax.close()
+            }
+            stagingWaxLease?.release()
+            stagingWaxLease = nil
             throw error
         }
 
@@ -546,7 +617,22 @@ struct IndexCommand: AsyncParsableCommand {
         stagingWaxLease = nil
         try db.close()
 
-        if mustRebuild {
+        if stagedBuild {
+            // A process death between the two file swaps must not expose a
+            // mixed SQLite/Wax generation as healthy. The marker survives
+            // that narrow window and makes the next index rebuild from a
+            // fresh staged snapshot; a successful promotion clears it.
+            if !lexicalOnly {
+                let stagedBytes = max(1, Self.waxFileAllocatedBytes(at: buildWaxPath))
+                Self.writeBreachMarker(
+                    cckitDir: cckitDir,
+                    allocatedBytes: UInt64(stagedBytes),
+                    expectedLiveBytes: UInt64(stagedBytes),
+                    reclaimableBytes: 0,
+                    factor: 1.0,
+                    reason: "staged semantic index promotion in progress"
+                )
+            }
             try IndexSwap.swapBuildIntoPlace(
                 cckitDir: cckitDir,
                 stagingDir: stagingDir,
@@ -554,8 +640,9 @@ struct IndexCommand: AsyncParsableCommand {
                 waxPath: waxPath,
                 includeWax: !lexicalOnly
             )
-            // The live store was breaching until this moment; only a
-            // completed swap retires the marker.
+            // The live store may have been breaching (or a promotion may have
+            // been interrupted) until this moment; only a completed swap
+            // retires the marker.
             if !lexicalOnly {
                 Self.clearBreachMarker(cckitDir: cckitDir)
             }

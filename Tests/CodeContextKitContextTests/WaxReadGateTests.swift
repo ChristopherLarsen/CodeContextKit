@@ -74,6 +74,13 @@ final class WaxReadGateTests: XCTestCase {
         ))
     }
 
+    func testInvalidFooterTextIsAnIntegrityBreach() {
+        XCTAssertTrue(WaxReadGate.isArenaIntegrityFailure(
+            "Wax store failed to open: Invalid footer: no valid footer found within max_footer_scan_bytes"
+        ))
+        XCTAssertFalse(WaxReadGate.isArenaIntegrityFailure("MiniLM model bundle unavailable"))
+    }
+
     // MARK: - Rebuild coverage (request 4)
 
     func testRebuildIncompleteFiresOnUncoveredExistingPaths() {
@@ -118,6 +125,15 @@ final class WaxReadGateTests: XCTestCase {
         XCTAssertEqual(try db.waxMandateCount(), 1)
     }
 
+    func testCoverageBatchRollsBackWhenAnyParentFileIsMissing() throws {
+        let file = try db.saveFile(path: "A.swift", language: "swift", sha256: "a", sizeBytes: 10, modifiedAt: nil)
+        XCTAssertThrowsError(try db.saveWaxCoverage([
+            .init(fileId: file, mandates: ["present"]),
+            .init(fileId: -1, mandates: ["missing"]),
+        ]))
+        XCTAssertEqual(try db.waxFrameCount(), 0, "A failed coverage batch must not partially claim Wax documents")
+    }
+
     // MARK: - Full evaluation (requests 1, 2, 4)
 
     func testEvaluateWarnsWithArmedMarker() async throws {
@@ -137,6 +153,16 @@ final class WaxReadGateTests: XCTestCase {
         XCTAssertTrue(warning.contains("107479040"), warning)
         XCTAssertTrue(warning.contains("--clean"), warning)
         XCTAssertTrue(report.isDegraded)
+    }
+
+    func testBreachWarningCarriesIntegrityCause() {
+        let warning = WaxStore.breachWarningText(for: .init(
+            allocatedBytes: 10,
+            expectedLiveBytes: 10,
+            reclaimableBytes: 0,
+            reason: "Wax integrity failure: Invalid footer"
+        ))
+        XCTAssertTrue(warning.contains("Invalid footer"))
     }
 
     func testEvaluateDetectsTruncatedArenaViaStamp() async throws {

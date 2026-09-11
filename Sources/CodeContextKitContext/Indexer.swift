@@ -159,7 +159,7 @@ public final class Indexer: Sendable {
         // Files whose arena documents were saved this run, awaiting the
         // durability pass. Mandate + coverage rows are written only AFTER
         // flush() commits — see the durability contract at the flush site.
-        var pendingCoverage: [(fileId: Int64, mandates: [String])] = []
+        var pendingCoverage: [Database.WaxCoverage] = []
         
         for (index, fileURL) in files.enumerated() {
             let relativePath = relativePath(for: fileURL, rootPath: absolutePath)
@@ -268,7 +268,7 @@ public final class Indexer: Sendable {
                             mandates.append(ingest.mandate)
                         }
                     }
-                    pendingCoverage.append((fileId, mandates))
+                    pendingCoverage.append(.init(fileId: fileId, mandates: mandates))
                 }
                 updatedCount += 1
                 totalSymbols += symbols.count
@@ -277,19 +277,6 @@ public final class Indexer: Sendable {
             }
         }
         
-        // Cleanup Phase: Remove files from DB that are no longer on disk
-        let allIndexedFiles = try db.getAllFiles()
-        for indexedFile in allIndexedFiles {
-            let fullURL = URL(fileURLWithPath: absolutePath).appendingPathComponent(indexedFile.path)
-            if !FileManager.default.fileExists(atPath: fullURL.path) || !scannedRelativePaths.contains(indexedFile.path) {
-                // The preflight comparison counted this removal; in delta mode
-                // its arena documents leak (bounded by the growth margin), in
-                // rebuild mode the arena was already replaced.
-                try db.deleteFile(path: indexedFile.path)
-                print("Removed stale file from index: \(indexedFile.path)")
-            }
-        }
-
         // Durability contract: the arena commit and the SQLite bookkeeping for
         // it must land in this order. Wax saves are uncommitted memory until
         // flush(), while SQLite rows commit immediately — writing coverage
@@ -303,11 +290,24 @@ public final class Indexer: Sendable {
         // retries them on the next run.
         if let wax {
             try await wax.flush()
-            for (fileId, mandates) in pendingCoverage {
-                for mandate in mandates {
-                    try db.saveWaxFrames(fileId: fileId, mandate: mandate, frameIDs: [])
-                }
-                try db.markWaxCoverage(fileId: fileId)
+            try db.saveWaxCoverage(pendingCoverage)
+        }
+
+        // Cleanup comes AFTER the post-flush bookkeeping. A long run can race
+        // a source deletion: doing this first deleted the parent fileRecord,
+        // then the deferred waxFrameRecord INSERT failed its FK constraint.
+        // The thrown error skipped Wax.close(), leaving an otherwise flushed
+        // arena without its final footer. If a file vanished meanwhile, this
+        // cascade now simply removes its just-written coverage as intended.
+        let allIndexedFiles = try db.getAllFiles()
+        for indexedFile in allIndexedFiles {
+            let fullURL = URL(fileURLWithPath: absolutePath).appendingPathComponent(indexedFile.path)
+            if !FileManager.default.fileExists(atPath: fullURL.path) || !scannedRelativePaths.contains(indexedFile.path) {
+                // The preflight comparison counted this removal; in delta mode
+                // its arena documents leak (bounded by the growth margin), in
+                // rebuild mode the arena was already replaced.
+                try db.deleteFile(path: indexedFile.path)
+                print("Removed stale file from index: \(indexedFile.path)")
             }
         }
         let currentWaxRecordCount = try db.waxFrameCount()
