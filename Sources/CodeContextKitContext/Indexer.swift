@@ -132,7 +132,7 @@ public final class Indexer: Sendable {
                 arenaAllocatedBytes: await wax.allocatedBytes(),
                 arenaFrameCount: await wax.frameCount(),
                 keepSetMandateCount: (try? db.waxMandateCount()) ?? 0,
-                maxFiles: WaxDeltaPolicy.maxFilesFromEnvironment(),
+                maxFiles: WaxDeltaPolicy.maxFilesFromEnvironment(indexedFileCount: existingByPath.count),
                 maxGrowth: WaxDeltaPolicy.maxGrowthFromEnvironment(),
                 allowanceBytes: WaxDeltaPolicy.allowanceBytesFromEnvironment(),
                 allowanceScale: WaxDeltaPolicy.allowanceScaleFromEnvironment()

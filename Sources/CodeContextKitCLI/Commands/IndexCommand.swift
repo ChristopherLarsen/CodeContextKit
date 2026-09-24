@@ -443,7 +443,7 @@ struct IndexCommand: AsyncParsableCommand {
             waxLease = nil
         } else {
             do {
-                waxLease = try WaxStore.acquireLease(for: waxPath)
+                waxLease = try WaxStore.acquireLease(for: waxPath, waitingUpTo: WaxStore.writerLeaseWait())
             } catch {
                 print("Error: \(error.localizedDescription)")
                 throw IndexFailure(reason: "arena lease unavailable: \(error.localizedDescription)")

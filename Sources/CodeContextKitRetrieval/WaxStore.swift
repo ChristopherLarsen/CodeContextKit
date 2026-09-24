@@ -54,16 +54,35 @@ public actor WaxStore {
     /// Acquire the stable cckit ownership lock for an arena without waiting.
     /// The sidecar inode is never replaced with the Wax arena, so it remains a
     /// valid exclusion point across delete/recreate and upstream promotion.
-    public nonisolated static func acquireLease(for path: String) throws -> RefreshLock.Lease {
+    public nonisolated static func acquireLease(
+        for path: String,
+        waitingUpTo wait: TimeInterval = 0
+    ) throws -> RefreshLock.Lease {
         let lockPath = path + ".lock"
         let parent = (lockPath as NSString).deletingLastPathComponent
         if !parent.isEmpty {
             try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
         }
-        guard let lease = RefreshLock.tryAcquire(lockPath: lockPath) else {
-            throw StoreError.inUse(lockPath: lockPath)
+        let deadline = Date().addingTimeInterval(wait)
+        while true {
+            if let lease = RefreshLock.tryAcquire(lockPath: lockPath) { return lease }
+            guard Date() < deadline else { throw StoreError.inUse(lockPath: lockPath) }
+            Thread.sleep(forTimeInterval: 0.25)
         }
-        return lease
+    }
+
+    /// How long a writer waits for the arena lease. Reads hold it for their
+    /// whole (seconds-long) lifetime, and the shim spawns a refresh right
+    /// before running the read that noticed staleness — failing instantly
+    /// lost that race every time, so refreshes never landed while an agent
+    /// was actively querying. Env-tunable: CCKIT_WAX_LEASE_WAIT_SECONDS.
+    public nonisolated static func writerLeaseWait(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> TimeInterval {
+        guard let raw = environment["CCKIT_WAX_LEASE_WAIT_SECONDS"], let value = Double(raw), value >= 0 else {
+            return 120
+        }
+        return value
     }
 
     /// If upstream promotion was interrupted after moving the source aside,

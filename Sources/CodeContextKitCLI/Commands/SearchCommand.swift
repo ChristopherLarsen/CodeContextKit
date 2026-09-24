@@ -62,7 +62,13 @@ struct SearchCommand: AsyncParsableCommand {
         let db = try Database(path: dbPath)
         // Skip opening the arena entirely in lexical-only mode: opening Wax
         // on a missing repo.wax creates an empty arena as a side effect.
-        let wax: WaxStore? = lexicalOnly ? nil : try await WaxStore(path: waxPath)
+        // A refresh holding the arena lease must not fail lexical routes,
+        // which answer from SQLite; only vector routes need the arena.
+        let wax: WaxStore? = lexicalOnly ? nil : try await PackCommand.openArenaUnlessBusy(waxPath: waxPath)
+        if !lexicalOnly && wax == nil && isVectorRoute {
+            print("Error: \(PackCommand.arenaBusyNotice)")
+            throw ExitCode.failure
+        }
 
         // Read-path integrity gate. Vector reads must never answer from a
         // truncated or unfinished arena — their `0 results` reads as a

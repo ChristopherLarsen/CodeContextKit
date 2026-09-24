@@ -110,11 +110,21 @@ public enum WaxDeltaPolicy {
         return value.isEmpty ? nil : value
     }
 
-    public static func maxFilesFromEnvironment() -> Int {
-        guard let raw = environmentValue("CCKIT_WAX_DELTA_MAX_FILES"), let value = Int(raw) else {
-            return defaultMaxFiles
+    /// Fraction of the indexed files a delta may touch before a full rebuild
+    /// is cheaper. Arena growth is per commit, not per file, so the cap only
+    /// bounds run time: a delta costs ~5 s/file (VX: 49 files in 248 s) while
+    /// a full rebuild costs ~2.3 s/file across the whole repo (VX: 811 files
+    /// in 31 min). A fixed 32 sent a 48-files-behind VX checkout into a
+    /// 31-minute rebuild that a 4-minute delta would have covered.
+    public static let defaultMaxFilesFraction = 0.25
+
+    /// Effective delta cap: `CCKIT_WAX_DELTA_MAX_FILES` when set, else
+    /// `max(defaultMaxFiles, indexedFileCount * defaultMaxFilesFraction)`.
+    public static func maxFilesFromEnvironment(indexedFileCount: Int = 0) -> Int {
+        if let raw = environmentValue("CCKIT_WAX_DELTA_MAX_FILES"), let value = Int(raw) {
+            return value
         }
-        return value
+        return max(defaultMaxFiles, Int(Double(indexedFileCount) * defaultMaxFilesFraction))
     }
 
     public static func maxGrowthFromEnvironment() -> Double {

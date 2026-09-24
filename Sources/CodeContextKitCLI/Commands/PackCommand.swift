@@ -118,7 +118,12 @@ struct PackCommand: AsyncParsableCommand {
 
         let db = try Database(path: dbPath)
         var breachWarning: String?
-        let wax: WaxStore? = lexicalOnly ? nil : try await WaxStore(path: waxPath)
+        let wax: WaxStore? = lexicalOnly ? nil : try await Self.openArenaUnlessBusy(waxPath: waxPath)
+        let arenaBusy = !lexicalOnly && wax == nil
+        if arenaBusy {
+            breachWarning = Self.arenaBusyNotice
+            InteractiveProgress.write("Warning: \(Self.arenaBusyNotice)\n", to: .standardError)
+        }
         if let wax {
             do {
                 try await wax.requireEmbeddings()
@@ -229,7 +234,7 @@ struct PackCommand: AsyncParsableCommand {
         // A lexical-only pack with zero primaries is either a true absence or
         // a prose-shaped task the locators cannot see. Never deliver it as a
         // silent confident negative.
-        let lexicalEmpty = wax == nil && !preview && result.primaryCount == 0
+        let lexicalEmpty = lexicalOnly && !preview && result.primaryCount == 0
         var packet = result.packet
         if let truncation {
             packet = ContextPacker.appendBudgetNotice(
@@ -335,6 +340,20 @@ struct PackCommand: AsyncParsableCommand {
 
     /// Append a degraded-retrieval notice to a packet body. Kept as a trailing
     /// section so packet consumers see it without disturbing the banner.
+    static let arenaBusyNotice =
+        "Semantic arena busy: an index refresh holds it, so vector retrieval is unavailable " +
+        "until it finishes (usually minutes); results use lexical ranking only."
+
+    /// A refresh holds the arena lease for minutes; failing the whole pack
+    /// then sent agents to grep. Serve a lexical packet instead.
+    static func openArenaUnlessBusy(waxPath: String) async throws -> WaxStore? {
+        do {
+            return try await WaxStore(path: waxPath)
+        } catch WaxStore.StoreError.inUse {
+            return nil
+        }
+    }
+
     static func appendDegradedNotice(
         to packet: String,
         semanticUnavailable: Bool,

@@ -375,6 +375,16 @@ final class WaxDeltaTests: XCTestCase {
         XCTAssertGreaterThan(frames, 0, "lexical run must not reset the live arena")
         try lexDb.close()
     }
+
+    func testMaxFilesScalesWithIndexedFileCount() {
+        unsetenv("CCKIT_WAX_DELTA_MAX_FILES")
+        XCTAssertEqual(WaxDeltaPolicy.maxFilesFromEnvironment(indexedFileCount: 0), 32)
+        XCTAssertEqual(WaxDeltaPolicy.maxFilesFromEnvironment(indexedFileCount: 100), 32)
+        XCTAssertEqual(WaxDeltaPolicy.maxFilesFromEnvironment(indexedFileCount: 811), 202)
+        setenv("CCKIT_WAX_DELTA_MAX_FILES", "7", 1)
+        defer { unsetenv("CCKIT_WAX_DELTA_MAX_FILES") }
+        XCTAssertEqual(WaxDeltaPolicy.maxFilesFromEnvironment(indexedFileCount: 811), 7)
+    }
 }
 
 /// Minimal delegate so decision-line printing is exercised (IndexCommand path).
