@@ -141,12 +141,13 @@ public enum JSONLRetention: Sendable {
         let packURL = cckitDir.appendingPathComponent(PackSavingsLedger.fileName)
         let historyURL = cckitDir.appendingPathComponent(ActionHistoryStore.fileName)
 
+        var evictedSavings: [PackSavingsEntry] = []
         if FileManager.default.fileExists(atPath: packURL.path) {
             let entries = try load(PackSavingsEntry.self, from: packURL)
-            let evicted = entries.filter { !isRetained($0.timestamp, now: now) }
-            if !evicted.isEmpty {
+            evictedSavings = entries.filter { !isRetained($0.timestamp, now: now) }
+            if !evictedSavings.isEmpty {
                 try LedgerRollups.foldSavings(
-                    evicted,
+                    evictedSavings,
                     into: cckitDir.appendingPathComponent(LedgerRollups.savingsRollupFileName)
                 )
             }
@@ -158,7 +159,8 @@ public enum JSONLRetention: Sendable {
             if !evicted.isEmpty {
                 try LedgerRollups.foldActions(
                     evicted,
-                    into: cckitDir.appendingPathComponent(LedgerRollups.toolRollupFileName)
+                    into: cckitDir.appendingPathComponent(LedgerRollups.toolRollupFileName),
+                    packSavings: evictedSavings
                 )
             }
             try rewrite(prune(entries, now: now, timestamp: \.timestamp), to: historyURL)
@@ -192,12 +194,80 @@ public struct MonthlyToolRollup: Codable, Sendable, Equatable {
     public var tool: String
     public var calls: Int
     public var tokensUsed: Int
+    public var failedCount: Int
+    public var zeroPrimaryCount: Int
+    public var reasons: [String: Int]
 
-    public init(monthKey: String, tool: String, calls: Int, tokensUsed: Int) {
+    enum CodingKeys: String, CodingKey {
+        case monthKey, tool, calls, tokensUsed
+        case failedCount, zeroPrimaryCount, reasons
+    }
+
+    public init(
+        monthKey: String,
+        tool: String,
+        calls: Int,
+        tokensUsed: Int,
+        failedCount: Int = 0,
+        zeroPrimaryCount: Int = 0,
+        reasons: [String: Int] = [:]
+    ) {
         self.monthKey = monthKey
         self.tool = tool
         self.calls = calls
         self.tokensUsed = tokensUsed
+        self.failedCount = failedCount
+        self.zeroPrimaryCount = zeroPrimaryCount
+        self.reasons = reasons
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        monthKey = try c.decode(String.self, forKey: .monthKey)
+        tool = try c.decode(String.self, forKey: .tool)
+        calls = try c.decode(Int.self, forKey: .calls)
+        tokensUsed = try c.decode(Int.self, forKey: .tokensUsed)
+        failedCount = try c.decodeIfPresent(Int.self, forKey: .failedCount) ?? 0
+        zeroPrimaryCount = try c.decodeIfPresent(Int.self, forKey: .zeroPrimaryCount) ?? 0
+        reasons = try c.decodeIfPresent([String: Int].self, forKey: .reasons) ?? [:]
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(monthKey, forKey: .monthKey)
+        try c.encode(tool, forKey: .tool)
+        try c.encode(calls, forKey: .calls)
+        try c.encode(tokensUsed, forKey: .tokensUsed)
+        try c.encode(failedCount, forKey: .failedCount)
+        try c.encode(zeroPrimaryCount, forKey: .zeroPrimaryCount)
+        try c.encode(reasons, forKey: .reasons)
+    }
+}
+
+/// Lifetime (or per-tool) usage after merging monthly rollups with the live 7-day window.
+public struct ToolUsageTotals: Sendable, Equatable {
+    public var calls: Int
+    public var tokensUsed: Int
+    public var failedCount: Int
+    public var zeroPrimaryCount: Int
+    public var reasons: [String: Int]
+
+    public init(
+        calls: Int = 0,
+        tokensUsed: Int = 0,
+        failedCount: Int = 0,
+        zeroPrimaryCount: Int = 0,
+        reasons: [String: Int] = [:]
+    ) {
+        self.calls = calls
+        self.tokensUsed = tokensUsed
+        self.failedCount = failedCount
+        self.zeroPrimaryCount = zeroPrimaryCount
+        self.reasons = reasons
+    }
+
+    public var productiveCount: Int {
+        max(0, calls - failedCount - zeroPrimaryCount - (reasons[LedgerOutcome.preview] ?? 0))
     }
 }
 
@@ -240,7 +310,15 @@ public enum LedgerRollups: Sendable {
     }
 
     /// Merge evicted action rows into the monthly tool-usage rollup file.
-    public static func foldActions(_ evicted: [ActionRecord], into fileURL: URL) throws {
+    ///
+    /// `packSavings` is the same eviction window's savings rows so legacy pack
+    /// calls (no `primaryCount` / `outcomeReason`) can still be classified as
+    /// productive vs empty before the raw JSONL disappears.
+    public static func foldActions(
+        _ evicted: [ActionRecord],
+        into fileURL: URL,
+        packSavings: [PackSavingsEntry] = []
+    ) throws {
         guard !evicted.isEmpty else { return }
         var existing: [MonthlyToolRollup] = []
         if FileManager.default.fileExists(atPath: fileURL.path) {
@@ -258,14 +336,65 @@ public enum LedgerRollups: Sendable {
             let month = parts.first ?? ""
             let tool = parts.dropFirst().first ?? record.toolName ?? record.type
             var rollup = byKey[key] ?? MonthlyToolRollup(monthKey: month, tool: tool, calls: 0, tokensUsed: 0)
+            let reason = LedgerOutcome.reason(for: record, savings: packSavings)
             rollup.calls += 1
             rollup.tokensUsed += record.tokensUsed
+            rollup.reasons[reason, default: 0] += 1
+            if LedgerOutcome.isFailure(reason) { rollup.failedCount += 1 }
+            if LedgerOutcome.isZeroPrimary(reason) { rollup.zeroPrimaryCount += 1 }
             byKey[key] = rollup
         }
         try JSONLRetention.rewrite(
             byKey.values.sorted { ($0.monthKey, $0.tool) < ($1.monthKey, $1.tool) },
             to: fileURL
         )
+    }
+
+    /// Combine archived months with the current 7-day window. Lifetime pack-stats
+    /// used to sum only `tool_usage_monthly.jsonl` and silently drop live rows.
+    public static func mergeToolUsage(
+        rollups: [MonthlyToolRollup],
+        live: [ActionRecord],
+        liveSavings: [PackSavingsEntry] = []
+    ) -> [String: ToolUsageTotals] {
+        var merged: [String: ToolUsageTotals] = [:]
+        for rollup in rollups {
+            var totals = merged[rollup.tool] ?? ToolUsageTotals()
+            totals.calls += rollup.calls
+            totals.tokensUsed += rollup.tokensUsed
+            totals.failedCount += rollup.failedCount
+            totals.zeroPrimaryCount += rollup.zeroPrimaryCount
+            totals.reasons = mergeReasonCounts(totals.reasons, rollup.reasons)
+            merged[rollup.tool] = totals
+        }
+        for record in live {
+            let tool = record.toolName ?? record.type
+            var totals = merged[tool] ?? ToolUsageTotals()
+            let reason = LedgerOutcome.reason(for: record, savings: liveSavings)
+            totals.calls += 1
+            totals.tokensUsed += record.tokensUsed
+            totals.reasons[reason, default: 0] += 1
+            if LedgerOutcome.isFailure(reason) { totals.failedCount += 1 }
+            if LedgerOutcome.isZeroPrimary(reason) { totals.zeroPrimaryCount += 1 }
+            merged[tool] = totals
+        }
+        return merged
+    }
+
+    public static func mergeReasonCounts(_ a: [String: Int], _ b: [String: Int]) -> [String: Int] {
+        var out = a
+        for (key, value) in b {
+            out[key, default: 0] += value
+        }
+        return out
+    }
+
+    public static func formatReasonHistogram(_ reasons: [String: Int]) -> String {
+        reasons
+            .filter { $0.value > 0 }
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: ", ")
     }
 
     public static func loadSavings(cckitDir: URL) -> [MonthlySavingsRollup] {

@@ -19,6 +19,9 @@ struct IndexCommand: AsyncParsableCommand {
     @Flag(help: "Clean the index before indexing.")
     var clean: Bool = false
 
+    @Flag(help: "Only seed an unindexed linked worktree from the main checkout's index, then exit.")
+    var seedOnly: Bool = false
+
     @Flag(help: "Rebuild the derived Wax semantic index from the current source tree.")
     var compact: Bool = false
 
@@ -347,6 +350,7 @@ struct IndexCommand: AsyncParsableCommand {
         let fullCommand = "cckit " + CommandLine.arguments.dropFirst().joined(separator: " ")
         guard let lock = RefreshLock.tryAcquire(lockPath: "\(cckitDir)/refresh.lock") else {
             print(Self.indexSkippedLine(reason: "locked"))
+            IndexRunLog.recordSkipped(reason: "locked", command: fullCommand, cckitDir: cckitDir)
             // Record the drop so pileups are visible in the ledger instead of
             // silently disappearing (a skipped run previously left no trace).
             let orchestrator = ActionOrchestrator(repoRoot: ".")
@@ -359,6 +363,25 @@ struct IndexCommand: AsyncParsableCommand {
             throw ExitCode.success
         }
         defer { lock.release() }
+
+        // A fresh linked worktree clones the main checkout's index so the
+        // run below re-indexes only the files that differ (minutes, not the
+        // ~30-minute cold build). --clean asks for a from-scratch rebuild.
+        if !clean {
+            let seed = WorktreeIndexSeed.seedIfNeeded(
+                repoRoot: fm.currentDirectoryPath,
+                cckitDir: cckitDir
+            )
+            if case .seeded = seed {
+                IndexRunLog.record(event: WorktreeIndexSeed.eventName, payload: seed.payload, cckitDir: cckitDir)
+                print(seed.jsonLine)
+            } else if seedOnly {
+                print(seed.jsonLine)
+            }
+        }
+        if seedOnly {
+            throw ExitCode.success
+        }
 
         // Every terminal state leaves exactly one ledger row. Failed index
         // runs used to vanish (the embeddings guard threw before the recorder
@@ -377,6 +400,7 @@ struct IndexCommand: AsyncParsableCommand {
         } catch {
             let duration = Int(Date().timeIntervalSince(startTime) * 1000)
             let reason = String(describing: error)
+            IndexRunLog.recordFailure(reason: reason, command: fullCommand, cckitDir: cckitDir)
             try? await ledger.recordCLIAction(
                 command: fullCommand,
                 toolName: "index",
@@ -751,6 +775,10 @@ struct IndexCommand: AsyncParsableCommand {
             payload["skipped"] = compacted.skipped
             payload["symbols"] = compacted.totalSymbols
         }
+        // Persist the same telemetry to the timestamped run log: stdout goes to
+        // a TTY or a detached refresh.log, neither of which records WHEN a run
+        // happened or captures plain `cckit index .` runs at all.
+        IndexRunLog.recordWaxCompact(payload, cckitDir: cckitDir)
         if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
            let json = String(data: data, encoding: .utf8) {
             print("WaxCompact \(json)")

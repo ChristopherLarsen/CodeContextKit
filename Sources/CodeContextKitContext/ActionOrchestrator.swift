@@ -89,6 +89,8 @@ public actor ActionOrchestrator {
         skipped: Int? = nil,
         symbols: Int? = nil,
         baselineTokens: Int? = nil,
+        primaryCount: Int? = nil,
+        outcomeReason: String? = nil,
         response: String? = nil
     ) throws {
         let id = try history.nextId()
@@ -105,7 +107,9 @@ public actor ActionOrchestrator {
             updated: updated,
             skipped: skipped,
             symbols: symbols,
-            baselineTokens: baselineTokens
+            baselineTokens: baselineTokens,
+            primaryCount: primaryCount,
+            outcomeReason: outcomeReason
         )
         try history.append(record)
     }

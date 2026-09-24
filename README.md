@@ -211,12 +211,16 @@ prune runs **at most once per day** (stamp: `.cckit/jsonl_retention_stamp`).
 the same name costs repo-wide (`-1` = unmeasured), so locator savings are
 auditable — and visibly bimodal (large wins on common names, ~1× on rare ones).
 Evicted rows are folded into monthly rollups (`pack_savings_monthly.jsonl`,
-`tool_usage_monthly.jsonl`) so lifetime numbers survive pruning. Metrics compare
-**delivered tokens** to the **whole-file size of files already loaded for that
-call** — not vs Grep or other tools (dual-running those spends the tokens you
-would claim to save). MCP responses attach a one-line `savings` summary
-(`~delivered vs whole-file`) on successful gather/symbol/outline/map calls; MCP
-pack calls print a machine-readable `PACK_STATS {...}` line. Review with:
+`tool_usage_monthly.jsonl`) so lifetime numbers survive pruning. Tool rollups keep
+`failedCount`, `zeroPrimaryCount`, and a reason histogram (`lease_held`,
+`zero_primary`, …) so empty packs stay diagnosable after the 7-day window.
+`cckit pack-stats` lifetime tool counts include the current raw window, not only
+archived months. Metrics compare **delivered tokens** to the **whole-file size of
+files already loaded for that call** — not vs Grep or other tools (dual-running
+those spends the tokens you would claim to save). MCP responses attach a one-line
+`savings` summary (`~delivered vs whole-file`) on successful
+gather/symbol/outline/map calls; MCP pack calls print a machine-readable
+`PACK_STATS {...}` line. Review with:
 
 ```bash
 cckit pack-stats

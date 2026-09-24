@@ -183,6 +183,58 @@ final class WaxDeltaTests: XCTestCase {
             arenaAllocatedBytes: 442_368 + 17_000_000, arenaFrameCount: 80, keepSetMandateCount: 80))
     }
 
+    // MARK: - Timestamped run log
+
+    /// Every index run must leave a timestamped `DeltaDecision` in
+    /// `.cckit/index-runs.jsonl`, naming `refusedBy` whenever it rebuilt.
+    /// Detached stdout (refresh.log) had no timestamps and missed plain CLI
+    /// runs, so a 20-minute rebuild could not be explained afterwards.
+    func testRunLogRecordsTimestampedDecisionWithRefusalReason() async throws {
+        // No stamp yet → the run must rebuild and name the predicate.
+        _ = try await indexer.index(at: tempDir.path, cckitDir: cckitDir.path)
+
+        let logPath = cckitDir.appendingPathComponent("index-runs.jsonl")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: logPath.path), "run log must be written")
+
+        let lines = try String(contentsOf: logPath, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+        let decisions: [[String: Any]] = lines.compactMap { line in
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  obj["event"] as? String == "DeltaDecision" else { return nil }
+            return obj
+        }
+        let last = try XCTUnwrap(decisions.last, "run log must contain a DeltaDecision")
+        let payload = try XCTUnwrap(last["payload"] as? [String: Any])
+        XCTAssertEqual(payload["refusedBy"] as? String, "noStamp")
+        let at = try XCTUnwrap(last["at"] as? String)
+        XCTAssertFalse(at.isEmpty, "the record must be timestamped")
+    }
+
+    /// A delta run logs an eligible verdict with no refusal predicate.
+    func testRunLogDeltaDecisionOmitsRefusalWhenEligible() async throws {
+        try await primeIndexAndStamp()
+        try "struct Alpha { func one() -> Int { 111 } }".write(
+            to: tempDir.appendingPathComponent("Alpha.swift"), atomically: true, encoding: .utf8)
+        let result = try await indexer.index(at: tempDir.path, cckitDir: cckitDir.path)
+        XCTAssertTrue(result.deltaApplied)
+
+        let logPath = cckitDir.appendingPathComponent("index-runs.jsonl")
+        let lines = try String(contentsOf: logPath, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+        let payloads: [[String: Any]] = lines.compactMap { line in
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  obj["event"] as? String == "DeltaDecision" else { return nil }
+            return obj["payload"] as? [String: Any]
+        }
+        let last = try XCTUnwrap(payloads.last)
+        XCTAssertEqual(last["eligible"] as? Bool, true)
+        XCTAssertNil(last["refusedBy"])
+    }
+
     // MARK: - Delta path integration
 
     func testSmallDeltaAppendsInsteadOfRebuilding() async throws {

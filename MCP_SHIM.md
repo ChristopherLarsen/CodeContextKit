@@ -125,9 +125,11 @@ Ideal MCP v1 (keep small):
 | `outline` | `cckit outline` | Structural skeleton before full-file reads (metadata only). Identical re-deliveries stub like `symbol` (`refresh=true` bypasses). |
 | `map` | `cckit map` | Names-only repo map; prefer gather when you need source. Skip if the gather packet already included a repository map. |
 | `search_text` | `rg` / in-process scan | Budgeted literal text search over the working tree: capped hits, per-file grouped ranges, one preview per file, honors .gitignore (ripgrep path) and skips junk dirs. Use instead of raw Grep so output stays bounded; regex/case/glob params available. |
-| `index` | `cckit index .` | Last. Usually unnecessary — MCP auto-refreshes on HEAD drift / dirty files, auto-compacts leaked Wax vectors, and retries once on locator miss (`CCKIT_REFRESH=auto`). |
+| `index` | `cckit index .` | Last. Usually unnecessary — MCP auto-refreshes on HEAD drift / dirty files, auto-compacts leaked Wax vectors **only past the CLI's delta band** (not a flat byte count, which sat below one append), and retries once on locator miss (`CCKIT_REFRESH=auto`). |
 
 Responses omit freshness when the index is current; `stale: true` appears only when it is not. MCP flattens CLI JSON fields to the top level (not nested under `data`). Set `CCKIT_REFRESH=never` to disable auto-reindex. `CCKIT_CALLER=mcp` is set on subprocesses so `pack-stats` can separate agent traffic from shell runs.
+
+Every index run appends a timestamped record to `.cckit/index-runs.jsonl` (`DeltaDecision`, `WaxCompact`, and any `IndexFailure`/`IndexSkipped`), independent of trigger source or TTY. The shim surfaces the last `deltaDecision`/`waxCompact` on responses, so a rebuild is always explainable after the fact. When the arena lease (`.cckit/repo.wax.lock`) is held — e.g. by a live semantic `cckit serve` — the shim defers auto-refresh with `reason: "wax_lease_held"` instead of spawning a child that fails.
 
 ### Degraded-arena contract
 

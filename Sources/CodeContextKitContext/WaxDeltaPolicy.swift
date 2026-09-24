@@ -75,7 +75,9 @@ public enum WaxDeltaPolicy {
         public let effectiveAllowanceBytes: Int
         public let allowanceScale: Double
 
-        public var summary: String {
+        /// Structured form, for the timestamped run log and any consumer that
+        /// wants the arithmetic without re-parsing `summary`.
+        public var payload: [String: Any] {
             var payload: [String: Any] = [
                 "eligible": eligible,
                 "deltaFiles": deltaFileCount,
@@ -88,6 +90,10 @@ public enum WaxDeltaPolicy {
             if let refusedBy {
                 payload["refusedBy"] = refusedBy
             }
+            return payload
+        }
+
+        public var summary: String {
             guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
                   let json = String(data: data, encoding: .utf8) else {
                 return eligible ? "DeltaDecision {\"eligible\": true}" : "DeltaDecision {\"eligible\": false}"

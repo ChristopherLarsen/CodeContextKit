@@ -21,7 +21,8 @@ Keep the routing table and rules identical across all three; a consistency test
 ## Rules
 
 1. Prefer `gather_code_context` over Grep/Read for source on the first
-   retrieval of task-shaped work. Treat the packet as starting context.
+   retrieval of task-shaped work. Treat the packet as starting context
+   (orientation, not coverage).
 2. After a gather or locator hit, do not Grep that name. If you lack the next
    name, outline the file. Huge hits: nested name or narrow Read — `symbol`
    will not dump the whole type.

@@ -567,4 +567,195 @@ final class PackSavingsLedgerTests: XCTestCase {
         let entries = try ledger.loadEntries(now: now.addingTimeInterval(60))
         XCTAssertEqual(entries.map(\.task), ["valid"])
     }
+
+    func testMonthlyToolRollupDecodesPreHistogramRows() throws {
+        let json = """
+        {"calls":16,"monthKey":"2026-08","tokensUsed":9000,"tool":"pack"}
+        """
+        let decoder = JSONDecoder()
+        let rollup = try decoder.decode(MonthlyToolRollup.self, from: Data(json.utf8))
+        XCTAssertEqual(rollup.calls, 16)
+        XCTAssertEqual(rollup.failedCount, 0)
+        XCTAssertEqual(rollup.zeroPrimaryCount, 0)
+        XCTAssertEqual(rollup.reasons, [:])
+    }
+
+    func testFoldActionsKeepsPackOutcomeHistogram() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cckit-pack-outcome-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let stamp = Date(timeIntervalSince1970: 1_788_000_000)
+        let records = [
+            ActionRecord(
+                id: 1,
+                prompt: "cckit pack --task AuthManager retry",
+                toolName: "pack",
+                type: "mcp",
+                tokensUsed: 800,
+                durationMs: 20,
+                status: "completed",
+                timestamp: stamp,
+                primaryCount: 3,
+                outcomeReason: LedgerOutcome.productive
+            ),
+            ActionRecord(
+                id: 2,
+                prompt: "cckit pack --task HTML render plan",
+                toolName: "pack",
+                type: "mcp",
+                tokensUsed: 120,
+                durationMs: 15,
+                status: "completed",
+                timestamp: stamp.addingTimeInterval(10),
+                primaryCount: 0,
+                outcomeReason: LedgerOutcome.zeroPrimary
+            ),
+            ActionRecord(
+                id: 3,
+                prompt: "cckit pack --task anything",
+                toolName: "pack",
+                type: "mcp",
+                tokensUsed: 0,
+                durationMs: 5,
+                status: "failed",
+                timestamp: stamp.addingTimeInterval(20),
+                response: "Wax store is already in use (stable lease: .cckit/repo.wax.lock). Stop the other cckit process and retry.",
+                outcomeReason: LedgerOutcome.leaseHeld
+            ),
+        ]
+        let url = dir.appendingPathComponent(LedgerRollups.toolRollupFileName)
+        try LedgerRollups.foldActions(records, into: url)
+        let rollups = LedgerRollups.loadTools(cckitDir: dir)
+        XCTAssertEqual(rollups.count, 1)
+        let pack = try XCTUnwrap(rollups.first)
+        XCTAssertEqual(pack.tool, "pack")
+        XCTAssertEqual(pack.calls, 3)
+        XCTAssertEqual(pack.failedCount, 1)
+        XCTAssertEqual(pack.zeroPrimaryCount, 1)
+        XCTAssertEqual(pack.reasons[LedgerOutcome.productive], 1)
+        XCTAssertEqual(pack.reasons[LedgerOutcome.zeroPrimary], 1)
+        XCTAssertEqual(pack.reasons[LedgerOutcome.leaseHeld], 1)
+    }
+
+    func testLegacyPackRowClassifiedFromSavingsMatch() throws {
+        let stamp = Date(timeIntervalSince1970: 1_788_000_000)
+        let action = ActionRecord(
+            id: 1,
+            prompt: "cckit pack --task AuthManager retry",
+            toolName: "pack",
+            type: "mcp",
+            tokensUsed: 800,
+            status: "completed",
+            timestamp: stamp
+        )
+        let savings = [
+            PackSavingsEntry(
+                timestamp: stamp.addingTimeInterval(1),
+                task: "AuthManager retry",
+                repo: "/r",
+                requestedMode: "auto",
+                deliveredMode: "surgical",
+                deliveredTokens: 800,
+                sourceWholeFileTokens: 2000,
+                tokensSaved: 1200,
+                budget: 12000
+            )
+        ]
+        XCTAssertEqual(LedgerOutcome.reason(for: action, savings: savings), LedgerOutcome.productive)
+
+        let miss = ActionRecord(
+            id: 2,
+            prompt: "cckit pack --task unnamed prose feature",
+            toolName: "pack",
+            type: "mcp",
+            tokensUsed: 90,
+            status: "completed",
+            timestamp: stamp.addingTimeInterval(30)
+        )
+        XCTAssertEqual(LedgerOutcome.reason(for: miss, savings: savings), LedgerOutcome.zeroPrimary)
+    }
+
+    func testMergeToolUsageIncludesLiveWindow() throws {
+        let rolled = [
+            MonthlyToolRollup(monthKey: "2026-08", tool: "pack", calls: 25, tokensUsed: 1000),
+            MonthlyToolRollup(monthKey: "2026-08", tool: "index", calls: 434, tokensUsed: 0),
+        ]
+        let now = Date()
+        let live = [
+            ActionRecord(
+                prompt: "cckit pack --task a",
+                toolName: "pack",
+                tokensUsed: 10,
+                status: "completed",
+                timestamp: now,
+                primaryCount: 2,
+                outcomeReason: LedgerOutcome.productive
+            ),
+            ActionRecord(
+                prompt: "cckit pack --task b",
+                toolName: "pack",
+                tokensUsed: 0,
+                status: "failed",
+                timestamp: now,
+                outcomeReason: LedgerOutcome.leaseHeld
+            ),
+            ActionRecord(
+                prompt: "cckit pack --task c",
+                toolName: "pack",
+                tokensUsed: 40,
+                status: "completed",
+                timestamp: now,
+                primaryCount: 0,
+                outcomeReason: LedgerOutcome.zeroPrimary
+            ),
+            ActionRecord(
+                prompt: "cckit index .",
+                toolName: "index",
+                tokensUsed: 0,
+                status: "completed",
+                timestamp: now
+            ),
+        ]
+        let merged = LedgerRollups.mergeToolUsage(rollups: rolled, live: live)
+        XCTAssertEqual(merged["pack"]?.calls, 28)
+        XCTAssertEqual(merged["index"]?.calls, 435)
+        XCTAssertEqual(merged["pack"]?.failedCount, 1)
+        XCTAssertEqual(merged["pack"]?.zeroPrimaryCount, 1)
+        XCTAssertEqual(merged["pack"]?.productiveCount, 26)
+    }
+
+    func testClassifyFailureLeaseHeld() {
+        let reason = LedgerOutcome.classifyFailure(
+            "Wax store is already in use (stable lease: .cckit/repo.wax.lock). Stop the other cckit process and retry."
+        )
+        XCTAssertEqual(reason, LedgerOutcome.leaseHeld)
+        XCTAssertTrue(LedgerOutcome.isFailure(reason))
+        XCTAssertFalse(LedgerOutcome.isZeroPrimary(reason))
+    }
+
+    func testPackCompletedReasonPrecedence() {
+        XCTAssertEqual(
+            LedgerOutcome.packCompleted(
+                isPreview: true, primaryCount: 0, wasBudgetTruncated: true,
+                wasLexicalEmpty: true, wasSemanticUnavailable: true
+            ),
+            LedgerOutcome.preview
+        )
+        XCTAssertEqual(
+            LedgerOutcome.packCompleted(
+                isPreview: false, primaryCount: 0, wasBudgetTruncated: true,
+                wasLexicalEmpty: false, wasSemanticUnavailable: false
+            ),
+            LedgerOutcome.budgetTruncated
+        )
+        XCTAssertEqual(
+            LedgerOutcome.packCompleted(
+                isPreview: false, primaryCount: 4, wasBudgetTruncated: false,
+                wasLexicalEmpty: false, wasSemanticUnavailable: false
+            ),
+            LedgerOutcome.productive
+        )
+    }
 }

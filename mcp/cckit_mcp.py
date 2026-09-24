@@ -45,8 +45,20 @@ CCKIT_DEBUG_STDERR = os.environ.get("CCKIT_DEBUG_STDERR", "").strip().lower() in
 _REFRESH_LOCK = threading.Lock()
 _COMPACT_STAMP = "wax-compact-stamp.json"
 # Soft-delete does not shrink repo.wax; only compact again after real growth.
+#
+# The trigger MUST mirror the CLI's own delta band or it will fight it: one
+# Wax delta append stages the whole FTS+vector blob and costs ~0.5 arena-
+# equivalents (~67 MB on the 139 MB reference arena). A flat 64 MB line sits
+# BELOW a single append, so every one-file edit tripped it and the shim
+# spawned a full ~20-minute `--compact` rebuild. These defaults mirror
+# WaxDeltaPolicy (Sources/CodeContextKitContext/WaxDeltaPolicy.swift):
+#   ceiling = stamp * (1 + maxGrowth) + max(allowanceBytes, stamp * scale)
+# The env vars below are the exact ones the CLI reads, so the two never drift.
 _WAX_COMPACT_GROWTH_BYTES = 64 * 1024 * 1024
 _WAX_COMPACT_GROWTH_RATIO = 1.5
+_DELTA_MAX_GROWTH = 0.10
+_DELTA_ALLOWANCE_BYTES = 16_000_000
+_DELTA_ALLOWANCE_SCALE = 1.5
 # A compact stamp claiming more than this multiple of the live store's size is
 # a latched artifact of the pre-cc164a8 stamper, not a real watermark.
 _COMPACT_STAMP_MAX_LIVE_RATIO = 2
@@ -192,11 +204,15 @@ def attach_stderr(payload: dict[str, Any], stderr: str, *, success: bool) -> dic
     return payload
 
 SERVER_INSTRUCTIONS = """
+This repo is indexed by cckit. If these tools are deferred (names shown,
+schemas withheld), load them in ONE lookup before the first source read:
+ToolSearch "select:mcp__cckit__gather_code_context,mcp__cckit__symbol,mcp__cckit__find_symbol,mcp__cckit__find_references,mcp__cckit__outline,mcp__cckit__search_text"
+
 Token-budgeted codebase tools over an indexed snapshot. gather_code_context and
 symbol read disk; outline is a capped skeleton (no docs; huge nested types
 collapsed). find_symbol, find_references, and map use the last index.
 
-Routing: work shaped like a symptom, a change, more than one file, or a failure log -> gather_code_context(task) — even when names are visible; those names go in task. Treat the packet as starting context. Prefer gather over Grep/Read for source on the first retrieval. Want a cheap look first? gather_code_context(mode="preview") returns names, line ranges, and body sizes (~1500 token cap), then symbol(...) for each body you need. One known body -> symbol. find_symbol after gather, or when you only need a qualified name, not a packet. find_references wants Foo or Foo.bar. Literal strings/config/error text -> search_text (capped), not raw Grep. File structure -> outline. Names-only overview -> map.
+Routing: work shaped like a symptom, a change, more than one file, or a failure log -> gather_code_context(task) — even when names are visible; those names go in task. Treat the packet as starting context (orientation, not coverage). Prefer gather over Grep/Read for source on the first retrieval. Want a cheap look first? gather_code_context(mode="preview") returns names, line ranges, and body sizes (~1500 token cap), then symbol(...) for each body you need. One known body -> symbol. find_symbol after gather, or when you only need a qualified name, not a packet. find_references wants Foo or Foo.bar. Literal strings/config/error text -> search_text (capped), not raw Grep. File structure -> outline. Names-only overview -> map.
 After a gather or locator hit, do not Grep that name. Huge hits: nested name
 or narrow Read — symbol will not dump the whole type. Pass repo= when unsure.
 Successful responses carry a savings line (~delivered vs whole-file); use it to
@@ -212,8 +228,9 @@ FIND_SYMBOL_DESCRIPTION = (
 
 GATHER_DESCRIPTION = (
     "Budgeted source packet for a coding task: a symptom, a change, more "
-    "than one file, or a failure log. Put the work in task; names you "
-    "know help matching and belong here, not in a first find_symbol. "
+    "than one file, or a failure log. Orientation, not coverage. Put the work "
+    "in task; names you know help matching and belong here, not in a first "
+    "find_symbol. "
     "mode=preview returns just names/ranges/body-sizes (~1500 token cap) — "
     "cheap first look before committing to bodies. symbol for one known "
     "body. Pass refresh=true to re-fetch bodies already delivered this "
@@ -1633,15 +1650,15 @@ def _cooldown_remaining(repo: Path) -> float:
     return max(0.0, _SPAWN_COOLDOWN_SECONDS - (time.monotonic() - last))
 
 
-def refresh_lock_is_free(repo: Path) -> bool:
-    """True when no indexer holds .cckit/refresh.lock right now.
+def _flock_is_free(lock_path: Path) -> bool:
+    """Non-blocking peek: True when no process holds an flock on lock_path.
 
-    Non-blocking peek so the shim avoids spawning a child that would drop
-    itself anyway. The fd (and lock) is released before any spawn — a race
-    after the peek is harmless: the losing child self-drops via its own flock.
+    The fd (and lock) is released before any spawn — a race after the peek is
+    harmless: the losing child self-drops via its own flock. Opening with "a+"
+    creates the lock file if absent, matching the CLI's O_CREAT probe.
     """
     try:
-        handle = open(repo / ".cckit" / "refresh.lock", "a+")
+        handle = open(lock_path, "a+")
     except OSError:
         return True
     try:
@@ -1651,6 +1668,26 @@ def refresh_lock_is_free(repo: Path) -> bool:
         return False
     finally:
         handle.close()
+
+
+def refresh_lock_is_free(repo: Path) -> bool:
+    """True when no indexer holds .cckit/refresh.lock right now."""
+    return _flock_is_free(repo / ".cckit" / "refresh.lock")
+
+
+def wax_lease_is_free(repo: Path) -> bool:
+    """True when no process holds the Wax arena lease (.cckit/repo.wax.lock).
+
+    The refresh lock alone does not cover every arena writer: a semantic
+    `cckit serve` holds the arena lease for its process lifetime WITHOUT the
+    refresh lock (WAX-16). Spawning `--compact` against it fails with
+    `IndexFailure: arena lease unavailable: Wax store is already in use` — the
+    shim must defer instead. Lexical-only repos never open the arena, so they
+    need no probe.
+    """
+    if (repo / ".cckit" / "lexical-only").is_file():
+        return True
+    return _flock_is_free(repo / ".cckit" / "repo.wax.lock")
 
 
 def spawn_detached_index(
@@ -1667,6 +1704,9 @@ def spawn_detached_index(
     concurrent triggers DROP instead of queueing another rebuild.
     """
     log_path = _refresh_log_path(repo)
+    # A never-indexed repo has no .cckit yet; opening the log would ENOENT and
+    # the refresh would silently never start.
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         if log_path.stat().st_size > _REFRESH_LOG_MAX_BYTES:
             log_path.write_bytes(b"")
@@ -1749,13 +1789,56 @@ def wax_breach_payload(repo: Path) -> dict[str, Any] | None:
     }
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def wax_growth_ceiling(stamp_allocated_bytes: int) -> int:
+    """The CLI's own delta-growth ceiling for a given baseline, in bytes.
+
+    Mirrors WaxDeltaPolicy.evaluate: effective allowance is the absolute floor
+    or the baseline-scaled value, whichever is larger, because Wax's per-commit
+    append is a near-fixed fraction OF the arena, not of the delta:
+        ceiling = stamp * (1 + maxGrowth) + max(allowanceBytes, stamp * scale)
+    """
+    allowance = max(
+        _env_int("CCKIT_WAX_DELTA_ALLOWANCE_BYTES", _DELTA_ALLOWANCE_BYTES),
+        round(stamp_allocated_bytes * _env_float("CCKIT_WAX_DELTA_ALLOWANCE_SCALE", _DELTA_ALLOWANCE_SCALE)),
+    )
+    growth = _env_float("CCKIT_WAX_DELTA_MAX_GROWTH", _DELTA_MAX_GROWTH)
+    return int(stamp_allocated_bytes * (1.0 + growth) + allowance)
+
+
 def wax_needs_compact(repo: Path) -> bool:
-    """True when repo.wax exists and has never been compacted, or has grown since.
+    """True when repo.wax has outgrown the CLI's delta band since its stamp.
 
     Sizes are ALLOCATED bytes (st_blocks): repo.wax is sparse AND Wax keeps a
     huge logical length across rewrites (~278MB apparent / ~12MB materialized
     right now), so st_size both overstates today and lies after every reclaim.
     cckit's operating guidance is du, not ls/stat.
+
+    The threshold is the CLI's band, NOT a flat byte count. One delta append is
+    ~0.5 arena-equivalents (~67 MB on the reference arena) — well above a flat
+    64 MB line — so a flat line made every one-file edit spawn a full rebuild.
+    Ask ``wax_growth_ceiling`` for the exact number.
 
     An armed wax-breach-marker means the CLI's bloat veto already refused to
     certify this arena; remediation is `cckit index . --clean`, not an endless
@@ -1789,8 +1872,9 @@ def wax_needs_compact(repo: Path) -> bool:
     # as absent so the next run restamps from the CLI.
     if last > live * _COMPACT_STAMP_MAX_LIVE_RATIO:
         return True
-    grown = live - last
-    return grown >= _WAX_COMPACT_GROWTH_BYTES or live >= int(last * _WAX_COMPACT_GROWTH_RATIO)
+    # Refuse only past the same growthCeiling the CLI enforces, so the shim
+    # never forces a rebuild the CLI's own delta policy would have taken.
+    return live > wax_growth_ceiling(last)
 
 
 def _file_record_hashes(repo: Path) -> dict[str, str] | None:
@@ -1947,6 +2031,17 @@ def maybe_refresh_index(repo: Path, args: list[str]) -> dict[str, Any] | None:
         needs_compact = wax_needs_compact(repo)
         if not needs_index and not needs_compact:
             return None
+        # A semantic `serve` holds the arena lease for its lifetime without the
+        # refresh lock; spawning into it would fail with an IndexFailure row.
+        # Defer instead — the arena is still serving reads, and a later call
+        # retries once the lease is free.
+        if not wax_lease_is_free(repo):
+            return {
+                "refreshed": False,
+                "skipped": True,
+                "reason": "wax_lease_held",
+                **freshness,
+            }
         if not _spawn_allowed(repo):
             return {
                 "refreshed": False,
@@ -1984,6 +2079,13 @@ def force_refresh_index(repo: Path) -> dict[str, Any]:
             }
         if _index_is_current(repo) and not wax_needs_compact(repo):
             return {"refreshed": False, "skipped": True, "reason": "already_fresh", **freshness}
+        if not wax_lease_is_free(repo):
+            return {
+                "refreshed": False,
+                "skipped": True,
+                "reason": "wax_lease_held",
+                **freshness,
+            }
         if not _spawn_allowed(repo):
             return {
                 "refreshed": False,
@@ -2032,33 +2134,85 @@ def _wax_growth_warning(compact: dict[str, Any] | None) -> dict[str, Any] | None
 
 _REFRESH_TELEMETRY_CACHE: dict[str, Any] = {}
 
+_INDEX_RUN_LOG_NAME = "index-runs.jsonl"
+# Timestamped JSONL written by the CLI on every run (DeltaDecision, WaxCompact,
+# failures). Preferred over refresh.log: it captures plain `cckit index .` runs
+# and every entry carries `at`.
+_INDEX_RUN_LOG_TAIL_BYTES = 256 * 1024
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _read_tail_text(path: Path, max_bytes: int) -> str:
+    try:
+        stat = path.stat()
+        with open(path, "rb") as handle:
+            handle.seek(max(0, stat.st_size - max_bytes))
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def parse_index_run_telemetry(tail: str) -> dict[str, Any]:
+    """Last DeltaDecision / WaxCompact / failure event from index-runs.jsonl.
+
+    Every record is `{"at": iso8601, "event": name, "payload": {...}}`; a torn
+    line is skipped rather than poisoning the whole tail.
+    """
+    payload: dict[str, Any] = {}
+    for line in reversed((tail or "").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        event = entry.get("event")
+        body = entry.get("payload")
+        if not isinstance(body, dict):
+            continue
+        at = entry.get("at")
+        if event == "WaxCompact" and "waxCompact" not in payload:
+            payload["waxCompact"] = {**body, "at": at}
+        elif event == "DeltaDecision" and "deltaDecision" not in payload:
+            payload["deltaDecision"] = {**body, "at": at}
+        elif event in ("IndexFailure", "IndexSkipped") and "lastIndexRun" not in payload:
+            payload["lastIndexRun"] = {"event": event, "at": at, **body}
+    return payload
+
 
 def _recent_refresh_log_telemetry(repo: Path) -> dict[str, Any]:
-    """Best-effort telemetry from detached index runs, parsed lazily.
+    """Best-effort telemetry from the last index run, parsed lazily.
 
-    Out-of-band runs leave no captured stdout in this process, so their
-    machine-readable lines are read back from `.cckit/refresh.log`: the last
-    `WaxCompact {...}` line is surfaced as waxCompact/waxGrowthWarning on
+    Prefers the timestamped `.cckit/index-runs.jsonl` (written by the CLI for
+    every run, including plain `cckit index .`); falls back to the legacy
+    detached-only `.cckit/refresh.log` for repos indexed before that log
+    existed. Surfaced as waxCompact/waxGrowthWarning/deltaDecision on
     subsequent tool calls. Cached per (mtime_ns, size); a miss is just no data.
     """
+    run_path = repo / ".cckit" / _INDEX_RUN_LOG_NAME
     log_path = _refresh_log_path(repo)
-    try:
-        stat = log_path.stat()
-        cache_key = f"{repo}:{stat.st_mtime_ns}:{stat.st_size}"
-    except OSError:
-        return {}
+    cache_key = f"{repo}:{_file_signature(run_path)}:{_file_signature(log_path)}"
     if _REFRESH_TELEMETRY_CACHE.get("key") == cache_key:
         return _REFRESH_TELEMETRY_CACHE.get("payload", {})
-    try:
-        with open(log_path, "rb") as handle:
-            handle.seek(max(0, stat.st_size - _REFRESH_LOG_TAIL_BYTES))
-            tail = handle.read().decode("utf-8", errors="replace")
-    except OSError:
-        return {}
-    payload: dict[str, Any] = {}
-    compact = parse_compact_result(tail)
-    if compact is not None:
-        payload["waxCompact"] = compact
+
+    payload = parse_index_run_telemetry(_read_tail_text(run_path, _INDEX_RUN_LOG_TAIL_BYTES))
+    if "waxCompact" not in payload:
+        # Legacy: a detached shim run's stdout captured WaxCompact, unstamped.
+        compact = parse_compact_result(_read_tail_text(log_path, _REFRESH_LOG_TAIL_BYTES))
+        if compact is not None:
+            payload["waxCompact"] = compact
+    compact = payload.get("waxCompact")
+    if isinstance(compact, dict):
         warning = _wax_growth_warning(compact)
         if warning is not None:
             payload["waxGrowthWarning"] = warning
@@ -2068,6 +2222,41 @@ def _recent_refresh_log_telemetry(repo: Path) -> dict[str, Any]:
 
 
 @track_inflight
+def repo_has_no_index(repo: Path) -> bool:
+    cckit_dir = repo / ".cckit"
+    return not (cckit_dir / "index-stamp.json").exists() and not (cckit_dir / "index.sqlite").exists()
+
+
+def seed_worktree_index(repo: Path) -> dict[str, Any] | None:
+    """Clone the main checkout's index into an unindexed linked worktree.
+
+    Synchronous and cheap (APFS clone): the call that follows answers from the
+    seeded index, and the normal stale-index refresh re-indexes only the files
+    that differ, detached. Without this a fresh worktree answers "Index not
+    found" and the agent falls back to grep for the whole task.
+    """
+    if not repo_has_no_index(repo):
+        return None
+    try:
+        proc = subprocess.run(
+            [CCKIT, "index", ".", "--seed-only"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=cckit_subprocess_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"seeded": False, "reason": str(error)}
+    for line in reversed(proc.stdout.splitlines()):
+        if line.startswith("WorktreeSeed "):
+            try:
+                return json.loads(line[len("WorktreeSeed "):])
+            except json.JSONDecodeError:
+                break
+    return {"seeded": False, "reason": "no_seed_output", "returncode": proc.returncode}
+
+
 def run_cckit(
     args: list[str],
     repo: str | None = None,
@@ -2080,7 +2269,10 @@ def run_cckit(
     except ValueError as error:
         return {"error": "bad_repo", "message": str(error)}
 
+    seed_meta = None if skip_auto_refresh else seed_worktree_index(cwd)
     refresh_meta = None if skip_auto_refresh else maybe_refresh_index(cwd, args)
+    if seed_meta is not None:
+        refresh_meta = {**(refresh_meta or {}), "worktreeSeed": seed_meta}
 
     try:
         proc = subprocess.run(
@@ -2127,13 +2319,26 @@ def run_cckit(
         # run actually lands.
         if refresh_meta:
             out["refresh"] = refresh_meta
-        # Surface telemetry from previously-detached runs (WaxCompact growth).
+        # Surface telemetry from the last index run (WaxCompact growth,
+        # DeltaDecision). index-runs.jsonl is timestamped and covers CLI runs.
         telemetry = _recent_refresh_log_telemetry(cwd)
-        for key in ("waxCompact", "waxGrowthWarning"):
+        for key in ("waxCompact", "waxGrowthWarning", "deltaDecision", "lastIndexRun"):
             if key in telemetry:
                 out.setdefault(key, telemetry[key])
         out[_REFRESHED_KEY] = refreshed
         return out
+
+    if stdout.startswith("Error: Index not found"):
+        no_index: dict[str, Any] = {
+            "error": "no_index",
+            "message": stdout,
+            "hint": (
+                "A background index build has started; retry shortly."
+                if refresh_meta and refresh_meta.get("triggered")
+                else "Run the index tool for this repo, then retry."
+            ),
+        }
+        return finish(attach_stderr(no_index, stderr, success=False))
 
     if proc.returncode != 0:
         err_payload: dict[str, Any] = {
@@ -2145,14 +2350,6 @@ def run_cckit(
         if stderr:
             err_payload["stderr"] = stderr
         return finish(err_payload)
-
-    if stdout.startswith("Error: Index not found"):
-        no_index: dict[str, Any] = {
-            "error": "no_index",
-            "message": stdout,
-            "hint": "Run the index tool for this repo, then retry.",
-        }
-        return finish(attach_stderr(no_index, stderr, success=False))
 
     if parse_json:
         try:

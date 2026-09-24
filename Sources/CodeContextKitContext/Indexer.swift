@@ -139,10 +139,13 @@ public final class Indexer: Sendable {
             )
             // Make the eligibility decision observable: ceiling, measured
             // bytes, and which predicate refused — a rebuild used to be
-            // inferable only after the fact.
+            // inferable only after the fact. Persist it for every run (CLI,
+            // shim-spawned, server) so the reason survives detached stdout and
+            // carries a timestamp; the summary print stays for interactive TTY.
             if delegate != nil {
                 print(deltaDecision!.summary)
             }
+            IndexRunLog.recordDeltaDecision(deltaDecision!, cckitDir: cckitDir)
         } else {
             deltaDecision = nil
         }

@@ -135,11 +135,16 @@ public struct ActionRecord: Codable, Hashable, Sendable {
     /// find-references). `-1` = unmeasured (rg unavailable); `0` = measured
     /// zero — the sentinel keeps "no baseline" from masquerading as savings.
     public var baselineTokens: Int?
+    /// Pack rows: confident primaries delivered (`0` is a real miss). Other tools leave this nil.
+    public var primaryCount: Int?
+    /// Stable outcome token surviving monthly rollup (`productive`, `zero_primary`, `lease_held`, …).
+    public var outcomeReason: String?
 
     enum CodingKeys: String, CodingKey {
         case id, prompt, toolName, type, tokensUsed, sourceWholeFileTokens
         case durationMs, status, timestamp, response
         case updated, skipped, symbols, baselineTokens
+        case primaryCount, outcomeReason
     }
 
     public init(
@@ -156,7 +161,9 @@ public struct ActionRecord: Codable, Hashable, Sendable {
         updated: Int? = nil,
         skipped: Int? = nil,
         symbols: Int? = nil,
-        baselineTokens: Int? = nil
+        baselineTokens: Int? = nil,
+        primaryCount: Int? = nil,
+        outcomeReason: String? = nil
     ) {
         self.id = id
         self.prompt = prompt
@@ -172,6 +179,8 @@ public struct ActionRecord: Codable, Hashable, Sendable {
         self.skipped = skipped
         self.symbols = symbols
         self.baselineTokens = baselineTokens
+        self.primaryCount = primaryCount
+        self.outcomeReason = outcomeReason
     }
 
     public init(from decoder: Decoder) throws {
@@ -190,6 +199,8 @@ public struct ActionRecord: Codable, Hashable, Sendable {
         skipped = try c.decodeIfPresent(Int.self, forKey: .skipped)
         symbols = try c.decodeIfPresent(Int.self, forKey: .symbols)
         baselineTokens = try c.decodeIfPresent(Int.self, forKey: .baselineTokens)
+        primaryCount = try c.decodeIfPresent(Int.self, forKey: .primaryCount)
+        outcomeReason = try c.decodeIfPresent(String.self, forKey: .outcomeReason)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -208,6 +219,8 @@ public struct ActionRecord: Codable, Hashable, Sendable {
         try c.encodeIfPresent(skipped, forKey: .skipped)
         try c.encodeIfPresent(symbols, forKey: .symbols)
         try c.encodeIfPresent(baselineTokens, forKey: .baselineTokens)
+        try c.encodeIfPresent(primaryCount, forKey: .primaryCount)
+        try c.encodeIfPresent(outcomeReason, forKey: .outcomeReason)
     }
 
     /// Tokens avoided versus whole files already loaded for this call.

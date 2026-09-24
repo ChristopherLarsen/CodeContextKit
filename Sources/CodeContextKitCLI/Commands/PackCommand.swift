@@ -86,6 +86,7 @@ struct PackCommand: AsyncParsableCommand {
                 toolName: "pack",
                 durationMs: duration,
                 status: "failed",
+                outcomeReason: LedgerOutcome.classifyFailure(reason),
                 response: String(reason.prefix(2000))
             )
             throw error
@@ -310,11 +311,21 @@ struct PackCommand: AsyncParsableCommand {
         // Success-path ledger row, recorded only after the packet has been
         // delivered — every throw before this point lands in run()'s catch
         // as a `failed` row, so each call leaves exactly one row.
+        let outcome = LedgerOutcome.packCompleted(
+            isPreview: preview,
+            primaryCount: result.primaryCount,
+            wasBudgetTruncated: truncation != nil,
+            wasLexicalEmpty: lexicalEmpty,
+            wasSemanticUnavailable: semanticUnavailable
+        )
         try? await actionOrchestrator.recordCLIAction(
             command: fullCommand,
             toolName: "pack",
             durationMs: duration,
-            tokensUsed: result.deliveredTokens
+            tokensUsed: result.deliveredTokens,
+            sourceWholeFileTokens: result.sourceWholeFileTokens,
+            primaryCount: result.primaryCount,
+            outcomeReason: outcome
         )
         if let wax {
             try? await wax.close()

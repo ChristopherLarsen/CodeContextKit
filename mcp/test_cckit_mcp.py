@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["mcp>=1.0,<2"]
+# ///
 """Unit tests for MCP miss-retry, dirty-tree refresh, and locator shaping."""
 
 from __future__ import annotations
@@ -928,6 +932,61 @@ class RefreshLockTests(unittest.TestCase):
         self.assertFalse(out.get("triggered"))
         self.assertEqual(spawned, [])
 
+    def test_maybe_refresh_defers_when_wax_lease_held(self) -> None:
+        """A serve-held arena lease must defer, not spawn a child that fails.
+
+        Regression: spawning `--compact` into a live semantic `serve` produced
+        `IndexFailure: arena lease unavailable: Wax store is already in use`.
+        The refresh lock is NOT held in that case (WAX-16).
+        """
+        import fcntl
+
+        spawned: list[Path] = []
+        lock_path = self.repo / ".cckit" / "repo.wax.lock"
+        with open(lock_path, "a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (
+                mock.patch.object(mcp, "_index_is_current", return_value=False),
+                mock.patch.object(
+                    mcp,
+                    "spawn_detached_index",
+                    side_effect=lambda repo, extra_args=None: spawned.append(repo)
+                    or {"triggered": True},
+                ),
+            ):
+                out = mcp.maybe_refresh_index(self.repo, ["find-symbol", "Foo"])
+
+        self.assertTrue(out and out.get("skipped"))
+        self.assertEqual(out.get("reason"), "wax_lease_held")
+        self.assertFalse(out.get("triggered"))
+        self.assertEqual(spawned, [])
+
+    def test_force_refresh_defers_when_wax_lease_held(self) -> None:
+        import fcntl
+
+        lock_path = self.repo / ".cckit" / "repo.wax.lock"
+        with open(lock_path, "a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(
+                mcp, "spawn_detached_index", return_value={"triggered": True}
+            ) as spawn_mock:
+                out = mcp.force_refresh_index(self.repo)
+
+        self.assertTrue(out.get("skipped"))
+        self.assertEqual(out.get("reason"), "wax_lease_held")
+        spawn_mock.assert_not_called()
+
+    def test_wax_lease_probe_skipped_for_lexical_repo(self) -> None:
+        """Lexical-only repos never open the arena, so a held arena lease
+        (e.g. a stale semantic reader) must not block their refresh."""
+        import fcntl
+
+        (self.repo / ".cckit" / "lexical-only").write_text("1\n", encoding="utf-8")
+        lock_path = self.repo / ".cckit" / "repo.wax.lock"
+        with open(lock_path, "a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertTrue(mcp.wax_lease_is_free(self.repo))
+
     def test_force_refresh_triggers_out_of_band_on_stale(self) -> None:
         spawned: list[tuple[Path, list[str] | None]] = []
 
@@ -990,6 +1049,42 @@ class RefreshLockTests(unittest.TestCase):
         self.assertEqual(mcp._cooldown_remaining(self.repo), 0.0)
 
 
+class WorktreeSeedTests(unittest.TestCase):
+    def test_spawn_creates_missing_cckit_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            with mock.patch.object(mcp.subprocess, "Popen") as popen:
+                popen.return_value.pid = 42
+                result = mcp.spawn_detached_index(repo)
+            self.assertTrue(result["triggered"])
+            self.assertTrue((repo / ".cckit").is_dir())
+
+    def test_seed_runs_only_for_unindexed_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            done = mock.Mock(
+                stdout='WorktreeSeed {"seeded": true, "source": "/main"}\n', returncode=0
+            )
+            with mock.patch.object(mcp.subprocess, "run", return_value=done) as run:
+                self.assertEqual(
+                    mcp.seed_worktree_index(repo), {"seeded": True, "source": "/main"}
+                )
+                self.assertIn("--seed-only", run.call_args.args[0])
+                (repo / ".cckit").mkdir()
+                (repo / ".cckit" / "index-stamp.json").write_text("{}")
+                self.assertIsNone(mcp.seed_worktree_index(repo))
+                self.assertEqual(run.call_count, 1)
+
+    def test_no_index_error_is_reported_on_nonzero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            failed = mock.Mock(
+                stdout="Error: Index not found. Run 'cckit index' first.", stderr="", returncode=1
+            )
+            with mock.patch.object(mcp.subprocess, "run", return_value=failed):
+                out = mcp.run_cckit(["find-symbol", "X"], repo=tmp, skip_auto_refresh=True)
+            self.assertEqual(out["error"], "no_index")
+
+
 class WaxCompactAutoTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -1028,10 +1123,52 @@ class WaxCompactAutoTests(unittest.TestCase):
         self._write_compact_stamp(self.repo)
         self.assertFalse(mcp.wax_needs_compact(self.repo))
 
-    def test_needs_compact_after_wax_grows(self) -> None:
-        self._write_compact_stamp(self.repo)
-        self.wax.write_bytes(b"x" * (2 * 1024 * 1024))
-        self.assertTrue(mcp.wax_needs_compact(self.repo))
+    def test_skips_compact_within_delta_band(self) -> None:
+        """A single append (~0.5 arena-equivalents) must NOT trip the shim.
+
+        The old flat 64 MB line sat below one ~67 MB append, so every one-file
+        edit spawned a full rebuild. The band's absolute floor keeps a single
+        append inside it on small arenas.
+        """
+        self._write_compact_stamp(self.repo, wax_bytes=1024)
+        self.wax.write_bytes(b"x" * (10 * 1024 * 1024))
+        self.assertFalse(mcp.wax_needs_compact(self.repo))
+
+    def test_needs_compact_past_delta_band(self) -> None:
+        # Drive the band down to the stamp with the exact env vars the CLI
+        # reads, so shim and CLI cannot drift.
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CCKIT_WAX_DELTA_MAX_GROWTH": "0",
+                "CCKIT_WAX_DELTA_ALLOWANCE_BYTES": "0",
+                "CCKIT_WAX_DELTA_ALLOWANCE_SCALE": "0",
+            },
+        ):
+            self._write_compact_stamp(self.repo, wax_bytes=1024)
+            self.wax.write_bytes(b"x" * (2 * 1024 * 1024))
+            self.assertTrue(mcp.wax_needs_compact(self.repo))
+
+    def test_growth_ceiling_matches_cli_band(self) -> None:
+        # ceiling = stamp * 1.1 + max(16 MB, stamp * 1.5)
+        self.assertEqual(
+            mcp.wax_growth_ceiling(128_000_000),
+            int(128_000_000 * 1.1) + 192_000_000,
+        )
+        # Absolute floor wins on small arenas.
+        self.assertEqual(mcp.wax_growth_ceiling(1024), int(1024 * 1.1) + 16_000_000)
+
+    def test_incident_single_append_stays_within_band(self) -> None:
+        """Regression for the miscalibration: stamp ~138.7 MB, append ~67.2 MB.
+
+        The CLI band must tolerate roughly three such appends before a rebuild;
+        the shim must not force one after the first.
+        """
+        stamp = 138_700_000
+        append = 67_223_552
+        ceiling = mcp.wax_growth_ceiling(stamp)
+        self.assertGreater(ceiling, stamp + append)
+        self.assertGreater(ceiling, stamp + 3 * append)
 
     def _live_allocated_bytes(self) -> int:
         import os
@@ -1179,6 +1316,53 @@ class WaxStampUnificationTests(unittest.TestCase):
 
     def test_recent_refresh_log_telemetry_missing_log_is_empty(self) -> None:
         self.assertEqual(mcp._recent_refresh_log_telemetry(self.repo), {})
+
+    def _run_log_path(self) -> Path:
+        return self.repo / ".cckit" / "index-runs.jsonl"
+
+    def test_index_run_log_telemetry_carries_timestamps_and_delta(self) -> None:
+        """The timestamped CLI run log is preferred over the legacy refresh.log:
+        it captures plain `cckit index .` runs and names refusedBy."""
+        self._run_log_path().write_text(
+            json.dumps({
+                "at": "2026-09-23T10:00:00Z",
+                "event": "DeltaDecision",
+                "payload": {
+                    "eligible": False, "refusedBy": "growthCeiling",
+                    "deltaFiles": 1, "maxFiles": 32, "stampBytes": 138700000,
+                    "arenaBytes": 400000000, "growthCeiling": 360595456,
+                    "allowance": 208050000,
+                },
+            }) + "\n"
+            + json.dumps({
+                "at": "2026-09-23T10:19:00Z",
+                "event": "WaxCompact",
+                "payload": {
+                    "bytesBefore": 138700000, "bytesAfter": 205923552,
+                    "delta": True, "rebuiltWax": False, "stamped": False,
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+        out = mcp._recent_refresh_log_telemetry(self.repo)
+
+        self.assertEqual(out["deltaDecision"]["refusedBy"], "growthCeiling")
+        self.assertEqual(out["deltaDecision"]["at"], "2026-09-23T10:00:00Z")
+        self.assertTrue(out["waxCompact"]["delta"])
+        self.assertFalse(out["waxCompact"]["rebuiltWax"])
+
+    def test_index_run_log_torn_line_is_skipped(self) -> None:
+        self._run_log_path().write_text(
+            '{"at":"2026-09-23T10:00:00Z","event":"WaxCompact","payload":{"delta":true}}\n'
+            '{"at":"2026-09-23T10:05:00Z","event":"IndexFailure","payload":{"reason":"boom"}}\n'
+            '{"at":"torn","event":"WaxCompact","payl\n',
+            encoding="utf-8",
+        )
+        out = mcp._recent_refresh_log_telemetry(self.repo)
+
+        self.assertTrue(out["waxCompact"]["delta"])
+        self.assertEqual(out["lastIndexRun"]["event"], "IndexFailure")
+        self.assertEqual(out["lastIndexRun"]["reason"], "boom")
 
     def test_growth_warning_thresholds(self) -> None:
         below = {"bytesBefore": 1000, "bytesAfter": 1100}
@@ -1463,6 +1647,7 @@ class PlaybookConsistencyTests(unittest.TestCase):
         "symptom, a change, more than one file, or a failure log",
         "even when names are visible",
         "starting context",
+        "orientation, not coverage",
         "Prefer gather over Grep/Read",
         "mode=\"preview\"",
         "find_symbol after gather",
