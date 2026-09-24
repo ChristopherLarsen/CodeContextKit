@@ -25,7 +25,7 @@ let package = Package(
         .package(url: "https://github.com/unum-cloud/usearch.git", from: "2.16.0"),
         .package(url: "https://github.com/tree-sitter/tree-sitter.git", from: "0.22.6"),
         .package(url: "https://github.com/tree-sitter-grammars/tree-sitter-kotlin.git", from: "1.1.0"),
-        .package(url: "https://github.com/ChristopherLarsen/Wax.git", revision: "3405b8c6ecf1dd0b6322936f1681ec8b480a3b08"),
+        .package(url: "https://github.com/ChristopherLarsen/Wax.git", revision: "873ba6be9e164160dc4318141f80280895e3ad33"),
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.3.0")
     ],
     targets: [

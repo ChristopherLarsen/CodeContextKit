@@ -267,3 +267,7 @@ The highest-value upstream improvements remain batch delete, stable sidecar lock
 - `swift test --skip-build` — passed: 137 XCTest cases plus 5 Swift Testing cases, 0 failures.
 - Isolated CLI smoke — first index rebuilt Wax, unchanged index skipped all four files without rebuilding, and `--compact` rebuilt the derived arena; no live-set residue remained.
 - MCP shim: `uv run --with 'mcp>=1.0,<2' python mcp/test_cckit_mcp.py` — passed, 112 tests.
+
+## Resolution: caller-owned live-set rewrite (2026-09-24)
+
+Wax fork `cckit-public-live-set-rewrite` (873ba6b) exposes `Memory.rewriteLiveSet(to:verifyDeep:)`: frames plus only the current lex/vec index generation, written to a separate verified file, no re-embedding, source untouched. cckit calls it in staging (`IndexCommand.rewriteStagedArena`) after a delta whose staged arena exceeds the stamp baseline by `CCKIT_WAX_REWRITE_GROWTH` (0.25; 1.0 in linked worktrees so seeded APFS clones stay shared), and for `--compact`. The candidate is promoted by the existing staged swap only when it kept every frame and both indexes and actually shrank; otherwise the uncompacted staged arena promotes as before. Measured on VX (16.9k symbols): 626 MB → 293 MB in 2.2 s, versus a 31-minute full re-embed. This addresses the cost of WAX-02 growth; stale twin documents remain until an occasional full rebuild.

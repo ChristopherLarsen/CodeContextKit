@@ -12,11 +12,14 @@ public actor WaxStore {
     public enum StoreError: LocalizedError {
         case inUse(lockPath: String)
         case ambiguousPromotionRecovery(path: String, backups: [String])
+        case notOpen(path: String)
 
         public var errorDescription: String? {
             switch self {
             case .inUse(let lockPath):
                 return "Wax store is already in use (stable lease: \(lockPath)). Stop the other cckit process and retry."
+            case .notOpen(let path):
+                return "Wax store at \(path) is not open."
             case .ambiguousPromotionRecovery(let path, let backups):
                 return "Wax arena is missing at \(path), but multiple promotion backups exist: \(backups.joined(separator: ", ")). Refusing to guess which one is authoritative."
             }
@@ -272,6 +275,18 @@ public actor WaxStore {
     }
     
     public func flush() async throws { try await memory?.flush() }
+
+    /// Write a compact copy of this arena to `destination`: live frames plus
+    /// only the current index generation, reusing the stored vectors (no
+    /// re-embedding). Every Wax commit appends a full index generation, so an
+    /// arena grows ~0.55x per delta run; this reclaims that in one copy. The
+    /// source is left untouched and stays open; the caller swaps.
+    public func rewriteArena(to destination: String) async throws -> Memory.LiveSetRewriteResult {
+        guard let memory else {
+            throw StoreError.notOpen(path: path)
+        }
+        return try await memory.rewriteLiveSet(to: URL(fileURLWithPath: destination), verifyDeep: false)
+    }
     public func close() async throws {
         defer { lease.release() }
         try await memory?.close()

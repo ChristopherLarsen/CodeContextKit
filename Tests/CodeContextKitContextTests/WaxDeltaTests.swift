@@ -376,6 +376,30 @@ final class WaxDeltaTests: XCTestCase {
         try lexDb.close()
     }
 
+    func testRewriteArenaReclaimsDeltaGrowthWithoutLosingFrames() async throws {
+        try await primeIndexAndStamp()
+        for version in 2...4 {
+            try "struct Alpha { func one() -> Int { \(version) } }".write(
+                to: tempDir.appendingPathComponent("Alpha.swift"), atomically: true, encoding: .utf8)
+            let result = try await indexer.index(at: tempDir.path, cckitDir: cckitDir.path)
+            XCTAssertTrue(result.deltaApplied)
+            try await wax.flush()
+        }
+        let frames = await wax.frameCount()
+        let destination = cckitDir.appendingPathComponent("repo.rewrite.wax").path
+
+        let rewrite = try await wax.rewriteArena(to: destination)
+
+        XCTAssertEqual(rewrite.frameCount, frames)
+        XCTAssertTrue(rewrite.copiedLexIndex)
+        XCTAssertTrue(rewrite.copiedVecIndex)
+        XCTAssertLessThan(rewrite.allocatedBytesAfter, rewrite.allocatedBytesBefore)
+        let reopened = try await WaxStore(path: destination)
+        let reopenedFrames = await reopened.frameCount()
+        try await reopened.close()
+        XCTAssertEqual(reopenedFrames, frames)
+    }
+
     func testMaxFilesScalesWithIndexedFileCount() {
         unsetenv("CCKIT_WAX_DELTA_MAX_FILES")
         XCTAssertEqual(WaxDeltaPolicy.maxFilesFromEnvironment(indexedFileCount: 0), 32)
