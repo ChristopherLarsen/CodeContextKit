@@ -1,5 +1,5 @@
 {
-  "originHash" : "527f1561ac9552e3052bbf353cfba32c4ecd9a701d9fd5fa9cf9665fe53c842a",
+  "originHash" : "7f05b02dc95228826cd404fc8b6504439e0c82ddfc7116ede74c9ee820b5646c",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -339,7 +339,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/ChristopherLarsen/Wax.git",
       "state" : {
-        "revision" : "873ba6be9e164160dc4318141f80280895e3ad33"
+        "revision" : "3405b8c6ecf1dd0b6322936f1681ec8b480a3b08"
       }
     }
   ],

@@ -413,66 +413,6 @@ struct IndexCommand: AsyncParsableCommand {
     }
 
 
-    static let rewriteFileName = "repo.rewrite.wax"
-
-    /// Growth past the baseline (fraction of it) that triggers a post-delta
-    /// live-set rewrite. Each delta commit appends ~0.55x the arena. Linked
-    /// worktrees default higher: their seeded arena is an APFS clone sharing
-    /// blocks with the main checkout, and a rewrite makes every block unique,
-    /// so it only pays once growth exceeds the shared base itself.
-    /// Env-tunable: CCKIT_WAX_REWRITE_GROWTH.
-    static func rewriteGrowthThreshold(isLinkedWorktree: Bool) -> Double {
-        if let raw = ProcessInfo.processInfo.environment["CCKIT_WAX_REWRITE_GROWTH"],
-           let value = Double(raw), value >= 0 {
-            return value
-        }
-        return isLinkedWorktree ? 1.0 : 0.25
-    }
-
-    static func stagedGrowthWantsRewrite(stagedBytes: Int, cckitDir: String, repoRoot: String) -> Bool {
-        guard let baseline = WaxCompactStamp.readWatermark(cckitDir: cckitDir)?.waxBytes, baseline > 0 else {
-            return false
-        }
-        let threshold = rewriteGrowthThreshold(
-            isLinkedWorktree: WorktreeIndexSeed.mainCheckout(of: repoRoot) != nil
-        )
-        return Double(stagedBytes) > Double(baseline) * (1 + threshold)
-    }
-
-    /// Rewrite the staged arena to `repo.rewrite.wax` in staging and check it
-    /// kept every frame and both indexes. Never throws: on any doubt the
-    /// candidate is deleted and the uncompacted staged arena is promoted.
-    static func rewriteStagedArena(wax: WaxStore, stagingDir: String) async -> [String: Any] {
-        let destination = (stagingDir as NSString).appendingPathComponent(rewriteFileName)
-        try? FileManager.default.removeItem(atPath: destination)
-        do {
-            let result = try await wax.rewriteArena(to: destination)
-            let expectedFrames = await wax.frameCount()
-            let hasEmbeddings = await wax.hasEmbeddings()
-            var report: [String: Any] = [
-                "frames": result.frameCount,
-                "bytesBefore": result.allocatedBytesBefore,
-                "bytesAfter": result.allocatedBytesAfter,
-                "durationMs": Int(result.durationMs),
-            ]
-            let complete = result.frameCount == expectedFrames
-                && result.copiedLexIndex
-                && (result.copiedVecIndex || !hasEmbeddings)
-            guard complete, result.allocatedBytesAfter < result.allocatedBytesBefore else {
-                try? FileManager.default.removeItem(atPath: destination)
-                report["rewritten"] = false
-                report["reason"] = complete ? "no_shrink" : "incomplete_copy"
-                return report
-            }
-            report["rewritten"] = true
-            print("Wax rewrite: \(result.allocatedBytesBefore) → \(result.allocatedBytesAfter) bytes in \(Int(result.durationMs)) ms (no re-embed)")
-            return report
-        } catch {
-            try? FileManager.default.removeItem(atPath: destination)
-            return ["rewritten": false, "reason": String(describing: error)]
-        }
-    }
-
     /// A failure that carries its operator-facing reason into the ledger row
     /// (ExitCode alone records only `ExitCode(rawValue: 1)`).
     struct IndexFailure: LocalizedError {
@@ -523,18 +463,19 @@ struct IndexCommand: AsyncParsableCommand {
             }
         }
         if lexicalOnly && compact {
-            print("Error: --compact rewrites the semantic arena; incompatible with --no-semantic.")
+            print("Error: --compact rebuilds the semantic arena; incompatible with --no-semantic.")
             throw IndexFailure(reason: "--compact is incompatible with --no-semantic")
         }
 
-        // --compact is a staged live-set rewrite (see rewriteStagedArena), not
-        // a rebuild: it reuses stored vectors instead of re-embedding.
+        // Current Wax exposes neither in-place maintenance nor batch deletion.
+        // A clean replacement is the only bounded cckit-owned compaction path.
         let hasExistingIndex = fm.fileExists(atPath: waxPath) || fm.fileExists(atPath: dbPath)
         // Breach markers and embedder mismatches are semantic concerns; a
         // lexical-only run must not nuke SQLite over them.
         let mustRebuild = lexicalOnly
             ? effectiveClean
             : effectiveClean
+                || compactRequested
                 || Self.hasBreachMarker(cckitDir: cckitDir)
                 || (embedderMismatch && hasExistingIndex)
 
@@ -548,7 +489,9 @@ struct IndexCommand: AsyncParsableCommand {
             if embedderMismatch && !effectiveClean {
                 print("Semantic embedder changed (\(storedEmbedderId ?? "none") → \(WaxEmbedderIdentity.current)); rebuilding index for vector search...")
             }
-            if Self.hasBreachMarker(cckitDir: cckitDir) {
+            if compactRequested {
+                print("Wax no longer exposes in-place compaction; rebuilding the derived index safely...")
+            } else if Self.hasBreachMarker(cckitDir: cckitDir) {
                 print("Wax breach marker found; rebuilding the derived index before opening it...")
             }
         }
@@ -689,29 +632,10 @@ struct IndexCommand: AsyncParsableCommand {
             throw error
         }
 
-        // Reclaim the index generations this run (and earlier deltas)
-        // appended, before promotion: the rewrite lands in staging, so a
-        // failure leaves the uncompacted staged arena to promote as before.
-        var rewrite: [String: Any]?
-        if let wax, stagedBuild, !lexicalOnly, !mustRebuild, !compacted.rebuiltWax,
-           compactRequested || Self.stagedGrowthWantsRewrite(
-               stagedBytes: Self.waxFileAllocatedBytes(at: buildWaxPath),
-               cckitDir: cckitDir,
-               repoRoot: absolutePath
-           ) {
-            rewrite = await Self.rewriteStagedArena(wax: wax, stagingDir: stagingDir)
-        }
-
         // Close staging stores before the swap so no handle outlives the
         // inode it built.
         if let wax {
             try await wax.close()
-        }
-        if let rewrite, rewrite["rewritten"] as? Bool == true {
-            let compactPath = (stagingDir as NSString).appendingPathComponent(Self.rewriteFileName)
-            if rename(compactPath, buildWaxPath) != 0 {
-                try? fm.removeItem(atPath: compactPath)
-            }
         }
         stagingWaxLease?.release()
         stagingWaxLease = nil
@@ -800,7 +724,7 @@ struct IndexCommand: AsyncParsableCommand {
             // A lexical run claims nothing about the arena's allocation
             // baseline; leave semantic stamps and sidecars untouched.
             stamped = false
-        } else if mustRebuild || compacted.rebuiltWax || rewrite?["rewritten"] as? Bool == true {
+        } else if mustRebuild || compacted.rebuiltWax {
             try WaxEmbedderIdentity.writeSidecar(cckitDir: cckitDir)
             try WaxCompactStamp.writeBaseline(cckitDir: cckitDir)
             stamped = true
@@ -836,9 +760,6 @@ struct IndexCommand: AsyncParsableCommand {
             "stamped": stamped,
             "rebuiltWax": compacted.rebuiltWax
         ]
-        if let rewrite {
-            payload["rewrite"] = rewrite
-        }
         if compacted.deltaApplied {
             payload["delta"] = true
             payload["appendedBytes"] = max(0, bytesAfterIndexing - bytesBeforeIndexing)
